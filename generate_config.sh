@@ -3,7 +3,7 @@
 # This script creates js/config.js on the Render server during the build.
 # It pulls the GOOGLE_CLIENT_ID from Render's Environment Variables.
 
-cat <<EOF > js/config.js
+cat <<EOF > js/Config.js
 export const CONFIG = {
     GOOGLE_CLIENT_ID: '$GOOGLE_CLIENT_ID',
     GOOGLE_SCOPES: 'https://www.googleapis.com/auth/drive.file',
@@ -11,4 +11,4 @@ export const CONFIG = {
 };
 EOF
 
-echo "✅ Configuration file generated successfully."
+echo "Configuration file generated successfully."
