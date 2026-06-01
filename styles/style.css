@@ -1,5 +1,5 @@
 /* =========================================
-   1. GLOBAL RESET & TYPOGRAPHY
+   1. GLOBAL RESET & CUSTOM PROPERTIES
    ========================================= */
 :root {
     --primary-color: rgb(0, 255, 110);
@@ -7,8 +7,47 @@
     --accent-blue: #007bff;
     --danger-red: #ff4d4d;
     --text-dark: #333;
-    --bg-glass: rgba(255, 255, 255, 0.85); /* Slightly more opaque for readability */
+    --text-muted: #666;
+    --bg-glass: rgba(255, 255, 255, 0.85);
+    --bg-surface: #ffffff;
+    --bg-surface-alt: #f9f9f9;
+    --bg-surface-hover: #f0f0f0;
+    --border-color: #ddd;
+    --border-light: rgba(255, 255, 255, 0.6);
     --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.15);
+    --shadow-modal: 0 10px 30px rgba(0, 0, 0, 0.2);
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 16px;
+    --radius-pill: 20px;
+    --transition-fast: 0.2s ease;
+    --transition-slide: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    color-scheme: light;
+}
+
+/* ── Dark Mode — triggered by data-theme="dark" on <html> ────────────── */
+[data-theme="dark"] {
+    --text-dark: #e0e0e0;
+    --text-muted: #aaa;
+    --bg-glass: rgba(30, 30, 30, 0.9);
+    --bg-surface: #1e1e1e;
+    --bg-surface-alt: #2a2a2a;
+    --bg-surface-hover: #333;
+    --border-color: #444;
+    --border-light: rgba(255, 255, 255, 0.1);
+    --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.4);
+    --shadow-modal: 0 10px 30px rgba(0, 0, 0, 0.5);
+    color-scheme: dark;
+}
+
+/* ── Reduced Motion ────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
 }
 
 * {
@@ -21,6 +60,8 @@
 body {
     overflow: hidden;
     font-size: 16px;
+    color: var(--text-dark);
+    background: var(--bg-surface);
 }
 
 #map {
@@ -37,12 +78,12 @@ body {
 /* =========================================
    2. SHARED UI ELEMENTS
    ========================================= */
-button, .popup-btn, .save-btn, .import-action-btn, 
-.import-secondary-action-btn, .show-external-data-btn {
+:is(button, .popup-btn, .save-btn, .import-action-btn,
+.import-secondary-action-btn, .show-external-data-btn) {
     border: none;
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     cursor: pointer;
-    transition: all 0.2s ease;
+    transition: all var(--transition-fast);
     font-size: 0.95rem;
     font-weight: 500;
     padding: 10px 15px;
@@ -54,47 +95,55 @@ button:active { transform: scale(0.98); }
 button:disabled { cursor: not-allowed; opacity: 0.6; filter: grayscale(100%); }
 
 /* Inputs */
-input[type="text"], textarea, select, .import-text-input {
+:is(input[type="text"], textarea, select, .import-text-input) {
     width: 100%;
     padding: 12px;
     margin: 8px 0 16px 0;
-    border: 1px solid #ddd;
-    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
     font-size: 1rem;
-    background-color: #f9f9f9;
+    background-color: var(--bg-surface-alt);
+    color: var(--text-dark);
 }
-input:focus, textarea:focus, select:focus {
+:is(input:focus, textarea:focus, select:focus) {
     outline: none;
     border-color: var(--accent-blue);
-    background: #fff;
+    background: var(--bg-surface);
 }
 
-/* [REQUEST 3] Professional File Input Styling */
+/* Professional File Input Styling */
 input[type="file"] {
     width: 100%;
     padding: 8px;
-    background: #f9f9f9;
-    border: 1px solid #ddd;
-    border-radius: 8px;
+    background: var(--bg-surface-alt);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
     font-size: 0.9rem;
-    color: #555;
+    color: var(--text-muted);
     margin-bottom: 15px;
 }
 
 input[type="file"]::file-selector-button {
     margin-right: 15px;
     padding: 8px 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     border: none;
     background-color: #e9ecef;
     color: #333;
     cursor: pointer;
     font-weight: 500;
-    transition: background 0.2s;
+    transition: background var(--transition-fast);
 }
-
 input[type="file"]::file-selector-button:hover {
     background-color: #dde0e3;
+}
+
+/* Checkbox accent */
+input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--primary-color);
+    margin: 0;
 }
 
 /* =========================================
@@ -108,7 +157,7 @@ input[type="file"]::file-selector-button:hover {
     background: #333;
     color: white;
     padding: 8px 12px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     font-size: 1.2rem;
     box-shadow: var(--shadow-soft);
 }
@@ -120,22 +169,20 @@ input[type="file"]::file-selector-button:hover {
     background-color: var(--bg-glass);
     backdrop-filter: blur(15px);
     -webkit-backdrop-filter: blur(15px);
-    border-right: 1px solid rgba(255, 255, 255, 0.5);
+    border-right: 1px solid var(--border-light);
     box-shadow: var(--shadow-soft);
     padding: 80px 20px 20px 20px;
     z-index: 1000;
     transform: translateX(-100%);
-    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: transform var(--transition-slide);
     overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 15px;
 }
-
-/* [REQUEST 1] Desktop Menu Fix: Rely strictly on the class */
 #controls.open { transform: translateX(0); }
 
-/* [REQUEST 4] Personality: Restoring Green Buttons */
+/* Green Action Buttons Grid */
 .add-site-div {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -143,42 +190,39 @@ input[type="file"]::file-selector-button:hover {
     width: 100%;
 }
 
-.add-site-div button, 
-.add-site-div .add_site, 
-.add-site-div .control-button {
-    width: 100%; 
-    background-color: var(--primary-color); /* Green */
+.add-site-div :is(button, .add_site, .control-button) {
+    width: 100%;
+    background-color: var(--primary-color);
     border: 1px solid rgba(0,0,0,0.05);
     font-size: 0.9rem;
     color: #000;
     font-weight: 600;
     box-shadow: 0 2px 5px rgba(0,0,0,0.05);
 }
-.add-site-div button:hover { 
-    background-color: var(--primary-hover); 
+.add-site-div button:hover {
+    background-color: var(--primary-hover);
     transform: translateY(-1px);
 }
 
-/* [REQUEST 4] Subtle Sync Buttons */
-#btn-login, #btn-sync-master, #btn-sync-manager {
+/* Subtle Sync Buttons */
+:is(#btn-login, #btn-sync-master, #btn-sync-manager) {
     font-size: 0.85rem;
     padding: 8px 5px;
-    background-color: #f0f0f0; /* Subtle grey */
-    color: #444;
-    border: 1px solid #ccc;
+    background-color: var(--bg-surface-hover);
+    color: var(--text-dark);
+    border: 1px solid var(--border-color);
     font-weight: 500;
-    white-space: nowrap; /* Force one line */
+    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
-#btn-login:hover, #btn-sync-master:hover, #btn-sync-manager:hover {
-    background-color: #e0e0e0;
-    color: #000;
+:is(#btn-login, #btn-sync-master, #btn-sync-manager):hover {
+    background-color: var(--bg-surface-alt);
+    color: var(--text-dark);
 }
-/* Login should stand out slightly more if needed */
-#btn-login { background-color: var(--accent-blue); color: white; border: none;}
-#btn-login:hover { background-color: #0056b3; color: white;}
-
+/* Login stands out */
+#btn-login { background-color: var(--accent-blue); color: white; border: none; }
+#btn-login:hover { background-color: #0056b3; color: white; }
 
 /* Control Rows */
 .control {
@@ -187,69 +231,75 @@ input[type="file"]::file-selector-button:hover {
     justify-content: space-between;
     background: rgba(255,255,255,0.5);
     padding: 10px;
-    border-radius: 8px;
-    border: 1px solid rgba(255,255,255,0.6);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border-light);
 }
-.div-label { font-weight: 600; font-size: 0.9rem; color: #444; }
+[data-theme="dark"] .control { background: rgba(255,255,255,0.05); }
+
+.div-label { font-weight: 600; font-size: 0.9rem; color: var(--text-muted); }
 
 /* Checkboxes */
-.spot-toggle, label[for="show-routes-toggle"] {
+:is(.spot-toggle, label[for="show-routes-toggle"]) {
     display: flex; align-items: center; gap: 8px; font-size: 0.9rem; cursor: pointer;
 }
-input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary-color); margin: 0; }
 
 /* Lat/Lon */
 #latlon {
     position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-    background-color: #333; color: white; padding: 8px 16px; border-radius: 20px;
+    background-color: #333; color: white; padding: 8px 16px; border-radius: var(--radius-pill);
     font-size: 0.85rem; z-index: 900; pointer-events: none;
 }
 
 /* =========================================
-   4. POPUPS & MODALS (Unified Positioning)
+   4. NATIVE DIALOG MODALS
    ========================================= */
-/* [REQUEST 1] Fix: Modals hidden by default, Flex for centering */
-.popup-overlay, .import-popup-overlay, .modal, .external-data-popup {
-    display: none; 
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+.modal-dialog {
+    border: none;
+    padding: 0;
+    margin: auto;          /* Restore UA default killed by * { margin: 0 } — centers showModal() */
+    background: transparent;
+    max-width: min(90vw, 400px);
+    max-height: 85vh;
+    overflow: visible;
+}
+.modal-dialog::backdrop {
     background-color: rgba(0, 0, 0, 0.6);
-    justify-content: center; /* Center Horizontal */
-    align-items: center;     /* Center Vertical */
-    z-index: 2000;
     backdrop-filter: blur(2px);
-    margin: 0 !important; /* Override any legacy margins */
+}
+.modal-dialog--wide {
+    max-width: min(90vw, 1200px);
 }
 
-/* [REQUEST 1] External Viewer specific override removal */
-/* We remove the `top: 50%... transform...` logic and use the flex parent above */
-#external-data-viewer.external-data-popup {
-    /* The flex rules on the class .external-data-popup above handle the centering now. */
-    /* Just ensure it's not fighting itself */
-    transform: none; 
-    left: 0; top: 0;
+/* Legacy compat: overlay classes still used by SyncDashboard runtime HTML */
+.popup-overlay, .import-popup-overlay, .modal, .external-data-popup {
+    display: none;
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background-color: rgba(0, 0, 0, 0.6);
+    justify-content: center;
+    align-items: center;
+    z-index: 2000;
+    backdrop-filter: blur(2px);
+    margin: 0 !important;
 }
 
 .popup-content, .modal-content, .import-popup-content, .external-data-popup-content {
-    background-color: #ffffff;
+    background-color: var(--bg-surface);
     padding: 25px;
-    border-radius: 16px;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-modal);
     width: 90%;
     max-width: 400px;
     max-height: 85vh;
     overflow-y: auto;
     position: relative;
-    /* Reset margins that might cause offsets */
-    margin: 0; 
+    margin: 0;
 }
 .import-popup-content { max-width: 500px; }
 
-/* [REQUEST 2] Side-by-Side Button Layout */
-.button-group, .import-form-actions, #spot-form-actions {
+/* Side-by-Side Button Layout */
+:is(.button-group, .import-form-actions, #spot-form-actions) {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 12px;
@@ -261,7 +311,36 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary-
 .popup-btn:hover { background-color: var(--primary-hover); }
 
 .cancel-btn, .import-secondary-action-btn, #close-form { background-color: #e0e0e0; color: #333; width: 100%; }
+[data-theme="dark"] :is(.cancel-btn, .import-secondary-action-btn, #close-form) { background-color: #444; color: #e0e0e0; }
 .cancel-btn:hover { background-color: #d0d0d0; }
+[data-theme="dark"] .cancel-btn:hover { background-color: #555; }
+
+/* Dark mode — headings & labels inside modals */
+.modal-dialog h2,
+.modal-dialog h3,
+.modal-dialog h4,
+.modal-dialog label,
+.modal-dialog strong,
+.popup-content h2,
+.popup-content h3,
+.popup-content h4,
+.popup-content label,
+.popup-content strong,
+.import-popup-overlay h3,
+.import-popup-overlay label,
+.import-popup-overlay strong {
+    color: var(--text-dark);
+}
+
+/* File selector button dark mode */
+[data-theme="dark"] input[type="file"]::file-selector-button {
+    background-color: #444;
+    color: #e0e0e0;
+}
+[data-theme="dark"] input[type="file"]::file-selector-button:hover {
+    background-color: #555;
+}
+[data-theme="dark"] #close-spot-details:hover { background: #444; }
 
 /* =========================================
    5. SPECIFIC FORM STYLES
@@ -270,78 +349,85 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary-
     display: flex; align-items: center; gap: 10px; margin: 15px 0;
 }
 
-/* [REQUEST 5] Camera Button Styling */
+/* Camera / Audio Button Styling */
 .custom-upload {
     width: 45px; height: 45px; border-radius: 10px;
     display: flex; justify-content: center; align-items: center;
-    background-color: var(--primary-color); /* Green by default */
+    background-color: var(--primary-color);
     border: 1px solid transparent;
-    cursor: pointer; font-size: 1.2rem; transition: 0.2s;
+    cursor: pointer; font-size: 1.2rem; transition: var(--transition-fast);
 }
-/* Selected state (Blue) - Toggled by JS */
 .custom-upload.selected {
     background-color: var(--accent-blue);
     color: white;
     border-color: var(--accent-blue);
 }
-.custom-upload.recording { background-color: var(--danger-red); color: white; animation: pulse 1.5s infinite; }
+.custom-upload.recording {
+    background-color: var(--danger-red);
+    color: white;
+    animation: pulse 1.5s infinite;
+}
 @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
 
 /* Import Multi-Select */
 .import-multi-select-box {
-    border: 1px solid #ddd; padding: 10px; max-height: 150px; overflow-y: auto;
-    background-color: #fcfcfc; border-radius: 8px; margin-bottom: 15px;
+    border: 1px solid var(--border-color); padding: 10px; max-height: 150px; overflow-y: auto;
+    background-color: var(--bg-surface-alt); border-radius: var(--radius-md); margin-bottom: 15px;
 }
 .import-multi-select-box label { display: flex; align-items: center; gap: 8px; padding: 5px; cursor: pointer; }
-.import-multi-select-box label:hover { background: #f0f0f0; }
+.import-multi-select-box label:hover { background: var(--bg-surface-hover); }
 
 /* =========================================
    6. SPOT DETAILS & EXTERNAL DATA
    ========================================= */
 #spot-details-menu {
-    position: fixed; top: 0; right: -100%; width: 100%; max-width: 400px; height: 100%;
-    background: white; box-shadow: -5px 0 15px rgba(0, 0, 0, 0.1);
-    transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    position: fixed; top: 0; width: 100%; max-width: 400px; height: 100%;
+    background: var(--bg-surface);
+    box-shadow: -5px 0 15px rgba(0, 0, 0, 0.1);
     z-index: 1005; padding: 25px; overflow-y: auto;
+    /* GPU-composited transform instead of animating `right` */
+    right: 0;
+    transform: translateX(100%);
+    transition: transform var(--transition-slide);
 }
-#spot-details-menu.open { right: 0; }
+#spot-details-menu.open { transform: translateX(0); }
 
 #close-spot-details {
     position: absolute; top: 20px; right: 20px; width: 36px; height: 36px;
-    border-radius: 8px; background: #f0f0f0; color: #333;
+    border-radius: var(--radius-md); background: var(--bg-surface-hover); color: var(--text-dark);
     display: flex; justify-content: center; align-items: center; padding: 0;
 }
 #close-spot-details:hover { background: #e0e0e0; }
 
 .show-external-data-btn { width: 100%; margin-top: 20px; background-color: var(--accent-blue); color: white; }
-.spot-entry img { max-width: 100%; border-radius: 12px; margin-top: 15px; border: 1px solid #eee; }
+.spot-entry img { max-width: 100%; border-radius: 12px; margin-top: 15px; border: 1px solid var(--border-color); }
 
 /* External Data List */
 .external-data-header {
     display: flex; justify-content: space-between; align-items: center;
-    padding-bottom: 15px; border-bottom: 1px solid #eee; margin-bottom: 15px;
+    padding-bottom: 15px; border-bottom: 1px solid var(--border-color); margin-bottom: 15px;
 }
-.close-viewer-btn { background: transparent; font-size: 1.5rem; color: #555; padding: 0; width: auto; }
+.close-viewer-btn { background: transparent; font-size: 1.5rem; color: var(--text-muted); padding: 0; width: auto; }
 .external-data-list a {
     display: block; padding: 12px; color: var(--accent-blue); text-decoration: none;
-    border-bottom: 1px solid #eee; font-size: 0.9rem;
+    border-bottom: 1px solid var(--border-color); font-size: 0.9rem;
 }
 
 /* =========================================
    7. SYNC DASHBOARD
    ========================================= */
 .sync-group-header {
-    background: #f0f2f5; padding: 10px 15px; font-weight: 600;
-    margin-top: 20px; border-radius: 8px; font-size: 0.85rem; color: #555;
+    background: var(--bg-surface-hover); padding: 10px 15px; font-weight: 600;
+    margin-top: 20px; border-radius: var(--radius-md); font-size: 0.85rem; color: var(--text-muted);
     text-transform: uppercase;
 }
 .sync-row {
     display: grid; grid-template-columns: 1fr 100px 40px; gap: 10px;
-    align-items: center; padding: 12px 10px; border-bottom: 1px solid #eee; font-size: 0.9rem;
+    align-items: center; padding: 12px 10px; border-bottom: 1px solid var(--border-color); font-size: 0.9rem;
 }
 .mini-sync-btn {
-    width: 32px; height: 32px; padding: 0; border: 1px solid #ddd;
-    background: white; border-radius: 50%; color: var(--accent-blue);
+    width: 32px; height: 32px; padding: 0; border: 1px solid var(--border-color);
+    background: var(--bg-surface); border-radius: 50%; color: var(--accent-blue);
 }
 
 /* Toast */
@@ -360,24 +446,30 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary-
 @media (max-width: 768px) {
     #controls {
         width: 100%; height: auto; max-height: 70vh; bottom: 0; top: auto;
-        border-radius: 20px 20px 0 0; transform: translateY(100%);
-        border-right: none; border-top: 1px solid rgba(255,255,255,0.5);
+        border-radius: var(--radius-pill) var(--radius-pill) 0 0;
+        transform: translateY(100%);
+        border-right: none; border-top: 1px solid var(--border-light);
     }
     #controls.open { transform: translateY(0); }
     .add-site-div { grid-template-columns: 1fr 1fr 1fr 1fr; }
     .add-site-div button { font-size: 0.8rem; padding: 8px 4px; }
     #latlon { bottom: 85px; font-size: 0.75rem; }
+
+    .modal-dialog { max-width: 95vw; }
 }
 
-/* [IN FILE: style.css] */
+/* =========================================
+   9. PROJECT & ANALYSIS COMPONENTS
+   ========================================= */
 .project-dropdown {
     width: 100%;
     padding: 8px;
-    border-radius: 6px;
-    border: 1px solid #ddd;
-    background: #fff;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-color);
+    background: var(--bg-surface);
     font-size: 0.95rem;
     font-weight: 500;
+    color: var(--text-dark);
 }
 
 .small-btn {
@@ -389,22 +481,107 @@ input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--primary-
     border: 1px solid #ccc;
 }
 .small-btn:hover { background: #d0d0d0; }
-
-/* [IN FILE: style.css] */
+[data-theme="dark"] .small-btn { background: #444; color: #e0e0e0; border-color: #555; }
+[data-theme="dark"] .small-btn:hover { background: #555; }
 
 /* Analysis Form Styles */
 .param-row { margin-bottom: 15px; }
-.param-label { display: block; font-size: 0.85rem; font-weight: 600; color: #555; margin-bottom: 5px; }
-.param-desc { font-size: 0.75rem; color: #888; margin-top: -10px; margin-bottom: 10px; display: block; }
+.param-label { display: block; font-size: 0.85rem; font-weight: 600; color: var(--text-muted); margin-bottom: 5px; }
+.param-desc { font-size: 0.75rem; color: var(--text-muted); margin-top: -10px; margin-bottom: 10px; display: block; }
 
 /* Range Slider */
-input[type=range] { width: 100%; margin: 5px 0; }
+input[type=range] { width: 100%; margin: 5px 0; accent-color: var(--accent-blue); }
 .range-value { float: right; font-weight: bold; color: var(--accent-blue); font-size: 0.9rem; }
 
 /* File Picker in Form */
 .form-file-picker {
     display: flex; gap: 10px; align-items: center;
-    border: 1px dashed #ccc; padding: 8px; border-radius: 6px; background: white; cursor: pointer;
+    border: 1px dashed #ccc; padding: 8px; border-radius: var(--radius-sm); background: var(--bg-surface); cursor: pointer;
 }
-.form-file-picker:hover { border-color: var(--accent-blue); background: #f0f7ff; }
-.file-picked-name { font-size: 0.85rem; color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.form-file-picker:hover { border-color: var(--accent-blue); background: var(--bg-surface-alt); }
+.file-picked-name { font-size: 0.85rem; color: var(--text-dark); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* =========================================
+   10. THEME TOGGLE
+   ========================================= */
+#theme-toggle {
+    position: fixed;
+    top: 15px;
+    right: 15px;
+    z-index: 1100;
+    background: var(--bg-surface-hover);
+    color: var(--text-dark);
+    border: 1px solid var(--border-color);
+    padding: 8px 12px;
+    border-radius: var(--radius-sm);
+    font-size: 1.2rem;
+    box-shadow: var(--shadow-soft);
+    cursor: pointer;
+    line-height: 1;
+}
+#theme-toggle:hover {
+    background: var(--bg-surface-alt);
+}
+
+/* =========================================
+   10. SHARING & COLLABORATION
+   ========================================= */
+
+.share-project-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+.share-project-item input[type="checkbox"] {
+    margin: 0;
+}
+
+.readonly-banner {
+    background: var(--primary-color, #4CAF50);
+    color: #000;
+    text-align: center;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+    border-radius: 4px;
+    margin-bottom: 10px;
+}
+[data-theme="dark"] .readonly-banner {
+    background: #2e7d32;
+    color: #e0e0e0;
+}
+
+#share-link-section code {
+    display: block;
+    background: var(--bg-surface, #fff);
+    padding: 6px 8px;
+    border-radius: 4px;
+    border: 1px solid #ddd;
+}
+[data-theme="dark"] #share-link-section code {
+    background: #333;
+    border-color: #555;
+}
+[data-theme="dark"] #share-link-section {
+    background: #2a2a2a;
+}
+
+#btn-sync-shared {
+    background: #0F9D58;
+    color: white;
+    border-color: #0F9D58;
+}
+#btn-sync-shared:hover {
+    background: #0d8c4e;
+}
+#btn-sync-shared:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Shared project badge in dropdown */
+#project-select option {
+    font-size: 0.9rem;
+}

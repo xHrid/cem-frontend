@@ -8,4 +8,4 @@ sites/
 # 2. Ignore System Files
 .DS_Store
 Thumbs.db
-js/config.js
+js/core/Config.js

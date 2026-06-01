@@ -1,0 +1,395 @@
+/**
+ * SharedMediaSync.js — Automatic media synchronisation for shared projects
+ *
+ * Architecture:
+ *  - Listens for MEDIA_SAVED events from Repository
+ *  - For imported editor projects: auto-pushes media to shared Drive folder
+ *  - For owner's shared projects: auto-pushes media to own project Drive folder
+ *  - External imports (isExternal: true) are SKIPPED — manual sync only
+ *  - Uses a queue + debounce to batch rapid saves (e.g. multi-image spot)
+ *  - Retries failed uploads up to 3 times with exponential backoff
+ *
+ * This replaces the broken flow where editors had to manually push media
+ * and it silently went to the wrong folder (their own root instead of shared).
+ *
+ * Public exports:
+ *   initSharedMediaSync()  — call once at app startup
+ *   getMediaSyncStatus()   — returns queue state for UI indicators
+ */
+
+import EventBus, { EVENTS } from '../core/EventBus.js';
+import * as DriveService from './DriveService.js';
+import * as MasterData from '../data/MasterData.js';
+import * as StorageAdapter from '../data/StorageAdapter.js';
+import { getProjectFolderName } from '../data/projectUtils.js';
+import { getAccessToken } from './AuthService.js';
+import { isImportedMediaSyncEnabled } from './SyncEngine.js';
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 2000;       // 2s, 4s, 8s exponential backoff
+const DEBOUNCE_MS = 1500;         // Wait 1.5s after last save before processing queue
+const MAX_CONCURRENT = 2;         // Max parallel uploads
+
+// ---------------------------------------------------------------------------
+// Module state
+// ---------------------------------------------------------------------------
+
+/**
+ * Queue of media files waiting to be pushed.
+ * @type {Array<{projectId: string, relPath: string, retries: number}>}
+ */
+const _queue = [];
+
+/** Currently uploading count */
+let _activeUploads = 0;
+
+/** Debounce timer ID */
+let _debounceTimer = null;
+
+/** Stats for UI */
+let _stats = { pushed: 0, failed: 0, pending: 0 };
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Initialize the shared media sync listener.
+ * Call once from App.js after DOMContentLoaded.
+ */
+export function initSharedMediaSync() {
+    EventBus.on(EVENTS.MEDIA_SAVED, ({ data }) => {
+        const { projectId, relPath, isExternal } = data;
+
+        // Imported/external media is opt-in via the single global toggle.
+        // In-app captures (spot photos/audio, KML) always sync.
+        if (isExternal && !isImportedMediaSyncEnabled()) {
+            console.log('[SharedMediaSync] Imported-media sync OFF — skipping:', relPath);
+            return;
+        }
+
+        // Skip if not logged in to Drive
+        if (!getAccessToken()) {
+            console.log('[SharedMediaSync] Not logged in, skipping auto-push:', relPath);
+            return;
+        }
+
+        // Verify project exists
+        const state = MasterData.getLocalState();
+        const project = state.projects.find(p => p.id === projectId);
+        if (!project) return;
+
+        // ALL non-external media auto-pushes to Drive. No exceptions.
+        // For imported editor projects → pushed to shared folder
+        // For ALL other projects (owner, shared or not) → pushed to own Drive folder
+
+        // Add to queue (dedup by relPath)
+        const exists = _queue.some(q => q.projectId === projectId && q.relPath === relPath);
+        if (!exists) {
+            _queue.push({ projectId, relPath, retries: 0 });
+            _stats.pending = _queue.length;
+            console.log(`[SharedMediaSync] Queued: ${relPath} (${_queue.length} pending)`);
+        }
+
+        // Debounce — wait for rapid saves to settle before processing
+        _scheduleDrain();
+    });
+
+    // NOTE: project-level pull/merge on switch is owned by SyncEngine
+    // (_syncActiveSharedProject). This module only handles media uploads.
+
+    // After storage ready + auth likely complete, scan for unsynced media
+    // This catches files saved while user was offline/logged-out
+    EventBus.on(EVENTS.STORAGE_READY, () => {
+        // Delay to let auth complete (auth happens async after storage)
+        setTimeout(() => _catchUpUnsyncedMedia(), 5000);
+    });
+
+    // User just enabled imported-media sync → push existing external files now.
+    EventBus.on(EVENTS.SYNC_IMPORTED_MEDIA_ENABLED, () => _catchUpUnsyncedMedia());
+
+    // Also try catch-up when data updates (covers post-login scenarios)
+    let _catchUpDone = false;
+    EventBus.on(EVENTS.DATA_UPDATED, () => {
+        if (_catchUpDone || !getAccessToken()) return;
+        _catchUpDone = true;
+        setTimeout(() => _catchUpUnsyncedMedia(), 2000);
+    });
+
+    console.log('[SharedMediaSync] Initialized — listening for MEDIA_SAVED + PROJECT_CHANGED.');
+}
+
+/**
+ * Scan all projects for media files that exist locally but not on Drive.
+ * Queues them for upload. Called after login to catch up files saved while offline.
+ */
+async function _catchUpUnsyncedMedia() {
+    if (!getAccessToken()) return;
+
+    const state = MasterData.getLocalState();
+    const project = state.projects.find(p => p.id === state.currentProjectId);
+    if (!project) return;
+
+    // Skip imported projects — they sync via PROJECT_CHANGED handler
+    if (project.shared?.isImported) return;
+
+    // Gather all media paths for active project
+    const mediaPaths = [];
+    for (const spot of (project.spots || [])) {
+        if (spot.image_local_filename) mediaPaths.push(spot.image_local_filename);
+        if (spot.audio_local_filename) mediaPaths.push(spot.audio_local_filename);
+    }
+    for (const site of (project.sites || [])) {
+        if (site.kml_filename) mediaPaths.push(site.kml_filename);
+    }
+
+    // Imported/external files only when the global toggle is ON.
+    if (isImportedMediaSyncEnabled()) {
+        for (const f of (project.external_files || [])) {
+            if (f.is_reference) continue;       // reference-only — nothing to upload
+            if (f.local_path)   mediaPaths.push(f.local_path);
+        }
+    }
+
+    if (mediaPaths.length === 0) return;
+
+    // Check which are already on Drive
+    let driveFiles;
+    try {
+        driveFiles = await DriveService.listAllDriveFiles();
+    } catch { return; }
+
+    const drivePaths = new Set(
+        driveFiles.map(f => f.appProperties?.relativePath).filter(Boolean)
+    );
+
+    // Queue any that are local-only
+    let queued = 0;
+    for (const relPath of mediaPaths) {
+        if (drivePaths.has(relPath)) continue; // Already on Drive
+
+        // Verify local file exists
+        const exists = await StorageAdapter.checkFileExists(relPath);
+        if (!exists) continue;
+
+        const alreadyQueued = _queue.some(q => q.relPath === relPath);
+        if (!alreadyQueued) {
+            _queue.push({ projectId: project.id, relPath, retries: 0 });
+            queued++;
+        }
+    }
+
+    if (queued > 0) {
+        _stats.pending = _queue.length;
+        console.log(`[SharedMediaSync] Catch-up: queued ${queued} unsynced media file(s).`);
+        _scheduleDrain();
+    }
+}
+
+/**
+ * Get current sync status for UI indicators.
+ * @returns {{ pushed: number, failed: number, pending: number, active: number }}
+ */
+export function getMediaSyncStatus() {
+    return { ..._stats, active: _activeUploads, pending: _queue.length };
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Queue processing
+// ---------------------------------------------------------------------------
+
+function _scheduleDrain() {
+    if (_debounceTimer) clearTimeout(_debounceTimer);
+    _debounceTimer = setTimeout(_drainQueue, DEBOUNCE_MS);
+}
+
+async function _drainQueue() {
+    _debounceTimer = null;
+
+    // Collect all promises so we can notify when batch completes
+    const promises = [];
+
+    while (_queue.length > 0 && _activeUploads < MAX_CONCURRENT) {
+        const item = _queue.shift();
+        _stats.pending = _queue.length;
+        _activeUploads++;
+
+        const p = _processItem(item).finally(() => {
+            _activeUploads--;
+        });
+        promises.push(p);
+    }
+
+    // Wait for current batch, then notify UI and drain remaining
+    if (promises.length > 0) {
+        await Promise.allSettled(promises);
+
+        // Notify UI so Sync Dashboard refreshes
+        EventBus.emit(EVENTS.SYNC_BATCH_COMPLETE, {
+            success: _stats.pushed,
+            failed: _stats.failed,
+            direction: 'push',
+        });
+
+        // Continue draining if more items queued during processing
+        if (_queue.length > 0) _scheduleDrain();
+    }
+}
+
+/**
+ * Process a single media upload item.
+ * Routes to shared folder (imported editor) or own project folder (owner).
+ */
+async function _processItem(item) {
+    const { projectId, relPath, retries } = item;
+
+    try {
+        const state = MasterData.getLocalState();
+        const project = state.projects.find(p => p.id === projectId);
+        if (!project) {
+            console.warn('[SharedMediaSync] Project gone, dropping:', projectId);
+            return;
+        }
+
+        const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
+
+        if (isImportedEditor) {
+            // Editor → push to owner's shared folder so owner can see it
+            await _pushToSharedFolder(project, relPath);
+        } else {
+            // Any other project (owner, shared or not) → push to own Drive folder
+            await _pushToOwnProjectFolder(project, relPath);
+        }
+
+        _stats.pushed++;
+        console.log(`[SharedMediaSync] ✓ Pushed: ${relPath}`);
+
+    } catch (err) {
+        console.error(`[SharedMediaSync] ✗ Failed (attempt ${retries + 1}): ${relPath}`, err.message);
+
+        if (retries < MAX_RETRIES) {
+            // Re-queue with backoff
+            const delay = RETRY_BASE_MS * Math.pow(2, retries);
+            setTimeout(() => {
+                _queue.push({ projectId, relPath, retries: retries + 1 });
+                _stats.pending = _queue.length;
+                _scheduleDrain();
+            }, delay);
+        } else {
+            _stats.failed++;
+            console.error(`[SharedMediaSync] Gave up after ${MAX_RETRIES} retries: ${relPath}`);
+            EventBus.emit(EVENTS.TOAST_SHOW, {
+                message: `Failed to sync media: ${relPath.split('/').pop()}`,
+                type: 'error',
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Upload to shared folder (editor → owner's Drive folder)
+// ---------------------------------------------------------------------------
+
+/**
+ * Push a media file into the shared project folder on the owner's Drive.
+ * This is what makes editor media visible to the owner.
+ *
+ * Path mapping:
+ *   Local: "MyProject_abc123/spots/Deer/images/Deer_cover.jpg"
+ *   Owner: "OwnerProject_def456/spots/Deer/images/Deer_cover.jpg"
+ *   Drive: [sharedFolderId]/spots/Deer/images/Deer_cover.jpg
+ */
+async function _pushToSharedFolder(project, relPath) {
+    const { sourceFolderId, ownerFolderName } = project.shared;
+    if (!sourceFolderId) throw new Error('No sourceFolderId on imported project');
+
+    // Get the file blob from local storage
+    const fileBlob = await StorageAdapter.getFileBlob(relPath);
+    if (!fileBlob) throw new Error(`Local file not found: ${relPath}`);
+
+    // Remap local folder prefix → owner's folder prefix
+    const localFolder = getProjectFolderName(project);
+    const ownerFolder = ownerFolderName || localFolder;
+
+    let targetPath = relPath;
+    if (relPath.startsWith(localFolder + '/')) {
+        targetPath = ownerFolder + relPath.substring(localFolder.length);
+    }
+
+    // Split path: remove project root folder (the shared folder IS the project root)
+    // e.g. "OwnerProject_def456/spots/Deer/images/Deer_cover.jpg"
+    //  → folders: ["spots", "Deer", "images"]
+    //  → filename: "Deer_cover.jpg"
+    const parts = targetPath.split('/');
+    parts.shift(); // Remove project folder name (mapped to sourceFolderId)
+    const filename = parts.pop();
+
+    if (!filename) throw new Error(`Invalid relPath after split: ${relPath}`);
+
+    // Ensure subfolders exist inside shared folder
+    let parentId = sourceFolderId;
+    if (parts.length > 0) {
+        parentId = await DriveService.ensureDrivePath(parts, sourceFolderId);
+    }
+
+    // Check if file already exists (avoid duplicates on retry)
+    const existing = await DriveService.findFileByName(filename, parentId);
+    if (existing) {
+        // Update existing file
+        await DriveService.updateDriveFile(existing.id, fileBlob);
+    } else {
+        // Upload new file with relativePath metadata
+        await DriveService.uploadFile(
+            fileBlob,
+            filename,
+            fileBlob.type || 'application/octet-stream',
+            parentId,
+            targetPath
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Upload to own project folder (owner's auto-sync)
+// ---------------------------------------------------------------------------
+
+/**
+ * Push media to the owner's own project folder on Drive.
+ * This ensures shared project media is on Drive for editors to pull.
+ */
+async function _pushToOwnProjectFolder(project, relPath) {
+    const fileBlob = await StorageAdapter.getFileBlob(relPath);
+    if (!fileBlob) throw new Error(`Local file not found: ${relPath}`);
+
+    const rootFolderId = await DriveService.findOrCreateRootFolder();
+
+    // Split into folder path + filename
+    const parts = relPath.split('/');
+    const filename = parts.pop();
+
+    if (!filename) throw new Error(`Invalid relPath: ${relPath}`);
+
+    // Ensure folder structure exists
+    let parentId = rootFolderId;
+    if (parts.length > 0) {
+        parentId = await DriveService.ensureDrivePath(parts, rootFolderId);
+    }
+
+    // Check if already exists (upsert)
+    const existing = await DriveService.findFileByName(filename, parentId);
+    if (existing) {
+        await DriveService.updateDriveFile(existing.id, fileBlob);
+    } else {
+        await DriveService.uploadFile(
+            fileBlob,
+            filename,
+            fileBlob.type || 'application/octet-stream',
+            parentId,
+            relPath
+        );
+    }
+}

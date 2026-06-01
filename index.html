@@ -1,31 +1,44 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
-    <title>Continuous Ecological Monitoring Toolkit</title>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- color-scheme managed via data-theme attribute + CSS -->
+    <title>Continuous Ecological Monitoring Toolkit</title>
     <link href="https://fonts.googleapis.com/css2?family=Poppins&display=swap" rel="stylesheet" />
-    <link rel="icon" type="image/png" href="/images/assets/favi.png">
+    <link rel="icon" type="image/png" href="./images/assets/favi.png">
 
     <link rel="stylesheet" href="./leaflet/leaflet.css" />
-
     <link rel="stylesheet" href="./styles/style.css" />
 
     <script src="https://accounts.google.com/gsi/client" async defer></script>
-    <meta charset="UTF-8">
+    <!-- Google API loader — provides gapi.load('picker') for shared-folder import -->
+    <script src="https://apps.google.com/api/js" async defer></script>
+    <!-- Inline theme init — runs before paint to prevent flash of wrong theme -->
+    <script>
+        (function() {
+            var saved = localStorage.getItem('cem-theme');
+            var theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+            document.documentElement.setAttribute('data-theme', theme);
+        })();
+    </script>
 </head>
 
 <body>
     <main>
-        <button id="menu-toggle">☰</button>
-        <div id="controls" class="open">
+        <button id="menu-toggle" aria-label="Toggle sidebar menu">☰</button>
+        <button id="theme-toggle" aria-label="Toggle dark mode">🌙</button>
+        <nav id="controls" class="open" aria-label="Control panel">
             <div class="control-section"
                 style="margin-bottom: 15px; border-bottom: 1px solid #ccc; padding-bottom: 10px;">
                 <div class="div-label" style="margin-bottom: 5px;">Project</div>
-                <select id="project-select" class="project-dropdown"></select>
+                <select id="project-select" class="project-dropdown" aria-label="Select project"></select>
                 <div style="display: flex; gap: 5px; margin-top: 5px;">
                     <button id="btn-new-project" class="small-btn">New</button>
                     <button id="btn-rename-project" class="small-btn">Rename</button>
+                    <button id="btn-share-project" class="small-btn">Share</button>
+                    <button id="btn-import-project" class="small-btn">Import</button>
                 </div>
             </div>
             <div id="auth-section" style="margin-top: 3.5rem;"></div>
@@ -52,18 +65,44 @@
                 </label>
             </div>
             <div id="stratification-controls"></div>
-        </div>
+        </nav>
         <div id="map"></div>
-        <div id="latlon"><label>Lat Long</label></div>
-        <div id="toast-notification"></div>
+        <div id="latlon" aria-live="polite"><label>Lat Long</label></div>
+        <div id="toast-notification" role="alert" aria-live="assertive"></div>
     </main>
 
-    <div id="popup-form" class="popup-overlay" style="display: none;">
+    <!-- ── Spot Form ─────────────────────────────────────────────────────── -->
+    <dialog id="popup-form" class="modal-dialog">
         <div class="popup-content">
             <form id="spot-form">
-                <input type="text" name="name" placeholder="Spot Name" />
-                <input type="text" name="birds" placeholder="Birds Seen" />
+                <input type="text" name="name" placeholder="Spot Name" autocomplete="off" />
+                <input type="text" name="birds" placeholder="Birds Seen" autocomplete="off" />
                 <textarea name="description" placeholder="Description"></textarea>
+
+                <!-- Location fields -->
+                <div style="margin:8px 0;">
+                    <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:0.9rem;">
+                        <input type="checkbox" id="use-current-location" checked />
+                        Use Current Location
+                    </label>
+                    <div id="custom-location-fields" style="display:none; gap:8px; margin-top:6px;">
+                        <input type="number" id="custom-lat" placeholder="Latitude" step="any" style="flex:1;" />
+                        <input type="number" id="custom-lon" placeholder="Longitude" step="any" style="flex:1;" />
+                    </div>
+                </div>
+
+                <!-- Date/Time fields -->
+                <div style="margin:8px 0;">
+                    <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:0.9rem;">
+                        <input type="checkbox" id="use-current-time" checked />
+                        Use Current Date/Time
+                    </label>
+                    <div id="custom-time-fields" style="display:none; gap:8px; margin-top:6px;">
+                        <input type="date" id="custom-date" style="flex:1;" />
+                        <input type="time" id="custom-time" step="1" style="flex:1;" />
+                    </div>
+                </div>
+
                 <div class="media-controls">
                     <label for="image-upload" class="custom-upload">
                         <span>📷</span>
@@ -75,18 +114,21 @@
                     </label>
                     <audio id="audioPlayback" controls class="audio-player"></audio>
                 </div>
-                <button type="submit" class="popup-btn">Submit</button>
-                <button type="button" id="close-form" class="popup-btn">Cancel</button>
+                <div class="button-group">
+                    <button type="submit" class="popup-btn">Submit</button>
+                    <button type="button" id="close-form" class="popup-btn cancel-btn">Cancel</button>
+                </div>
             </form>
             <div id="status"></div>
         </div>
-    </div>
+    </dialog>
 
-    <div id="add-site-popup-form" class="popup-overlay" style="display: none;">
+    <!-- ── Add Site ──────────────────────────────────────────────────────── -->
+    <dialog id="add-site-popup-form" class="modal-dialog">
         <div class="popup-content">
             <form id="add-site-form">
                 <h3>Add New Site</h3>
-                <input type="text" name="siteName" placeholder="Site Name" required />
+                <input type="text" name="siteName" placeholder="Site Name" required autocomplete="off" />
                 <label for="kml-upload" class="kml-upload-area">
                     <span id="kml-file-name">Choose KML file...</span>
                 </label>
@@ -103,49 +145,71 @@
             </form>
             <div id="add-site-status"></div>
         </div>
-    </div>
+    </dialog>
 
-    <div id="save-route-dialog" class="modal">
-        <div class="modal-content">
-            <span class="close">&times;</span>
+    <!-- ── Save Route ────────────────────────────────────────────────────── -->
+    <dialog id="save-route-dialog" class="modal-dialog">
+        <div class="popup-content">
             <h3>Save Route</h3>
             <form id="route-form">
-                <input type="text" id="route-name" placeholder="Walk Name" />
+                <input type="text" id="route-name" placeholder="Walk Name" autocomplete="off" />
                 <div class="button-group">
                     <button type="submit" class="save-btn">Save</button>
                     <button type="button" class="cancel-btn">Cancel</button>
                 </div>
             </form>
         </div>
-    </div>
+    </dialog>
 
-    <div id="import-media-popup" class="import-popup-overlay" style="display: none;">
-        <div class="import-popup-content">
+    <!-- ── Import Media ──────────────────────────────────────────────────── -->
+    <dialog id="import-media-popup" class="modal-dialog">
+        <div class="popup-content import-popup-content">
             <form id="import-media-form" novalidate>
                 <h3>Import External Media</h3>
                 <div id="spot-selection-container" class="import-multi-select-box"></div>
                 <input type="file" id="external-file-input" name="files" class="import-file-input" multiple required>
-                <div class="import-form-actions">
-                    <button type="submit" class="import-action-btn">Import</button>
-                    <button type="button" id="cancel-import-btn" class="import-secondary-action-btn">Cancel</button>
+
+                <div style="margin:10px 0;">
+                    <label style="display:flex; align-items:center; gap:6px; cursor:pointer; font-size:0.9rem;">
+                        <input type="checkbox" id="import-as-reference" />
+                        Import as Reference
+                        <span style="font-size:0.8rem; color:var(--text-muted);">(store path only, don't copy files)</span>
+                    </label>
+                    <div id="reference-base-dir-container" style="display:none; margin-top:8px; padding:8px; background:var(--bg-surface-alt); border-radius:4px;">
+                        <label for="reference-base-dir" style="display:block; font-size:0.85rem; font-weight:bold; margin-bottom:4px;">
+                            Base Directory Path
+                        </label>
+                        <input type="text" id="reference-base-dir"
+                               placeholder="e.g. D:\Recordings\Site1 or /home/user/recordings"
+                               style="width:100%; padding:6px 8px; font-size:0.85rem; border:1px solid var(--border-color); border-radius:4px; box-sizing:border-box;" />
+                        <span style="font-size:0.75rem; color:var(--text-muted); display:block; margin-top:4px;">
+                            Full path to the folder containing these files on your computer.
+                        </span>
+                    </div>
+                </div>
+
+                <div class="button-group">
+                    <button type="submit" class="popup-btn">Import</button>
+                    <button type="button" id="cancel-import-btn" class="popup-btn cancel-btn">Cancel</button>
                 </div>
             </form>
         </div>
-    </div>
+    </dialog>
 
-    <div id="analysis-popup" class="import-popup-overlay" style="display: none;">
-        <div class="import-popup-content" style="max-width: 600px; max-height: 90vh; display: flex; flex-direction: column;">
-            
-            <div style="margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 15px;">
+    <!-- ── Analysis Hub ──────────────────────────────────────────────────── -->
+    <dialog id="analysis-popup" class="modal-dialog" style="max-width: min(90vw, 600px);">
+        <div class="popup-content import-popup-content" style="max-width: 600px; max-height: 90vh; display: flex; flex-direction: column;">
+
+            <div style="margin-bottom: 15px; border-bottom: 1px solid var(--border-color); padding-bottom: 15px;">
                 <label class="div-label">Job Name <span style="color:red">*</span></label>
-                <input type="text" id="analysis-job-name" placeholder="e.g. River Survey - Morning" style="margin-bottom: 5px;" required />
+                <input type="text" id="analysis-job-name" placeholder="e.g. River Survey - Morning" style="margin-bottom: 5px;" required autocomplete="off" />
             </div>
 
             <div style="display:flex; justify-content:space-between; align-items:center; padding-bottom:10px;">
-                <h3>📊 Analysis Hub</h3>
-                <div style="font-size: 0.85rem; background: #f5f5f5; padding: 5px 10px; border-radius: 20px;">
+                <h3 style="color: var(--text-dark);">📊 Analysis Hub</h3>
+                <div style="font-size: 0.85rem; background: var(--bg-surface-alt); padding: 5px 10px; border-radius: 20px;">
                     <span id="watcher-indicator" style="color: #ccc; font-size: 1.2rem; line-height: 0;">●</span>
-                    <span id="watcher-status-text" style="margin-left: 5px;">Connecting...</span>
+                    <span id="watcher-status-text" style="margin-left: 5px; color: var(--text-muted);">Connecting...</span>
                 </div>
             </div>
 
@@ -154,9 +218,9 @@
                 <strong>⚠️ Watcher is Offline</strong><br>
                 To run analysis, you must start the python watcher on your computer.
                 <div
-                    style="background:#f8f9fa; border:1px solid #ddd; padding:8px; margin-top:8px; font-family:monospace; border-radius:4px; display:flex; justify-content:space-between;">
+                    style="background: var(--bg-surface-alt); border:1px solid var(--border-color); padding:8px; margin-top:8px; font-family:monospace; border-radius:4px; display:flex; justify-content:space-between;">
                     <code id="watcher-command">python watcher.py</code>
-                    <button onclick="navigator.clipboard.writeText('python watcher.py')"
+                    <button type="button" id="copy-watcher-cmd"
                         style="background:none; border:none; color:#2196F3; cursor:pointer;">Copy</button>
                 </div>
                 <p style="margin-top:5px; margin-bottom:0; font-size:0.8rem;">Run this in your terminal at the root of
@@ -173,79 +237,186 @@
                 <label class="div-label">2. Select Input Data</label>
                 <div id="analysis-file-selector" class="import-multi-select-box"
                     style="height: 120px; resize: vertical; margin-bottom: 20px;">
-                    <p style="padding:10px; color:#999;">Select a script first...</p>
+                    <p style="padding:10px; color: var(--text-muted);">Select a script first...</p>
                 </div>
 
                 <div id="dynamic-params-container" style="display:none;">
                     <label class="div-label">3. Configure Parameters</label>
                     <div id="analysis-dynamic-form"
-                        style="background: #f9f9f9; padding: 15px; border-radius: 8px; border: 1px solid #eee;">
+                        style="background: var(--bg-surface-alt); padding: 15px; border-radius: 8px; border: 1px solid var(--border-color);">
                     </div>
                 </div>
 
             </div>
 
-            <div class="button-group" style="margin-top: 20px; border-top: 1px solid #eee;">
+            <div class="button-group" style="margin-top: 20px; border-top: 1px solid var(--border-color);">
                 <button id="btn-run-analysis" class="popup-btn" disabled>🚀 Queue Job</button>
-                <button id="close-analysis-btn" class="cancel-btn">Close</button>
+                <button type="button" id="close-analysis-btn" class="popup-btn cancel-btn">Close</button>
             </div>
         </div>
-    </div>
+    </dialog>
 
-    <div id="spot-details-menu">
-        <button id="close-spot-details">x</button>
+    <!-- ── Jobs Dashboard ────────────────────────────────────────────────── -->
+    <dialog id="jobs-popup" class="modal-dialog modal-dialog--wide">
+        <div class="popup-content import-popup-content" style="max-width: 90vw; height: 85vh; display: flex; flex-direction: column; padding: 0;">
+            <div class="external-data-header" style="padding: 15px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin:0; color: var(--text-dark);">Analysis Jobs Dashboard</h3>
+                <div style="display: flex; gap: 10px;">
+                    <button id="refresh-jobs-btn" class="control-button" style="padding: 5px 10px;">↻ Refresh</button>
+                    <button type="button" id="close-jobs-btn" class="close-viewer-btn" style="margin:0;">x</button>
+                </div>
+            </div>
+            <div style="display: flex; flex: 1; overflow: hidden;">
+                <div id="jobs-list-sidebar" style="width: 300px; border-right: 1px solid var(--border-color); overflow-y: auto; background: var(--bg-surface-alt);">
+                </div>
+                <div id="job-result-viewer" style="flex: 1; overflow-y: auto; padding: 20px; background: var(--bg-surface);">
+                    <div id="job-viewer-placeholder" style="text-align: center; color: var(--text-muted); margin-top: 100px;">
+                        Select a job from the left to view details and results.
+                    </div>
+                    <div id="job-viewer-content" style="display: none;">
+                        <div style="margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid var(--border-color);">
+                            <h2 id="viewer-job-name" style="margin: 0 0 5px 0; color: var(--text-dark);"></h2>
+                            <div style="font-size: 0.9rem; color: var(--text-muted);">
+                                <span id="viewer-job-status" style="font-weight: bold;"></span> |
+                                <span id="viewer-job-id"></span>
+                            </div>
+                        </div>
+                        <h4 style="color: var(--text-dark);">Generated Output Files</h4>
+                        <div id="viewer-file-list" style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px;"></div>
+                        <div id="viewer-preview-area" style="border: 1px solid var(--border-color); min-height: 300px; padding: 10px; border-radius: 4px; background: var(--bg-surface-alt);">
+                            <p style="color: var(--text-muted); text-align:center;">Select a file above to preview</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- ── Spot Details Slide Panel (not a dialog — side panel) ───────── -->
+    <aside id="spot-details-menu" aria-label="Spot details">
+        <button id="close-spot-details" aria-label="Close spot details">x</button>
         <div id="spot-details-content"></div>
-    </div>
+    </aside>
 
-    <div id="external-data-viewer" class="external-data-popup" style="display: none;">
-        <div class="external-data-popup-content"> 
+    <!-- ── External Data Viewer ──────────────────────────────────────────── -->
+    <dialog id="external-data-viewer" class="modal-dialog">
+        <div class="popup-content external-data-popup-content">
             <div class="external-data-header">
                 <h3>External Media</h3>
-                <button id="close-external-viewer" class="close-viewer-btn">x</button>
+                <button type="button" id="close-external-viewer" class="close-viewer-btn">x</button>
             </div>
             <div id="external-data-content" class="external-data-list"></div>
         </div>
-    </div>
+    </dialog>
 
-    <div id="jobs-popup" class="import-popup-overlay" style="display: none;">
-        <div class="import-popup-content">
-            <h3>Jobs Feature Pending</h3><button id="close-jobs-btn">Close</button>
-        </div>
-    </div>
-
-    <div id="conflict-modal" class="popup-overlay" style="display: none; z-index: 2000;">
+    <!-- ── Conflict Resolution ───────────────────────────────────────────── -->
+    <dialog id="conflict-modal" class="modal-dialog">
         <div class="popup-content" style="text-align: center;">
             <h3>⚠️ Data Conflict</h3>
             <p id="conflict-msg">Local and Drive data are different.</p>
 
             <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 20px;">
-                <button id="btn-conflict-merge" class="popup-btn" style="background: #673AB7;">
+                <button id="btn-conflict-merge" class="popup-btn" style="background: #673AB7; color: white;">
                     ✨ Smart Merge (Recommended)
                 </button>
                 <div style="display: flex; gap: 10px;">
-                    <button id="btn-conflict-pull" class="popup-btn" style="background: #2196F3; flex: 1;">
+                    <button id="btn-conflict-pull" class="popup-btn" style="background: #2196F3; color: white; flex: 1;">
                         ⬇ Pull (Drive Wins)
                     </button>
-                    <button id="btn-conflict-push" class="popup-btn" style="background: #FF9800; flex: 1;">
+                    <button id="btn-conflict-push" class="popup-btn" style="background: #FF9800; color: white; flex: 1;">
                         ⬆ Push (Local Wins)
                     </button>
                 </div>
-                <button id="btn-conflict-cancel" class="popup-btn" style="background: #777;">
+                <button id="btn-conflict-cancel" class="popup-btn" style="background: #777; color: white;">
                     Do Nothing
                 </button>
             </div>
         </div>
-    </div>
+    </dialog>
+
+    <!-- ── Project Name Input Dialog ─────────────────────────────────────── -->
+    <dialog id="project-name-dialog" class="modal-dialog">
+        <div class="popup-content">
+            <h3 id="project-name-dialog-title">New Project</h3>
+            <form id="project-name-form">
+                <input type="text" id="project-name-input" placeholder="Project name" autocomplete="off" required />
+                <div class="button-group">
+                    <button type="submit" class="popup-btn">OK</button>
+                    <button type="button" id="cancel-project-name" class="popup-btn cancel-btn">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <!-- ── Share Project Dialog ────────────────────────────────────────── -->
+    <dialog id="share-project-dialog" class="modal-dialog">
+        <div class="popup-content">
+            <h3>Share Project</h3>
+            <form id="share-project-form">
+                <div id="share-project-list" style="max-height: 150px; overflow-y: auto; margin-bottom: 10px;"></div>
+
+                <input type="text" id="share-emails-input"
+                       placeholder="Enter Gmail addresses (comma-separated)"
+                       autocomplete="email" />
+
+                <div style="margin: 8px 0;">
+                    <label style="font-size: 0.9rem;">
+                        Permission:
+                        <select id="share-role-select" style="margin-left: 6px;">
+                            <option value="reader">Viewer (read-only)</option>
+                            <option value="writer">Editor (can edit)</option>
+                        </select>
+                    </label>
+                </div>
+
+                <div id="share-link-section" style="display: none; margin: 10px 0; padding: 8px; background: var(--surface-alt, #f0f0f0); border-radius: 6px;">
+                    <div style="font-size: 0.85rem; margin-bottom: 4px; font-weight: 500;">Share Link:</div>
+                    <code id="share-link-display" style="font-size: 0.8rem; word-break: break-all;"></code>
+                    <button type="button" id="copy-share-link-btn" class="small-btn" style="margin-top: 6px;">Copy Link</button>
+                </div>
+
+                <div class="button-group">
+                    <button type="submit" class="popup-btn">Share</button>
+                    <button type="button" id="cancel-share-btn" class="popup-btn cancel-btn">Close</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <!-- ── Import Project Dialog ───────────────────────────────────────── -->
+    <dialog id="import-project-dialog" class="modal-dialog">
+        <div class="popup-content">
+            <h3>Import Shared Project</h3>
+            <p style="font-size: 0.85rem; margin-bottom: 10px; opacity: 0.8;">
+                Pick the project folder that was shared with you. A Google Drive window
+                will open so you can grant this app access to just that folder.
+            </p>
+            <div class="button-group" style="margin-bottom: 12px;">
+                <button type="button" id="btn-pick-drive-folder" class="popup-btn">
+                    📂 Select Shared Folder from Drive
+                </button>
+            </div>
+            <form id="import-project-form">
+                <p style="font-size: 0.8rem; margin: 8px 0; opacity: 0.7;">
+                    Or paste a share link / folder ID (only works for folders you have
+                    already opened via the picker):
+                </p>
+                <input type="text" id="import-link-input"
+                       placeholder="Paste share link or folder ID"
+                       autocomplete="off" />
+                <div class="button-group">
+                    <button type="submit" class="popup-btn">Import</button>
+                    <button type="button" id="cancel-import-project-btn" class="popup-btn cancel-btn">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <!-- ── Sync Dashboard (built at runtime by SyncDashboard.js) ─────── -->
+    <!-- SyncDashboard creates its own dialog dynamically -->
 
     <script src="./leaflet/leaflet.js"></script>
-
-    <script type="module" src="./js/app.js"></script>
-    <script type="module" src="./js/map.js"></script>
-    <script type="module" src="./js/route.js"></script>
-    <script type="module" src="./js/spots.js"></script>
-    <script type="module" src="./js/ui.js"></script>
-    <script type="module" src="./js/sites.js"></script>
-    <script type="module" src="./js/analysis.js"></script>
+    <script type="module" src="./js/main.js"></script>
 </body>
 
 </html>
