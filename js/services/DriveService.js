@@ -264,7 +264,7 @@ export async function findFileByName(filename, parentId) {
     const q = `name = '${safeName}' and '${safeParent}' in parents and trashed = false`;
 
     const res  = await fetchDrive(
-        `${DRIVE_FILES_URL}?q=${encodeURIComponent(q)}&fields=files(id,name,modifiedTime)`
+        `${DRIVE_FILES_URL}?q=${encodeURIComponent(q)}&fields=files(id,name,modifiedTime)&supportsAllDrives=true&includeItemsFromAllDrives=true`
     );
     const data = await res.json();
 
@@ -320,7 +320,7 @@ export async function findFilesByPrefix(namePrefix, parentId) {
  * @returns {Promise<string>}
  */
 export async function readDriveTextFile(fileId) {
-    const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media`);
+    const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media&supportsAllDrives=true`);
     return res.text();
 }
 
@@ -459,6 +459,8 @@ async function _listFilesRecursive(folderId) {
             q,
             fields,
             pageSize: String(PAGE_SIZE),
+            supportsAllDrives: 'true',
+            includeItemsFromAllDrives: 'true',
         });
         if (pageToken) params.set('pageToken', pageToken);
 
@@ -503,7 +505,7 @@ export async function listAllFilesInFolder(folderId) {
  * @returns {Promise<Blob>}
  */
 export async function downloadBlob(fileId) {
-    const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media`);
+    const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media&supportsAllDrives=true`);
     return res.blob();
 }
 
@@ -590,6 +592,33 @@ export async function shareWithUser(fileId, emailAddress, role, sendEmail = true
 }
 
 /**
+ * Make a file readable by "anyone with the link".
+ *
+ * Used for shared-project media: editors can't read the owner's private media
+ * under drive.file, so each media file is published link-public and displayed
+ * via its public URL (https://drive.google.com/thumbnail?id=… / uc?id=…).
+ * Idempotent — a duplicate "anyone" permission is harmless.
+ *
+ * @param {string} fileId
+ * @returns {Promise<void>}
+ */
+export async function makeFilePublic(fileId) {
+    try {
+        await fetchDrive(
+            `${DRIVE_FILES_URL}/${fileId}/permissions?supportsAllDrives=true`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: 'reader', type: 'anyone' }),
+            }
+        );
+    } catch (e) {
+        // Already public, or we lack permission — non-fatal for display.
+        console.warn('[DriveService] makeFilePublic failed:', e.message);
+    }
+}
+
+/**
  * List all permissions on a Drive file/folder.
  *
  * @param {string} fileId  Drive file/folder ID.
@@ -626,7 +655,7 @@ export async function removePermission(fileId, permissionId) {
  */
 export async function getFileMetadata(fileId, fields = 'id,name,mimeType,parents,owners,shared,permissions(id,role,type,emailAddress)') {
     const res = await fetchDrive(
-        `${DRIVE_FILES_URL}/${fileId}?fields=${encodeURIComponent(fields)}`
+        `${DRIVE_FILES_URL}/${fileId}?fields=${encodeURIComponent(fields)}&supportsAllDrives=true`
     );
     return res.json();
 }
@@ -647,7 +676,10 @@ export async function listFolderContents(folderId) {
     let pageToken = null;
 
     do {
-        const params = new URLSearchParams({ q, fields, pageSize: String(PAGE_SIZE) });
+        const params = new URLSearchParams({
+            q, fields, pageSize: String(PAGE_SIZE),
+            supportsAllDrives: 'true', includeItemsFromAllDrives: 'true',
+        });
         if (pageToken) params.set('pageToken', pageToken);
 
         const res  = await fetchDrive(`${DRIVE_FILES_URL}?${params.toString()}`);

@@ -21,8 +21,8 @@
  * which is included via a <script> tag in index.html.
  *
  * Usage:
- *   import { pickSharedFolder } from './services/PickerService.js';
- *   const folder = await pickSharedFolder(); // { id, name } or null if cancelled
+ *   import { pickSharedProjectFile } from './services/PickerService.js';
+ *   const file = await pickSharedProjectFile(); // { id, name } or null if cancelled
  */
 
 import Config from '../core/Config.js';
@@ -98,15 +98,24 @@ function _waitForGapi(timeoutMs) {
 // ---------------------------------------------------------------------------
 
 /**
- * Open the Google Picker so the user can select a FOLDER that was shared with
- * them ("Shared with me"). Selecting the folder grants this app drive.file
- * access to it under the narrow scope.
+ * Open the Google Picker so the editor selects the shared project's
+ * `project_data.json` FILE (not the folder).
+ *
+ * WHY a file, not a folder: under the narrow `drive.file` scope, picking a
+ * folder grants access to the folder but NOT the right to list/read the files
+ * the owner created inside it. Picking the `project_data.json` file directly
+ * grants read+write to THAT file (the editor already has writer permission via
+ * the share) — which is exactly the one file collaborators edit. No restricted
+ * scope, no OAuth verification.
+ *
+ * The view shows "Shared with me", filtered to JSON, with folder navigation so
+ * the user can open the shared folder and pick `project_data.json` inside it.
  *
  * @returns {Promise<{id: string, name: string}|null>}
- *          The picked folder, or null if the user cancelled/closed the dialog.
+ *          The picked file, or null if the user cancelled.
  * @throws  {Error} If config is missing or the Picker fails to load.
  */
-export async function pickSharedFolder() {
+export async function pickSharedProjectFile() {
     const apiKey = Config.google.pickerApiKey;
     const appId  = Config.google.appId;
 
@@ -124,19 +133,20 @@ export async function pickSharedFolder() {
 
     return new Promise((resolve, reject) => {
         try {
-            // "Shared with me" folders, folder-selection enabled.
-            const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
-                .setSelectFolderEnabled(true)
-                .setMode(google.picker.DocsViewMode.LIST)
-                .setOwnedByMe(false)          // show items shared with the user
-                .setIncludeFolders(true);
+            // "Shared with me", navigable folders, but select a JSON FILE.
+            const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
+                .setSelectFolderEnabled(false)
+                .setIncludeFolders(true)          // let the user open the shared folder
+                .setOwnedByMe(false)              // show items shared with the user
+                .setMimeTypes('application/json')  // only project_data.json-type files
+                .setMode(google.picker.DocsViewMode.LIST);
 
             const builder = new google.picker.PickerBuilder()
                 .setOAuthToken(oauthToken)
                 .setDeveloperKey(apiKey)
-                .setAppId(appId)              // associate picked files with this app
+                .setAppId(appId)
                 .addView(view)
-                .setTitle('Select a shared project folder')
+                .setTitle('Open the shared folder, then select project_data.json')
                 .setCallback((data) => {
                     const action = data[google.picker.Response.ACTION];
 

@@ -17,7 +17,7 @@ import {
     parseFolderIdFromInput,
     getSharingInfo,
 } from '../services/SharingService.js';
-import { pickSharedFolder } from '../services/PickerService.js';
+import { pickSharedProjectFile } from '../services/PickerService.js';
 import { showToast } from './Toast.js';
 import { openModal, closeModal } from './ModalManager.js';
 
@@ -212,10 +212,10 @@ function _initImportModal() {
         closeModal('import-project-dialog');
 
         try {
-            const folder = await pickSharedFolder();
-            if (!folder) return; // user cancelled the picker
+            const file = await pickSharedProjectFile();
+            if (!file) return; // user cancelled the picker
 
-            const project = await importSharedProject(folder.id);
+            const project = await importSharedProject(file.id);
             showToast(`Imported "${project.name}" successfully!`, 'success');
         } catch (err) {
             console.error('[SharingUI] Picker import failed:', err);

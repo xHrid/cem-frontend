@@ -256,13 +256,23 @@ async function _processItem(item) {
         }
 
         const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
+        const isShared = isImportedEditor || project.sharing?.isShared;
 
+        let fileId = null;
         if (isImportedEditor) {
             // Editor → push to owner's shared folder so owner can see it
-            await _pushToSharedFolder(project, relPath);
+            fileId = await _pushToSharedFolder(project, relPath);
         } else {
             // Any other project (owner, shared or not) → push to own Drive folder
-            await _pushToOwnProjectFolder(project, relPath);
+            fileId = await _pushToOwnProjectFolder(project, relPath);
+        }
+
+        // For SHARED projects, make the media link-public and record its Drive
+        // ID on the spot/site so the OTHER side (who can't list our folder under
+        // drive.file) can display it via a public URL.
+        if (isShared && fileId) {
+            await DriveService.makeFilePublic(fileId);
+            _recordDriveId(project, relPath, fileId);
         }
 
         _stats.pushed++;
@@ -339,18 +349,17 @@ async function _pushToSharedFolder(project, relPath) {
     // Check if file already exists (avoid duplicates on retry)
     const existing = await DriveService.findFileByName(filename, parentId);
     if (existing) {
-        // Update existing file
         await DriveService.updateDriveFile(existing.id, fileBlob);
-    } else {
-        // Upload new file with relativePath metadata
-        await DriveService.uploadFile(
-            fileBlob,
-            filename,
-            fileBlob.type || 'application/octet-stream',
-            parentId,
-            targetPath
-        );
+        return existing.id;
     }
+    const created = await DriveService.uploadFile(
+        fileBlob,
+        filename,
+        fileBlob.type || 'application/octet-stream',
+        parentId,
+        targetPath
+    );
+    return created.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,13 +392,44 @@ async function _pushToOwnProjectFolder(project, relPath) {
     const existing = await DriveService.findFileByName(filename, parentId);
     if (existing) {
         await DriveService.updateDriveFile(existing.id, fileBlob);
-    } else {
-        await DriveService.uploadFile(
-            fileBlob,
-            filename,
-            fileBlob.type || 'application/octet-stream',
-            parentId,
-            relPath
-        );
+        return existing.id;
+    }
+    const created = await DriveService.uploadFile(
+        fileBlob,
+        filename,
+        fileBlob.type || 'application/octet-stream',
+        parentId,
+        relPath
+    );
+    return created.id;
+}
+
+/**
+ * Record a media file's Drive ID on the matching spot/site record so the other
+ * collaborator can display it via a public URL (they can't list our folder
+ * under drive.file). Triggers a project_data.json re-push via DATA_UPDATED.
+ *
+ * @param {object} project
+ * @param {string} relPath  Local relative path of the media file.
+ * @param {string} fileId   Drive file ID (now public).
+ */
+function _recordDriveId(project, relPath, fileId) {
+    let changed = false;
+    for (const spot of (project.spots || [])) {
+        if (spot.image_local_filename === relPath && spot.image_drive_id !== fileId) {
+            spot.image_drive_id = fileId; changed = true;
+        }
+        if (spot.audio_local_filename === relPath && spot.audio_drive_id !== fileId) {
+            spot.audio_drive_id = fileId; changed = true;
+        }
+    }
+    for (const site of (project.sites || [])) {
+        if (site.kml_filename === relPath && site.kml_drive_id !== fileId) {
+            site.kml_drive_id = fileId; changed = true;
+        }
+    }
+    if (changed) {
+        MasterData.saveMasterData();
+        EventBus.emit(EVENTS.DATA_UPDATED); // re-push project_data.json with the IDs
     }
 }

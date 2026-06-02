@@ -432,18 +432,32 @@ async function _showSpotDetails(spot) {
         const entry = spotEntries[idx];
 
         const imgContainer = content.querySelector(`.media-container-img-${idx}`);
-        if (entry.image_local_filename && imgContainer) {
-            const url = await getLocalFileUrl(entry.image_local_filename);
-            imgContainer.innerHTML = url
-                ? `<img src="${url}" style="max-width:100%; border-radius:8px;">`
-                : `<p style="font-size:0.8rem; color:red;">Image file missing from disk</p>`;
+        if ((entry.image_local_filename || entry.image_drive_id) && imgContainer) {
+            // Prefer the local file; fall back to the public Drive URL (e.g. an
+            // editor viewing the owner's photo, which isn't on this device).
+            const url = entry.image_local_filename
+                ? await getLocalFileUrl(entry.image_local_filename)
+                : null;
+            if (url) {
+                imgContainer.innerHTML = `<img src="${url}" style="max-width:100%; border-radius:8px;">`;
+            } else if (entry.image_drive_id) {
+                const pub = `https://drive.google.com/thumbnail?id=${entry.image_drive_id}&sz=w1600`;
+                imgContainer.innerHTML = `<img src="${pub}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
+            } else {
+                imgContainer.innerHTML = `<p style="font-size:0.8rem; color:red;">Image file missing from disk</p>`;
+            }
         }
 
         const audioContainer = content.querySelector(`.media-container-audio-${idx}`);
-        if (entry.audio_local_filename && audioContainer) {
-            const url = await getLocalFileUrl(entry.audio_local_filename);
+        if ((entry.audio_local_filename || entry.audio_drive_id) && audioContainer) {
+            const url = entry.audio_local_filename
+                ? await getLocalFileUrl(entry.audio_local_filename)
+                : null;
             if (url) {
                 audioContainer.innerHTML = `<audio controls src="${url}" style="width:100%;"></audio>`;
+            } else if (entry.audio_drive_id) {
+                const pub = `https://drive.google.com/uc?export=download&id=${entry.audio_drive_id}`;
+                audioContainer.innerHTML = `<audio controls src="${pub}" style="width:100%;"></audio>`;
             }
         }
     }

@@ -107,17 +107,26 @@ async function _pushAllProjectMedia(project, rootFolderId) {
 
             // Check if already on Drive (skip duplicate uploads)
             const existing = await DriveService.findFileByName(filename, parentId);
+            let fileId;
             if (existing) {
-                // Update content in case local version is newer
                 await DriveService.updateDriveFile(existing.id, fileBlob);
+                fileId = existing.id;
             } else {
-                await DriveService.uploadFile(
+                const created = await DriveService.uploadFile(
                     fileBlob,
                     filename,
                     fileBlob.type || 'application/octet-stream',
                     parentId,
                     relPath
                 );
+                fileId = created.id;
+            }
+
+            // Publish + record the Drive ID so collaborators can display it via
+            // a public URL (they can't list our folder under drive.file).
+            if (fileId) {
+                await DriveService.makeFilePublic(fileId);
+                _setMediaDriveId(project, relPath, fileId);
             }
             pushed++;
         } catch (err) {
@@ -127,6 +136,24 @@ async function _pushAllProjectMedia(project, rootFolderId) {
 
     if (pushed > 0) {
         console.log(`[SharingService] Pushed ${pushed}/${mediaPaths.length} media files to Drive.`);
+    }
+}
+
+/**
+ * Stamp a media file's public Drive ID onto its spot/site record (mutates in
+ * place; caller persists). Lets collaborators display media via a public URL.
+ *
+ * @param {object} project
+ * @param {string} relPath
+ * @param {string} fileId
+ */
+function _setMediaDriveId(project, relPath, fileId) {
+    for (const spot of (project.spots || [])) {
+        if (spot.image_local_filename === relPath) spot.image_drive_id = fileId;
+        if (spot.audio_local_filename === relPath) spot.audio_drive_id = fileId;
+    }
+    for (const site of (project.sites || [])) {
+        if (site.kml_filename === relPath) site.kml_drive_id = fileId;
     }
 }
 
@@ -158,11 +185,25 @@ export async function shareProject(projectId, emails, role) {
     const projectFolder = getProjectFolderName(project);
     const folderId      = await DriveService.ensureDrivePath([projectFolder], rootFolderId);
 
-    // Push project_data.json into the folder BEFORE sharing
-    await pushProjectDataToDrive(project);
+    // Mark shared NOW so pushProjectDataToDrive uses the merge path and the
+    // media push knows to publish public links.
+    if (!project.sharing) {
+        project.sharing = {
+            isShared: true,
+            driveFolderId: folderId,
+            sharedWith: [],
+            sharedAt: new Date().toISOString(),
+        };
+    }
+    project.sharing.isShared = true;
+    project.sharing.driveFolderId = folderId;
 
-    // Push ALL existing media to Drive so recipients can pull it immediately
+    // Push media FIRST — this publishes each file and stamps its public Drive
+    // ID onto the spot/site records...
     await _pushAllProjectMedia(project, rootFolderId);
+
+    // ...then push project_data.json so it carries those Drive IDs for editors.
+    await pushProjectDataToDrive(project);
 
     // Share with each email
     const results = [];
@@ -248,66 +289,53 @@ export async function unshareProject(projectId, email) {
 // ---------------------------------------------------------------------------
 
 /**
- * Import a shared project by its Drive folder ID.
+ * Import a shared project from the picked `project_data.json` FILE.
  *
- * Reads `project_data.json` directly from the shared folder.
- * No need to access parent folder or owner's master_data.json.
+ * The editor selects project_data.json via the Picker, which grants drive.file
+ * read+write to that exact file. We read it by ID (no folder listing — which
+ * drive.file can't do for the owner's files) and derive the shared folder ID
+ * from the file's `parents`, so media uploads/downloads still have a target.
  *
- * @param {string} folderId  Drive folder ID from the share link.
- * @returns {Promise<object>}  The imported project object.
+ * @param {string} projectFileId  Drive file ID of the shared project_data.json.
+ * @returns {Promise<object>}     The imported project object.
  */
-export async function importSharedProject(folderId) {
+export async function importSharedProject(projectFileId) {
     if (!getAccessToken()) throw new Error('Not logged in.');
 
-    // Verify we can access the folder
-    let folderMeta;
+    // Read metadata of the picked file (id is now app-authorized via the Picker).
+    let fileMeta;
     try {
-        folderMeta = await DriveService.getFileMetadata(folderId);
+        fileMeta = await DriveService.getFileMetadata(
+            projectFileId,
+            'id,name,mimeType,parents,owners,capabilities(canEdit)'
+        );
     } catch (err) {
         throw new Error(
-            'Cannot access shared folder. Make sure the link is correct and the owner has shared it with you.'
+            'Cannot access the selected file. Re-open the shared folder in the picker ' +
+            'and select the file named project_data.json.'
         );
     }
 
-    if (folderMeta.mimeType !== 'application/vnd.google-apps.folder') {
-        throw new Error('The provided ID is not a folder.');
+    if (fileMeta.mimeType === 'application/vnd.google-apps.folder') {
+        throw new Error('You selected a folder. Open it and pick the project_data.json file inside.');
     }
 
-    // Determine our permission level on this folder
-    const myRole = await _detectMyRole(folderId);
+    const sourceFolderId = fileMeta.parents?.[0] || null;
+    const myRole = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
 
-    // Read project_data.json from INSIDE the shared folder
+    // Read the project JSON by file ID.
     let sharedProject = null;
-    const projectFile = await DriveService.findFileByName('project_data.json', folderId);
-
-    if (projectFile) {
-        try {
-            const text = await DriveService.readDriveTextFile(projectFile.id);
-            sharedProject = JSON.parse(text);
-            console.log('[SharingService] Read project_data.json from shared folder.');
-        } catch (err) {
-            console.warn('[SharingService] Could not parse project_data.json:', err);
-        }
+    try {
+        sharedProject = JSON.parse(await DriveService.readDriveTextFile(projectFileId));
+        console.log('[SharingService] Read shared project_data.json by file ID.');
+    } catch (err) {
+        throw new Error('Could not read the selected project_data.json. Pick the correct file and retry.');
     }
 
-    // Fallback: build minimal project from folder name
-    if (!sharedProject) {
-        console.warn('[SharingService] No project_data.json found — building from folder name.');
-        sharedProject = {
-            id: crypto.randomUUID(),
-            name: folderMeta.name.replace(/_[a-f0-9]{6}$/, '').replace(/_/g, ' '),
-            spots: [],
-            routes: [],
-            sites: [],
-            external_files: [],
-            created_at: new Date().toISOString(),
-        };
-    }
-
-    // Check if already imported
+    // Already imported? (key off the source folder)
     const state = MasterData.getLocalState();
     const existing = state.projects.find(p =>
-        p.shared?.isImported && p.shared?.sourceFolderId === folderId
+        p.shared?.isImported && p.shared?.projectDataFileId === projectFileId
     );
     if (existing) {
         throw new Error(`Project "${existing.name}" is already imported.`);
@@ -319,12 +347,12 @@ export async function importSharedProject(folderId) {
         id: crypto.randomUUID(), // New local ID to avoid collisions
         shared: {
             isImported: true,
-            sourceFolderId: folderId,        // The shared project folder
+            sourceFolderId,                  // derived from the file's parent
             sourceProjectId: sharedProject.id,
-            ownerEmail: folderMeta.owners?.[0]?.emailAddress || 'unknown',
+            ownerEmail: fileMeta.owners?.[0]?.emailAddress || 'unknown',
             permission: myRole,
             lastSyncedAt: new Date().toISOString(),
-            projectDataFileId: projectFile?.id || null,
+            projectDataFileId: projectFileId,
             ownerFolderName: null, // Set below — needed for path remapping
         },
     };
@@ -344,7 +372,7 @@ export async function importSharedProject(folderId) {
 
     EventBus.emit(EVENTS.PROJECT_IMPORTED, {
         projectId: importedProject.id,
-        sourceFolderId: folderId,
+        sourceFolderId,
     });
     EventBus.emit(EVENTS.PROJECT_CHANGED);
 
@@ -411,19 +439,18 @@ export async function syncImportedProject(projectId) {
         throw new Error('Not an imported project.');
     }
 
-    const { sourceFolderId } = project.shared;
+    // Read the shared project_data.json by its KNOWN file ID. drive.file can't
+    // list the owner's folder, so we never search by name here.
+    const fileId = project.shared.projectDataFileId;
+    if (!fileId) {
+        throw new Error('Missing shared file reference — re-import the shared project.');
+    }
 
-    // Read project_data.json from the shared folder
     let updatedProject = null;
-    const projectFile = await DriveService.findFileByName('project_data.json', sourceFolderId);
-
-    if (projectFile) {
-        try {
-            const text = await DriveService.readDriveTextFile(projectFile.id);
-            updatedProject = JSON.parse(text);
-        } catch (err) {
-            console.warn('[SharingService] Could not read project_data.json for sync:', err);
-        }
+    try {
+        updatedProject = JSON.parse(await DriveService.readDriveTextFile(fileId));
+    } catch (err) {
+        console.warn('[SharingService] Could not read project_data.json for sync:', err.message);
     }
 
     if (updatedProject) {
@@ -455,7 +482,7 @@ export async function syncImportedProject(projectId) {
             ...localShared,
             ownerFolderName: ownerFolder,
             lastSyncedAt: new Date().toISOString(),
-            projectDataFileId: projectFile.id,
+            projectDataFileId: fileId,
         };
 
         await MasterData.saveMasterData();
@@ -463,10 +490,11 @@ export async function syncImportedProject(projectId) {
         EventBus.emit(EVENTS.DATA_UPDATED);
         EventBus.emit(EVENTS.PROJECT_CHANGED);
 
-        // Auto-pull media files from the shared folder
+        // Auto-pull media files referenced by public URL (drive.file can't list
+        // the owner's folder, so path-based pulls are best-effort only).
         await _pullMediaFromSharedFolder(project);
     } else {
-        throw new Error('Could not find project_data.json in shared folder. Owner may not have synced yet.');
+        throw new Error('Could not read the shared project_data.json (file may have been removed).');
     }
 }
 
@@ -579,21 +607,30 @@ export async function pushToSharedProject(projectId) {
 
     const { sourceFolderId } = project.shared;
 
-    // Locate the single shared project_data.json.
+    // Locate the single shared project_data.json — the owner's file.
     let fileId = project.shared.projectDataFileId || null;
     if (!fileId) {
         const f = await DriveService.findFileByName('project_data.json', sourceFolderId);
         fileId = f?.id || null;
     }
 
+    // CRITICAL: never CREATE a project_data.json here. If we don't have the
+    // owner's file ID, the import never truly read it (drive.file can't list
+    // the owner's file) — creating one would make a duplicate + fork the data.
+    // Bail out instead.
+    if (!fileId) {
+        throw new Error(
+            'Cannot push: the shared project_data.json is not accessible to this app. ' +
+            'Re-import the shared folder, or the app needs broader read permission.'
+        );
+    }
+
     // Read current remote so the merge doesn't clobber others' edits.
     let remote = { spots: [], routes: [], sites: [], external_files: [] };
-    if (fileId) {
-        try {
-            remote = JSON.parse(await DriveService.readDriveTextFile(fileId));
-        } catch (e) {
-            console.warn('[SharingService] Could not read shared project_data.json:', e.message);
-        }
+    try {
+        remote = JSON.parse(await DriveService.readDriveTextFile(fileId));
+    } catch (e) {
+        console.warn('[SharingService] Could not read shared project_data.json:', e.message);
     }
 
     // Our local data uses OUR folder namespace; the shared file uses the
@@ -614,8 +651,10 @@ export async function pushToSharedProject(projectId) {
 
     const blob = new Blob([JSON.stringify(remote, null, 2)], { type: 'application/json' });
 
-    // Write back to the SAME file (idempotent upsert — no duplicates).
-    fileId = await DriveService.upsertFile('project_data.json', sourceFolderId, blob);
+    // Write back to the SAME file by ID (PATCH). Do NOT use findFileByName/
+    // upsert here — under drive.file the editor can't list the owner's file,
+    // so a name lookup would miss it and create a duplicate.
+    await DriveService.updateDriveFile(fileId, blob);
 
     project.shared.projectDataFileId = fileId;
     project.shared.lastPushedAt = new Date().toISOString();

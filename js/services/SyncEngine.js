@@ -48,6 +48,9 @@ const PUSH_DEBOUNCE_MS = 4000;
 /** Background safety flush — only does work when the dirty flag is set. */
 const INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+/** Pseudo-realtime pull cadence for the active SHARED project. */
+const POLL_MS = 30 * 1000; // 30 seconds
+
 /** localStorage key for the single "sync imported media" preference. */
 const IMPORTED_MEDIA_KEY = 'cem-sync-imported-media';
 
@@ -60,6 +63,7 @@ let _dirty     = false;          // unpushed JSON changes exist
 let _status    = 'idle';         // 'idle' | 'syncing' | 'offline' | 'error'
 let _debounce  = null;
 let _interval  = null;
+let _poll      = null;
 
 // Shared-project sync: avoid re-pulling the same project repeatedly on every
 // PROJECT_CHANGED (which also fires after our own sync emits it).
@@ -190,7 +194,7 @@ function _activeProject() {
  *  - Imported project (viewer/editor) → pull owner's latest project_data + media.
  *  - Owner's shared project           → pull editor contributions and merge.
  */
-async function _syncActiveSharedProject() {
+async function _syncActiveSharedProject(force = false) {
     if (!getAccessToken() || _sharedSyncBusy) return;
 
     const active = _activeProject();
@@ -200,8 +204,9 @@ async function _syncActiveSharedProject() {
     const isOwnerShared = !!active.sharing?.isShared;
     if (!isImported && !isOwnerShared) return;
 
-    // Once per switch — our own sync re-emits PROJECT_CHANGED.
-    if (_lastSharedSyncId === active.id) return;
+    // Once per switch (force=true bypasses, for polling / focus refresh).
+    // Our own sync re-emits PROJECT_CHANGED, so the guard avoids loops.
+    if (!force && _lastSharedSyncId === active.id) return;
     _lastSharedSyncId = active.id;
 
     _sharedSyncBusy = true;
@@ -254,9 +259,20 @@ export function initSyncEngine() {
     // Periodic safety flush — only works when dirty.
     _interval = setInterval(() => flush('interval'), INTERVAL_MS);
 
-    // Flush on close / background so unsynced edits are not lost.
+    // Pseudo-realtime: poll the active shared project so collaborators' edits
+    // show up within ~POLL_MS. Only runs while the tab is visible (no wasted
+    // API calls in the background) and only for shared projects.
+    _poll = setInterval(() => {
+        if (document.visibilityState === 'visible') _syncActiveSharedProject(true);
+    }, POLL_MS);
+
+    // Flush on close / background; pull immediately when the tab refocuses.
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') _flushOnClose();
+        if (document.visibilityState === 'hidden') {
+            _flushOnClose();
+        } else {
+            _syncActiveSharedProject(true); // catch up on refocus
+        }
     });
     window.addEventListener('pagehide', _flushOnClose);
 

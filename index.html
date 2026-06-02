@@ -388,21 +388,21 @@
         <div class="popup-content">
             <h3>Import Shared Project</h3>
             <p style="font-size: 0.85rem; margin-bottom: 10px; opacity: 0.8;">
-                Pick the project folder that was shared with you. A Google Drive window
-                will open so you can grant this app access to just that folder.
+                A Google Drive window will open. Open the folder shared with you and
+                select the file named <code>project_data.json</code> — this lets you
+                view and edit the project.
             </p>
             <div class="button-group" style="margin-bottom: 12px;">
                 <button type="button" id="btn-pick-drive-folder" class="popup-btn">
-                    📂 Select Shared Folder from Drive
+                    📂 Select shared project (project_data.json)
                 </button>
             </div>
             <form id="import-project-form">
                 <p style="font-size: 0.8rem; margin: 8px 0; opacity: 0.7;">
-                    Or paste a share link / folder ID (only works for folders you have
-                    already opened via the picker):
+                    Advanced: paste the project_data.json file ID directly:
                 </p>
                 <input type="text" id="import-link-input"
-                       placeholder="Paste share link or folder ID"
+                       placeholder="project_data.json file ID"
                        autocomplete="off" />
                 <div class="button-group">
                     <button type="submit" class="popup-btn">Import</button>
