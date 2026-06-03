@@ -182,6 +182,29 @@ function _bindUIEvents() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Initialise auth once the Google Identity Services library is present.
+ *
+ * The GIS script (accounts.google.com/gsi/client) loads `async defer`, so it
+ * may not be ready when bootstrap runs at DOMContentLoaded. Poll briefly for
+ * `globalThis.google` before calling initAuth, instead of bailing on the first
+ * miss (which left tokenClient null -> "Auth not initialized" on first login).
+ *
+ * @param {Function} onSuccess
+ * @param {number} [tries=50]  ~10s at 200ms steps.
+ */
+function _initAuthWhenReady(onSuccess, tries = 50) {
+    if (globalThis.google?.accounts?.oauth2) {
+        initAuth(onSuccess);
+        return;
+    }
+    if (tries <= 0) {
+        console.error('[App] Google Identity Services failed to load — check network / adblock / CSP for accounts.google.com.');
+        return;
+    }
+    setTimeout(() => _initAuthWhenReady(onSuccess, tries - 1), 200);
+}
+
+/**
  * initApp — Application entry point.
  *
  * Called by app.js on window load.  Renders the UI panel, wires events, and
@@ -202,9 +225,10 @@ export function initApp() {
     _renderAuthPanel(authSection);
     _bindUIEvents();
 
-    // Initialise Google Identity Services OAuth client.
-    // _onAuthSuccess will be invoked asynchronously once a token is obtained.
-    initAuth(_onAuthSuccess);
+    // Initialise Google Identity Services OAuth client once the GIS library is
+    // loaded (its <script> is async defer, so it may lag bootstrap).
+    // _onAuthSuccess fires asynchronously once a token is obtained.
+    _initAuthWhenReady(_onAuthSuccess);
 
     // Central sync orchestrator: auto-pushes JSON on change/interval/close,
     // runs the initial conflict check, and owns shared-project sync.
