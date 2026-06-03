@@ -134,11 +134,14 @@ export async function pickSharedProjectFile() {
     return new Promise((resolve, reject) => {
         try {
             // "Shared with me", navigable folders, but select a JSON FILE.
-            const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
-                .setSelectFolderEnabled(false)
-                .setIncludeFolders(true)          // let the user open the shared folder
-                .setOwnedByMe(false)              // show items shared with the user
-                .setMimeTypes('application/json')  // only project_data.json-type files
+            // Select the shared FOLDER. Under drive.file, picking a folder grants
+            // this app access to the folder AND its contents (project_data.json +
+            // every media/result file) — so a collaborator can download everything
+            // through the authenticated Drive API: no CORS, no restricted scope.
+            const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+                .setSelectFolderEnabled(true)
+                .setIncludeFolders(true)
+                .setOwnedByMe(false)              // show folders shared with the user
                 .setMode(google.picker.DocsViewMode.LIST);
 
             const builder = new google.picker.PickerBuilder()
@@ -146,7 +149,7 @@ export async function pickSharedProjectFile() {
                 .setDeveloperKey(apiKey)
                 .setAppId(appId)
                 .addView(view)
-                .setTitle('Open the shared folder, then select project_data.json')
+                .setTitle('Select the shared project folder')
                 .setCallback((data) => {
                     const action = data[google.picker.Response.ACTION];
 

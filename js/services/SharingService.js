@@ -325,26 +325,38 @@ export async function importSharedProject(projectFileId) {
         );
     }
 
+    // Accept EITHER the shared folder (preferred) or a project_data.json file
+    // (back-compat). A folder pick grants drive.file access to the folder AND its
+    // contents, so we can list it, read project_data.json, AND download every
+    // media/result file via the API — no CORS, no restricted scope.
+    let sourceFolderId, projectDataFileId, myRole;
     if (fileMeta.mimeType === 'application/vnd.google-apps.folder') {
-        throw new Error('You selected a folder. Open it and pick the project_data.json file inside.');
+        sourceFolderId    = fileMeta.id;
+        myRole            = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
+        const pdFile      = await DriveService.findFileByName('project_data.json', sourceFolderId);
+        if (!pdFile) {
+            throw new Error('No project_data.json in that folder — select the shared PROJECT folder.');
+        }
+        projectDataFileId = pdFile.id;
+    } else {
+        sourceFolderId    = fileMeta.parents?.[0] || null;
+        myRole            = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
+        projectDataFileId = projectFileId;
     }
-
-    const sourceFolderId = fileMeta.parents?.[0] || null;
-    const myRole = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
 
     // Read the project JSON by file ID.
     let sharedProject = null;
     try {
-        sharedProject = JSON.parse(await DriveService.readDriveTextFile(projectFileId));
-        console.log('[SharingService] Read shared project_data.json by file ID.');
+        sharedProject = JSON.parse(await DriveService.readDriveTextFile(projectDataFileId));
+        console.log('[SharingService] Read shared project_data.json.');
     } catch (err) {
-        throw new Error('Could not read the selected project_data.json. Pick the correct file and retry.');
+        throw new Error('Could not read project_data.json from the shared folder.');
     }
 
-    // Already imported? (key off the source folder)
+    // Already imported? (key off the project_data.json file id)
     const state = MasterData.getLocalState();
     const existing = state.projects.find(p =>
-        p.shared?.isImported && p.shared?.projectDataFileId === projectFileId
+        p.shared?.isImported && p.shared?.projectDataFileId === projectDataFileId
     );
     if (existing) {
         throw new Error(`Project "${existing.name}" is already imported.`);
@@ -361,7 +373,7 @@ export async function importSharedProject(projectFileId) {
             ownerEmail: fileMeta.owners?.[0]?.emailAddress || 'unknown',
             permission: myRole,
             lastSyncedAt: new Date().toISOString(),
-            projectDataFileId: projectFileId,
+            projectDataFileId: projectDataFileId,
             ownerFolderName: null, // Set below — needed for path remapping
         },
     };
@@ -761,6 +773,16 @@ export async function pullEditorContributions(projectId) {
     const folderId = project.sharing?.driveFolderId;
     if (!folderId) {
         return { merged: false, contributionCount: 0 };
+    }
+
+    // Owner: fold any locally-completed analysis jobs into the project and queue
+    // their results for upload, so collaborators receive them automatically
+    // (no need to open the Jobs dashboard first).
+    try {
+        const { recordCompletedJobs } = await import('./ProjectFilesSync.js');
+        await recordCompletedJobs(project);
+    } catch (e) {
+        console.warn('[SharingService] recordCompletedJobs failed:', e.message);
     }
 
     const file = await DriveService.findFileByName('project_data.json', folderId);

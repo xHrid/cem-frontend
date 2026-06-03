@@ -24,6 +24,9 @@ import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
 import { getAllJobs, getJobResultFiles } from '../data/Repository.js';
 
+/** Drive IDs that failed to fetch this session — skip to avoid hammering each poll. */
+const _unfetchable = new Set();
+
 /**
  * Enumerate every file the project references, as {relPath, driveId, kind}.
  * Covers spot image/audio, site KML, and job (json + result files).
@@ -122,17 +125,18 @@ export async function materializeProjectFiles(project) {
 
     let got = 0;
     for (const ref of enumerateFileRefs(project)) {
-        if (!ref.driveId) continue;
+        if (!ref.driveId || _unfetchable.has(ref.driveId)) continue;
         try {
             if (await StorageAdapter.checkFileExists(ref.relPath)) continue;
             const blob = await DriveService.fetchPublicBlob(ref.driveId, ref.kind);
-            if (!blob || blob.size === 0) continue;
+            if (!blob || blob.size === 0) { _unfetchable.add(ref.driveId); continue; }
 
             const parts = ref.relPath.split('/');
             const name  = parts.pop();
             await StorageAdapter.saveFile(blob, name, parts);
             got++;
         } catch (e) {
+            _unfetchable.add(ref.driveId);
             console.warn(`[ProjectFilesSync] Could not materialize "${ref.relPath}":`, e.message);
         }
     }
