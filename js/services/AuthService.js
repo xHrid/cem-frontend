@@ -28,6 +28,9 @@ let tokenClient = null;
 /** @type {string|null} */
 let accessToken = null;
 
+/** Signed-in Google account email (resolved lazily after each token grant). */
+let userEmail = null;
+
 /**
  * UNIX-epoch milliseconds at which the current access token expires.
  * Initialised to 0 so `isTokenExpired()` returns true before any login.
@@ -80,6 +83,10 @@ export function initAuth(onLoginSuccess) {
                 's'
             );
 
+            // Resolve the account email (used to stamp who created each record).
+            // drive.file's `about.get` returns the user's email — no extra scope.
+            _fetchUserEmail();
+
             if (typeof onLoginSuccess === 'function') onLoginSuccess();
         },
     });
@@ -117,6 +124,31 @@ export function forceReauth() {
  */
 export function getAccessToken() {
     return accessToken;
+}
+
+/**
+ * Return the signed-in account email, or null if not yet resolved.
+ * @returns {string|null}
+ */
+export function getUserEmail() {
+    return userEmail;
+}
+
+/** Fetch the current account's email via Drive about.get (fire-and-forget). */
+async function _fetchUserEmail() {
+    if (!accessToken) return;
+    try {
+        const res = await fetch(
+            'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)',
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        if (res.ok) {
+            const json = await res.json();
+            userEmail = json.user?.emailAddress || null;
+        }
+    } catch (e) {
+        console.warn('[AuthService] could not resolve user email:', e.message);
+    }
 }
 
 /**

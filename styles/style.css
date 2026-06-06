@@ -759,3 +759,16 @@ input, textarea, code, pre,
     background: #3a3320 !important; color: #f0e2b0 !important; border-color: #6b5d2e !important;
 }
 [data-theme="dark"] #watcher-offline-help code { color: #ffe9a8; }
+
+
+/* Creator pill in the sync-diff resolver — truncated email, tap to expand */
+.creator-pill {
+    display: inline-flex; align-items: center; max-width: 130px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    vertical-align: bottom;
+    font-family: var(--font-mono); font-size: 0.7rem;
+    color: var(--ink-soft); background: var(--bg-surface-alt);
+    border: 1px solid var(--border-color); border-radius: 999px;
+    padding: 1px 8px; cursor: pointer;
+}
+.creator-pill.expanded { max-width: none; white-space: normal; word-break: break-all; }

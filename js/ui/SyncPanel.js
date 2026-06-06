@@ -31,6 +31,7 @@ const STATUS_META = {
     syncing: { icon: '🔄', text: 'Syncing…',    color: '#4285F4' },
     offline: { icon: '⚪', text: 'Offline',     color: 'var(--text-muted)' },
     error:   { icon: '⚠️', text: 'Sync error',  color: '#d9534f' },
+    paused:  { icon: '⏸️', text: 'Sync paused', color: '#c8662a' },
 };
 
 /** @type {HTMLElement|null} */

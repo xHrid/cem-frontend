@@ -57,8 +57,9 @@ const POLL_MS = 2 * 60 * 1000; // 2 minutes (was 30s — too aggressive)
 
 let _started   = false;
 let _dirty     = false;          // unpushed JSON changes exist
-let _status    = 'idle';         // 'idle' | 'syncing' | 'offline' | 'error'
+let _status    = 'idle';         // 'idle' | 'syncing' | 'offline' | 'error' | 'paused'
 let _lastSyncAt = null;          // epoch ms of the last successful sync
+let _paused    = false;          // user paused sync (e.g. cancelled conflict resolution)
 let _debounce  = null;
 let _interval  = null;
 let _poll      = null;
@@ -76,7 +77,25 @@ let _sharedSyncBusy   = false;
  * @returns {{ status: string, dirty: boolean }}
  */
 export function getSyncState() {
-    return { status: _status, dirty: _dirty, lastSyncAt: _lastSyncAt };
+    return { status: _status, dirty: _dirty, lastSyncAt: _lastSyncAt, paused: _paused };
+}
+
+/** Pause all automatic syncing (pull/conflict-check/push) until resumed. */
+export function pauseSync() {
+    _paused = true;
+    _setStatus('paused');
+}
+
+/** Resume automatic syncing. */
+export function resumeSync() {
+    if (!_paused) return;
+    _paused = false;
+    _setStatus('idle');
+}
+
+/** @returns {boolean} */
+export function isSyncPaused() {
+    return _paused;
 }
 
 /** Stamp a successful sync and re-emit status so the UI can refresh "X ago". */
@@ -119,6 +138,9 @@ function _markDirty() {
  * @returns {Promise<void>}
  */
 export async function flush(reason = 'manual') {
+    // A manual flush also resumes a paused engine (explicit user intent).
+    if (reason === 'manual') _paused = false;
+    if (_paused) return;
     if (!getAccessToken()) { _setStatus('offline'); return; }
     if (!_dirty && reason !== 'manual') return;
 
@@ -154,6 +176,7 @@ export async function flush(reason = 'manual') {
  * No-ops to 'offline' when there is no token.
  */
 export function onAuthReady() {
+    if (_paused) return;
     if (!getAccessToken()) { _setStatus('offline'); return; }
     checkForRemoteUpdates(false).catch(err =>
         console.warn('[SyncEngine] initial conflict check failed:', err.message)
@@ -177,7 +200,7 @@ function _activeProject() {
  *  - Owner's shared project           → pull editor contributions and merge.
  */
 async function _syncActiveSharedProject(force = false) {
-    if (!getAccessToken() || _sharedSyncBusy) return;
+    if (_paused || !getAccessToken() || _sharedSyncBusy) return;
 
     const active = _activeProject();
     if (!active) return;

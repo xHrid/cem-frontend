@@ -91,6 +91,18 @@ function _stable(obj) {
 
 const _fmtTs = (it) => it?.timestamp ? new Date(it.timestamp).toLocaleString() : '—';
 
+/**
+ * A truncated "who created this" pill. Tap/click toggles the full email (long
+ * addresses would otherwise blow up the row). Returns '' when unknown.
+ * @param {object} item
+ */
+function _creatorPill(item) {
+    const email = item?.created_by;
+    if (!email) return '';
+    const safe = String(email).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    return `<span class="creator-pill" title="${safe}" tabindex="0">👤 ${safe}</span>`;
+}
+
 // ---------------------------------------------------------------------------
 // Diff computation
 // ---------------------------------------------------------------------------
@@ -112,6 +124,7 @@ function _computeDiff(local, remote) {
 
     const projects = [];
     let totalDiffs = 0;
+    let conflictCount = 0;
 
     for (const pid of allIds) {
         const lp = lById.get(pid) || null;
@@ -158,6 +171,7 @@ function _computeDiff(local, remote) {
             if (conflicts.length || localOnly.length || driveOnly.length) {
                 collections.push({ key: col.key, label: col.label, conflicts, localOnly, driveOnly });
                 totalDiffs += conflicts.length + localOnly.length + driveOnly.length;
+                conflictCount += conflicts.length;
             }
         }
 
@@ -166,7 +180,7 @@ function _computeDiff(local, remote) {
         }
     }
 
-    return { local, remote, projects, totalDiffs };
+    return { local, remote, projects, totalDiffs, conflictCount };
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +312,16 @@ function _open() {
         return;
     }
 
+    // Additive-only changes (new spots / new temporal entries on either side,
+    // nothing edited differently on BOTH) are not a real conflict — auto-merge
+    // the union silently instead of nagging the user. The dialog only appears
+    // when the same item was edited differently on both sides.
+    if (diff.conflictCount === 0) {
+        _model = { diff, ..._defaultChoices(diff) }; // defaults keep everything
+        applyResolvedConflict(_assembleResolved());
+        return;
+    }
+
     _model = { diff, ..._defaultChoices(diff) };
     _render();
     const dlg = document.getElementById('sync-diff-dialog');
@@ -343,23 +367,23 @@ function _render() {
 
             for (const c of col.conflicts) {
                 const k = esc(_key(p.id, col.key, c.id));
-                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:4px 0; flex-wrap:wrap;">
-                    <span style="flex:1; min-width:120px;">✎ ${esc(_itemLabel(c.local, col.key))} <small style="color:var(--text-muted);">(edited on both)</small></span>
+                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:6px 0; flex-wrap:wrap;">
+                    <span style="flex:1; min-width:120px;">✎ ${esc(_itemLabel(c.local, col.key))} <small style="color:var(--text-muted);">(edited on both)</small> ${_creatorPill(c.local || c.drive)}</span>
                     <label style="font-size:0.8rem;"><input type="radio" name="${k}" value="local"  data-choice="${k}"> Local <small>(${esc(_fmtTs(c.local))})</small></label>
                     <label style="font-size:0.8rem;"><input type="radio" name="${k}" value="drive"  data-choice="${k}"> Drive <small>(${esc(_fmtTs(c.drive))})</small></label>
                 </div>`;
             }
             for (const c of col.localOnly) {
                 const k = esc(_key(p.id, col.key, c.id));
-                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:4px 0;">
-                    <span style="flex:1;">＋ ${esc(_itemLabel(c.local, col.key))} <small style="color:#2e7d32;">(only here)</small></span>
+                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:6px 0; flex-wrap:wrap;">
+                    <span style="flex:1; min-width:120px;">＋ ${esc(_itemLabel(c.local, col.key))} <small style="color:var(--forest);">(only here)</small> ${_creatorPill(c.local)}</span>
                     <label style="font-size:0.8rem;"><input type="checkbox" data-keep="${k}" data-side="local"> Keep</label>
                 </div>`;
             }
             for (const c of col.driveOnly) {
                 const k = esc(_key(p.id, col.key, c.id));
-                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:4px 0;">
-                    <span style="flex:1;">＋ ${esc(_itemLabel(c.drive, col.key))} <small style="color:#1565c0;">(only on Drive)</small></span>
+                html += `<div class="diff-row" style="display:flex; gap:8px; align-items:center; padding:6px 0; flex-wrap:wrap;">
+                    <span style="flex:1; min-width:120px;">＋ ${esc(_itemLabel(c.drive, col.key))} <small style="color:var(--sky);">(only on Drive)</small> ${_creatorPill(c.drive)}</span>
                     <label style="font-size:0.8rem;"><input type="checkbox" data-keep="${k}" data-side="drive"> Keep</label>
                 </div>`;
             }
@@ -410,25 +434,46 @@ function _bindInputs() {
             projectChoices.set(cb.getAttribute('data-projkeep'), cb.checked ? 'keep' : 'discard');
         });
     });
+    // Tap a creator pill to reveal / re-truncate the full email.
+    document.querySelectorAll('#sync-diff-body .creator-pill').forEach(pill => {
+        pill.addEventListener('click', () => pill.classList.toggle('expanded'));
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Bulk actions
 // ---------------------------------------------------------------------------
 
+/**
+ * Bulk filter:
+ *  - 'local' → final state == this device. Keep conflicts' local side, keep
+ *    local-only items/projects, DISCARD anything that exists only on Drive.
+ *  - 'drive' → final state == Drive. Mirror image.
+ */
 function _bulk(mode) {
     if (!_model) return;
     const { diff, choices, projectChoices } = _model;
+    const wantLocal = mode === 'local';
 
     for (const p of diff.projects) {
-        if (p.side !== 'both') { projectChoices.set(p.id, 'keep'); continue; }
+        if (p.side === 'local-only') {
+            projectChoices.set(p.id, wantLocal ? 'keep' : 'discard');
+            continue;
+        }
+        if (p.side === 'drive-only') {
+            projectChoices.set(p.id, wantLocal ? 'discard' : 'keep');
+            continue;
+        }
         for (const col of p.collections) {
             for (const c of col.conflicts) {
-                choices.set(_key(p.id, col.key, c.id), mode === 'drive' ? 'drive' : 'local');
+                choices.set(_key(p.id, col.key, c.id), wantLocal ? 'local' : 'drive');
             }
-            // One-sided items: keep everything in all bulk modes (union — never lose data).
-            for (const c of col.localOnly) choices.set(_key(p.id, col.key, c.id), 'local');
-            for (const c of col.driveOnly) choices.set(_key(p.id, col.key, c.id), 'drive');
+            for (const c of col.localOnly) {
+                choices.set(_key(p.id, col.key, c.id), wantLocal ? 'local' : 'discard');
+            }
+            for (const c of col.driveOnly) {
+                choices.set(_key(p.id, col.key, c.id), wantLocal ? 'discard' : 'drive');
+            }
         }
     }
     _syncInputsToModel();
@@ -462,7 +507,17 @@ function _ensureDialog() {
 
     dlg.querySelector('#diff-bulk-local').addEventListener('click',  () => _bulk('local'));
     dlg.querySelector('#diff-bulk-drive').addEventListener('click',  () => _bulk('drive'));
-    dlg.querySelector('#diff-cancel').addEventListener('click', () => { if (dlg.open) dlg.close(); });
+    // Cancel = leave both sides as-is AND pause auto-sync so the dialog doesn't
+    // immediately re-pop on the next poll. User resumes via the Sync menu /
+    // "Sync now".
+    dlg.querySelector('#diff-cancel').addEventListener('click', async () => {
+        if (dlg.open) dlg.close();
+        try {
+            const { pauseSync } = await import('../services/SyncEngine.js');
+            pauseSync();
+        } catch (e) { console.warn('[SyncDiffUI] pause failed:', e.message); }
+        showToast('Sync paused. Resume from the sync menu when ready.', 'info');
+    });
 
     dlg.querySelector('#diff-apply').addEventListener('click', async () => {
         const btn = dlg.querySelector('#diff-apply');

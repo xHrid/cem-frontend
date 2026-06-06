@@ -22,7 +22,7 @@ import EventBus, { EVENTS }       from '../core/EventBus.js';
 import * as StorageAdapter         from './StorageAdapter.js';
 import * as MasterData             from './MasterData.js';
 import { getProjectFolderName }    from './projectUtils.js';
-import { getAccessToken }          from '../services/AuthService.js';
+import { getAccessToken, getUserEmail } from '../services/AuthService.js';
 import {
     findOrCreateRootFolder,
     findFileByName,
@@ -129,6 +129,7 @@ export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
         ...spotData,
         spotId,
         projectId              : project.id,
+        created_by             : spotData.created_by || getUserEmail() || null,
         timestamp,
         image_local_filename   : imgPath,
         audio_local_filename   : audioPath
@@ -183,6 +184,7 @@ export async function saveSite(siteName, kmlFile, clusters) {
         name           : siteName,
         kml_filename   : kmlPath,
         clusters       : clusters || null,  // Bug fix: persist clusters param.
+        created_by     : getUserEmail() || null,
         timestamp      : new Date().toISOString()
     };
 
@@ -218,6 +220,7 @@ export async function saveRoute(routeData) {
         ...routeData,
         id        : crypto.randomUUID(),
         projectId : project.id,
+        created_by: getUserEmail() || null,
         timestamp : new Date().toISOString()
     };
 
@@ -273,6 +276,7 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
         latitude             : data.latitude  ?? data.lat,
         longitude            : data.longitude ?? data.lng,
         description          : data.description || '',
+        created_by           : getUserEmail() || null,
         image_local_filename : imgPath,
         audio_local_filename : audioPath,
         timestamp            : now,
