@@ -172,4 +172,10 @@ export async function deleteProject(projectId) {
     EventBus.emit(EVENTS.PROJECT_CHANGED);
     EventBus.emit(EVENTS.DATA_UPDATED);
     pushMasterToDrive(); // fire-and-forget
+
+    // Reclaim the deleted project's local files (media, jobs, etc.).
+    try {
+        const { gcAndRefresh } = await import('../services/StorageGC.js');
+        await gcAndRefresh();
+    } catch (e) { console.warn('[ProjectManager] post-delete GC failed:', e.message); }
 }

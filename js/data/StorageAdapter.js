@@ -493,6 +493,39 @@ export async function listDirectoryFiles(pathParts) {
     });
 }
 
+/**
+ * List EVERY stored file path in the active backend (recursively for native FS,
+ * all keys for IndexedDB). Used by the storage garbage collector to find files
+ * no project references anymore.
+ *
+ * @returns {Promise<string[]>}  All relative file paths / keys.
+ */
+export async function listAllFileKeys() {
+    if (!_memoryMode && _rootHandle) {
+        const out = [];
+        await _walkNative(_rootHandle, '', out);
+        return out;
+    }
+    const db = await _openDB();
+    return new Promise((resolve) => {
+        const tx  = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).getAllKeys();
+        req.onsuccess = () => resolve(req.result.map(String));
+        req.onerror   = () => resolve([]);
+    });
+}
+
+/** Recursively collect file paths under a native-FS directory handle. */
+async function _walkNative(dirHandle, prefix, out) {
+    try {
+        for await (const [name, handle] of dirHandle.entries()) {
+            const path = prefix ? `${prefix}/${name}` : name;
+            if (handle.kind === 'file') out.push(path);
+            else await _walkNative(handle, path, out);
+        }
+    } catch { /* unreadable dir — skip */ }
+}
+
 // ---------------------------------------------------------------------------
 // Public API — file deletion
 // ---------------------------------------------------------------------------

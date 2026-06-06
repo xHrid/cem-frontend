@@ -719,6 +719,14 @@ export async function resolveMasterConflict(action) {
 
         remoteMasterCache = null;
 
+        // Pull / merge may have orphaned local files — sweep them.
+        if (action === 'pull' || action === 'merge') {
+            try {
+                const { gcAndRefresh } = await import('./StorageGC.js');
+                await gcAndRefresh();
+            } catch (e) { console.warn('[SyncService] post-resolution GC failed:', e.message); }
+        }
+
         // Notify the rest of the app that data has changed
         EventBus.emit(EVENTS.DATA_UPDATED);
         EventBus.emit(EVENTS.PROJECT_CHANGED);
@@ -798,6 +806,14 @@ export async function applyResolvedConflict(resolvedState) {
     }
 
     remoteMasterCache = null;
+
+    // Resolving a conflict can orphan whole project folders (e.g. Drive-wins
+    // replaces local projects with new-id copies). Sweep dead local files.
+    try {
+        const { gcAndRefresh } = await import('./StorageGC.js');
+        await gcAndRefresh();
+    } catch (e) { console.warn('[SyncService] post-resolution GC failed:', e.message); }
+
     EventBus.emit(EVENTS.DATA_UPDATED);
     EventBus.emit(EVENTS.PROJECT_CHANGED);
     EventBus.emit(EVENTS.TOAST_SHOW, { message: 'Local and Drive are now in sync.', type: 'success' });

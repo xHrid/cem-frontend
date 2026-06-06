@@ -313,8 +313,9 @@ input[type="checkbox"], input[type="radio"] {
     padding: 7px 16px; border-radius: var(--radius-pill);
     font-family: var(--font-mono); font-size: 0.8rem; letter-spacing: 0.02em;
     z-index: 900; pointer-events: none; box-shadow: var(--shadow-soft);
+    white-space: nowrap; max-width: 92vw;
 }
-#latlon label { font-family: var(--font-mono); }
+#latlon label { font-family: var(--font-mono); white-space: nowrap; }
 
 /* =========================================
    4. MODALS
@@ -370,6 +371,10 @@ input[type="checkbox"], input[type="radio"] {
    5. FORM PIECES
    ========================================= */
 .media-controls { display: flex; align-items: center; gap: 12px; margin: 16px 0; flex-wrap: wrap; }
+/* Audio players: always full width — the native control otherwise renders tiny
+   until playback starts, then jumps wider. Force a stable full-width box. */
+audio { width: 100%; display: block; }
+.media-controls audio { flex: 1 1 100%; min-width: 0; }
 
 .custom-upload {
     width: 48px; height: 48px; border-radius: 12px;
@@ -453,9 +458,8 @@ input[type="checkbox"], input[type="radio"] {
 /* Gallery: arrows are real flex boxes BESIDE the rail (fully clickable). The
    rail shows one full-width card, swiped (touch) or stepped (buttons). Mouse-
    wheel scrolling is blocked in JS — see SpotManager. */
-.spot-rail-wrap { display: flex; align-items: center; gap: 8px; }
+.spot-rail-wrap { position: relative; }
 .spot-entry-rail {
-    flex: 1; min-width: 0;
     display: flex; gap: 16px; overflow-x: auto; padding: 6px 2px 18px;
     scroll-snap-type: x mandatory; scroll-behavior: smooth;
     touch-action: pan-x; overscroll-behavior-x: contain;
@@ -474,19 +478,23 @@ input[type="checkbox"], input[type="radio"] {
 }
 .spot-entry img { max-height: 440px; object-fit: contain; background: var(--paper-2); }
 
-/* Gallery arrows — beside the rail; subtle horizontal nudge on press */
+/* Gallery arrows — float OVER the card edges so cards use the full width.
+   Absolute + inside the wrap bounds = reliable full-button click target. */
 .rail-nav {
-    flex: none; align-self: center;
+    position: absolute; top: 50%; transform: translateY(-50%); z-index: 5;
     width: 42px; height: 42px; border-radius: 50%;
-    background: var(--forest); color: var(--on-accent); border: none;
+    background: color-mix(in srgb, var(--forest) 88%, transparent); color: var(--on-accent); border: none;
     display: flex; align-items: center; justify-content: center;
     font-size: 1.3rem; line-height: 1; cursor: pointer; box-shadow: var(--shadow-soft);
-    opacity: 0.9; transition: opacity var(--transition-fast), transform var(--transition-fast);
+    opacity: 0.92; transition: opacity var(--transition-fast), transform var(--transition-fast);
 }
 .rail-nav:hover { opacity: 1; }
-.rail-nav:active { transform: none; }                /* cancel global scale */
-.rail-nav.prev:active { transform: translateX(-3px); }
-.rail-nav.next:active { transform: translateX(3px); }
+.rail-nav.prev { left: 8px; }
+.rail-nav.next { right: 8px; }
+/* Keep the vertical centring while adding a subtle horizontal nudge on press */
+.rail-nav:active { transform: translateY(-50%); }
+.rail-nav.prev:active { transform: translate(-3px, -50%); }
+.rail-nav.next:active { transform: translate(3px, -50%); }
 .spot-entry .entry-index {
     font-family: var(--font-display); font-weight: 600; font-size: 0.7rem;
     text-transform: uppercase; letter-spacing: 0.12em; color: var(--amber);
@@ -567,12 +575,18 @@ input[type="checkbox"], input[type="radio"] {
 .mini-sync-btn { width: 32px; height: 32px; padding: 0; border: 1px solid var(--border-color); background: var(--bg-surface); border-radius: 50%; color: var(--sky); }
 
 #toast-notification {
-    position: fixed; bottom: 20px; right: -360px; width: 310px; padding: 15px 17px;
+    position: fixed; bottom: 20px; right: 20px; left: auto;
+    width: auto; max-width: min(320px, calc(100vw - 40px));
+    padding: 15px 17px;
     background-color: var(--forest-deep); color: var(--on-accent); border-radius: var(--radius-md);
-    z-index: 99999; transition: right var(--transition-slide); box-shadow: var(--shadow-modal);
+    z-index: 99999; box-shadow: var(--shadow-modal);
     font-size: 0.92rem; border-left: 5px solid var(--lichen);
+    /* Hidden via transform (NOT via right:-360) so it never leaves a sliver of
+       bar on screen, and so left/right can both be set on mobile. */
+    transform: translateY(170%); opacity: 0; pointer-events: auto;
+    transition: transform var(--transition-slide), opacity var(--transition-slide);
 }
-#toast-notification.show { right: 20px; }
+#toast-notification.show { transform: translateY(0); opacity: 1; }
 #toast-notification.success { border-left-color: var(--lichen); }
 #toast-notification.failed  { border-left-color: var(--rust); }
 
@@ -694,8 +708,10 @@ body.panel-open #theme-toggle { opacity: 0; pointer-events: none; transform: tra
     #sync-diff-dialog .popup-content { width: 96vw; max-width: 96vw; }
     .diff-row { flex-wrap: wrap; }
 
-    #toast-notification { width: auto; left: 16px; right: -100%; }
-    #toast-notification.show { right: 16px; }
+    #toast-notification { left: 16px; right: 16px; max-width: none; width: auto; }
+
+    /* Hide the hamburger while a full-screen side panel is open (it overlapped the title). */
+    body.panel-open #menu-toggle { display: none; }
 
     .control { gap: 8px; }
     .control > button { min-width: 78px; font-size: 0.82rem; }

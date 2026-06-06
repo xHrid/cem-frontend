@@ -97,18 +97,46 @@ export function showToast(message, type = 'info') {
 
     el.textContent = message;
 
+    // Keep-alive wiring (attached once): while the pointer hovers or a touch is
+    // held on the toast, pause the auto-hide; resume (fresh duration) on release.
+    _attachKeepAlive(el);
+
     // Trigger slide-in on the next animation frame so CSS transition fires even
     // when toggling from a previously .show state.
     requestAnimationFrame(() => {
         el.classList.add('show');
     });
 
-    // Auto-hide after the configured duration.
-    const duration = Config.ui.toastDuration;
+    _scheduleHide(el);
+}
+
+/** (Re)start the auto-hide timer for the visible toast. */
+function _scheduleHide(el) {
+    if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
     _hideTimer = setTimeout(() => {
         el.classList.remove('show');
         _hideTimer = null;
-    }, duration);
+    }, Config.ui.toastDuration);
+}
+
+/** Pause the auto-hide (pointer in / touch held). */
+function _pauseHide() {
+    if (_hideTimer) { clearTimeout(_hideTimer); _hideTimer = null; }
+}
+
+/** Attach keep-alive listeners to the toast element exactly once. */
+function _attachKeepAlive(el) {
+    if (el.dataset.keepAlive === '1') return;
+    el.dataset.keepAlive = '1';
+
+    const hold   = () => _pauseHide();
+    const resume = () => { if (el.classList.contains('show')) _scheduleHide(el); };
+
+    el.addEventListener('mouseenter', hold);
+    el.addEventListener('mouseleave', resume);
+    el.addEventListener('touchstart', hold,   { passive: true });
+    el.addEventListener('touchend',   resume);
+    el.addEventListener('touchcancel', resume);
 }
 
 /**

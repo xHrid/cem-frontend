@@ -116,6 +116,7 @@ function _buildDialog() {
 
             <div class="button-group" style="margin-top:16px; display:flex; gap:8px; flex-wrap:wrap;">
                 <button id="sync-now-btn" class="popup-btn" style="flex:1;">🔄 Sync now</button>
+                <button id="gc-now-btn" class="popup-btn cancel-btn" style="flex:1;">🧹 Clean up storage</button>
             </div>
         </div>
     `;
@@ -129,6 +130,21 @@ function _buildDialog() {
     dlg.querySelector('#sync-now-btn').addEventListener('click', async () => {
         await flush('manual');
         showToast('Sync triggered.', 'success');
+    });
+
+    // Reclaim dead local files (orphaned media / discarded projects).
+    dlg.querySelector('#gc-now-btn').addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        btn.disabled = true; btn.textContent = 'Cleaning…';
+        try {
+            const { gcAndRefresh } = await import('../services/StorageGC.js');
+            const n = await gcAndRefresh();
+            showToast(n > 0 ? `Cleaned ${n} unused file(s).` : 'Storage already clean.', 'success');
+        } catch (err) {
+            showToast(`Cleanup failed: ${err.message}`, 'failed');
+        } finally {
+            btn.disabled = false; btn.textContent = '🧹 Clean up storage';
+        }
     });
 
     return dlg;
