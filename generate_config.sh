@@ -79,7 +79,6 @@ const Config = deepFreeze({
     },
     server: {
         baseUrl: '${SERVER_BASE_URL}',
-        apiKey:  '${SERVER_API_KEY}',
     },
     ui: {
         toastDuration: 3000,
@@ -99,4 +98,3 @@ echo "Configuration file generated successfully at js/core/Config.js"
 echo "  google.clientId    : ${GOOGLE_CLIENT_ID:-(unset!)}"
 echo "  google.pickerApiKey: ${PICKER_API_KEY:+set}"
 echo "  server.baseUrl     : ${SERVER_BASE_URL:-(unset — server mode disabled)}"
-echo "  server.apiKey      : ${SERVER_API_KEY:+set}"

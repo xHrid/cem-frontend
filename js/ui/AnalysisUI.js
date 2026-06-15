@@ -315,7 +315,7 @@ async function _checkServerStatus() {
             'Server not configured (Config.server)';
         if (els.runBtn) { els.runBtn.disabled = true; els.runBtn.textContent = 'Run on Server'; }
         const d = document.getElementById('server-help-detail');
-        if (d) d.innerHTML = '<br><strong>Set Config.server.baseUrl and apiKey.</strong>';
+        if (d) d.innerHTML = '<br><strong>Set Config.server.baseUrl.</strong>';
         return;
     }
 

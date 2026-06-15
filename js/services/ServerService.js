@@ -6,23 +6,21 @@
  *
  * This is the browser-side counterpart to watcher.py. Instead of writing a job
  * descriptor into jobs/queue/ and waiting for a local python watcher to pick it
- * up, server mode talks directly to the Dockerised FastAPI in cem-scripts-new:
+ * up, server mode talks directly to the Dockerised FastAPI (STACD/Airflow model):
  *
- *      1. POST /jobs                      -> create an isolated server job
- *      2. POST /jobs/{id}/upload          -> push audio (birdnet) OR the cached
- *                                            aggregate CSV (analysis steps)
- *      3. POST /jobs/{id}/run/{step}      -> launch the chosen step (async)
- *      4. GET  /jobs/{id}/tasks/{task}    -> poll until success | failed
- *      5. GET  /jobs/{id}/results         -> list produced files
- *         GET  /jobs/{id}/file?path=...   -> download each one
+ *      1. POST /api/v1/datasets/audio                -> mint a job_id + upload WAVs
+ *      2. POST /api/v1/jobs/{id}/datasets/{kind}     -> upload aggregate / processed list
+ *      3. POST /api/v1/jobs/{id}/{algo}              -> run step SYNCHRONOUSLY (blocks)
+ *      4. GET  /api/v1/jobs/{id}/results             -> list produced files
+ *         GET  /api/v1/jobs/{id}/file?path=...       -> download each one
  *
  * Downloaded results are written into the SAME local storage layout the watcher
  * uses (<project>/jobs/results/<jobId>/...), and the job descriptor is parked in
  * jobs/completed | jobs/failed, so JobsDashboard renders server jobs with zero
- * changes. For a BirdNET run we additionally persist the produced aggregate to
- * <project>/system/database/birdnet_results.csv and append the processed file
- * names to the local cache — so the dependency/overlap logic AND later analysis
- * steps (server OR watcher) keep working exactly as before.
+ * changes. For a BirdNET run we persist the server aggregate to
+ * <project>/system/database/birdnet_results_server.csv (separate from the local
+ * aggregate) and update the server-specific processed cache — so dedup and later
+ * analysis steps keep working correctly.
  *
  * The server is stateless per job, so an analysis step has no aggregate of its
  * own. We satisfy its BirdNET dependency by uploading the locally-cached
@@ -31,8 +29,8 @@
  * Server URL + API key are read from Config.server (see Config.js).
  *
  * Public exports:
- *   isConfigured        — true when Config.server has a baseUrl + apiKey
- *   getServerConfig     — { baseUrl, apiKey }
+ *   isConfigured        — true when Config.server has a baseUrl
+ *   getServerConfig     — { baseUrl }
  *   checkServerHealth   — GET /health -> { online, steps }
  *   getServerSteps      — GET /steps  -> UI-ready script descriptor array
  *   runJobOnServer      — full upload -> run -> poll -> download orchestration
@@ -59,24 +57,19 @@ function _url(path) {
     return _base() + path;
 }
 
-/** Auth header object for authenticated endpoints. */
-function _authHeaders() {
-    return { 'X-API-Key': Config.server?.apiKey || '' };
-}
-
 /**
- * True when a server URL and API key are present in Config.
+ * True when a server URL is present in Config.
  * @returns {boolean}
  */
 export function isConfigured() {
-    return Boolean(_base() && Config.server?.apiKey);
+    return Boolean(_base());
 }
 
 /**
- * @returns {{ baseUrl: string, apiKey: string }}
+ * @returns {{ baseUrl: string }}
  */
 export function getServerConfig() {
-    return { baseUrl: _base(), apiKey: Config.server?.apiKey || '' };
+    return { baseUrl: _base() };
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +138,7 @@ export async function checkServerHealth() {
     }
 }
 
-// API step id -> pipeline script filename (mirrors pipeline/manifest.json).
+// API step id -> pipeline script filename (fallback when manifest omits it).
 const _SCRIPT_FILE = {
     birdnet:                  'birdnet_predictions.py',
     heatmaps:                 'activity_heatmaps.py',
@@ -157,30 +150,27 @@ const _SCRIPT_FILE = {
 };
 
 /**
- * Fetch the runnable step catalogue from the server and shape it into the same
- * descriptor objects AnalysisUI expects from installed.json — so server mode
- * works even if the watcher has never synced scripts locally.
+ * Fetch the runnable step catalogue from the server (full manifest) and shape
+ * it into the same descriptor objects AnalysisUI expects from installed.json.
  *
- * Every step takes a spot/date selection; only birdnet exposes the snr_db param.
+ * The server now returns parameters[], inputs[], aggregate_file etc. from the
+ * manifest — the UI renders every script's tunables with their defaults.
  *
  * @returns {Promise<object[]>}
  */
 export async function getServerSteps() {
-    const steps = await _json(_url('/steps'), { headers: _authHeaders() }, 10000);
+    const steps = await _json(_url('/api/v1/steps'), {}, 10000);
     return Object.entries(steps).map(([id, meta]) => ({
         id,
-        name:        meta.name || id,
-        script_file: _SCRIPT_FILE[id] || `${id}.py`,
-        description: meta.description || '',
-        depends_on:  meta.depends_on || [],
-        inputs: [{
-            type: 'spot_date_range',
-            label: 'Select spots and date range',
-            valid_extensions: ['.wav'],
-        }],
-        parameters: id === 'birdnet'
-            ? [{ id: 'snr_db', label: 'SNR for noise removal (dB)', type: 'text', default: '18' }]
-            : [],
+        name:           meta.name || id,
+        script_file:    _SCRIPT_FILE[id] || `${id}.py`,
+        description:    meta.description || '',
+        depends_on:     meta.depends_on || [],
+        aggregate_file: meta.aggregate_file || '',
+        inputs:         meta.inputs && meta.inputs.length
+            ? meta.inputs
+            : [{ type: 'spot_date_range', label: 'Select spots and date range', valid_extensions: ['.wav'] }],
+        parameters:     meta.parameters || [],
     }));
 }
 
@@ -189,24 +179,50 @@ export async function getServerSteps() {
 // ---------------------------------------------------------------------------
 
 /**
- * Collect the audio files (and reference files) that match the selected spots
- * and date range, returning their storage-relative paths so the bytes can be
- * read and uploaded. Mirrors the selection logic in AnalysisService.buildJobData
- * but yields individual files (not collapsed directories).
- *
- * @returns {{ audio: {path:string,name:string}[],
- *             references: {path:string,name:string,spot:string}[] }}
+ * Load the server-specific processed-files cache for a script.
+ * @param {string} projectFolder
+ * @param {string} scriptFile   e.g. "birdnet_predictions.py"
+ * @returns {Promise<Set<string>>}
  * @private
  */
-function _collectAudioInputs(spotIds, startDate, endDate, currentScript, spots, externalFiles) {
+async function _loadServerProcessedCache(projectFolder, scriptFile) {
+    const path = `${projectFolder}/system/database/processed_${scriptFile}_server.txt`;
+    try {
+        const blob = await StorageAdapter.getFileBlob(path);
+        if (!blob) return new Set();
+        const text = await blob.text();
+        return new Set(text.split(/\r?\n/).map(s => s.trim()).filter(Boolean));
+    } catch {
+        return new Set();
+    }
+}
+
+/**
+ * Collect the audio files that match the selected spots and date range,
+ * PRE-FILTERING out files already in the server processed cache.
+ *
+ * Server mode only supports copied imports (no reference files — those live
+ * on disk and can't be read from the browser). References are skipped with
+ * a warning.
+ *
+ * @returns {Promise<{ audio: {path:string,name:string}[],
+ *                      references: {path:string,name:string,spot:string}[],
+ *                      skippedProcessed: number }>}
+ * @private
+ */
+async function _collectAudioInputs(projectFolder, spotIds, startDate, endDate, currentScript, spots, externalFiles) {
     const validExts = currentScript.inputs?.[0]?.valid_extensions ?? ['.wav'];
     const extRegex  = new RegExp(`\\.(${validExts.map(e => e.replace('.', '')).join('|')})$`, 'i');
     const startVal  = parseInt(startDate.replace(/-/g, ''), 10);
     const endVal    = parseInt(endDate.replace(/-/g, ''), 10);
     const spotIdSet = new Set(spotIds);
 
+    // Pre-filter: load server-specific processed cache
+    const processedSet = await _loadServerProcessedCache(projectFolder, currentScript.script_file);
+
     const audio = [];
     const references = [];
+    let skippedProcessed = 0;
 
     externalFiles.forEach(file => {
         if (!file.local_path || !file.name) return;
@@ -226,11 +242,16 @@ function _collectAudioInputs(spotIds, startDate, endDate, currentScript, spots, 
             const spotName = spot ? spot.name.replace(/\s+/g, '').toUpperCase() : (matchId || '');
             references.push({ path: file.local_path, name: file.name, spot: spotName });
         } else {
+            // Skip files already processed on the server
+            if (processedSet.has(file.name)) {
+                skippedProcessed++;
+                return;
+            }
             audio.push({ path: file.local_path, name: file.name });
         }
     });
 
-    return { audio, references };
+    return { audio, references, skippedProcessed };
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +272,18 @@ async function _moveJobRecord(projectFolder, jobId, record, fromStatus, toStatus
     await StorageAdapter.deleteFile(`${projectFolder}/jobs/${fromStatus}/${jobId}.json`);
 }
 
-/** Merge new filenames into the local processed-files cache for a script. */
-async function _appendProcessedCache(projectFolder, scriptFile, names) {
+/**
+ * Merge new filenames into a processed-files cache.
+ * @param {string} projectFolder
+ * @param {string} scriptFile  e.g. "birdnet_predictions.py"
+ * @param {string[]} names     filenames to append
+ * @param {boolean} [server=false]  true → server-specific cache (_server suffix)
+ */
+async function _appendProcessedCache(projectFolder, scriptFile, names, server = false) {
     if (!names.length) return;
-    const path = `${projectFolder}/system/database/processed_${scriptFile}.txt`;
+    const suffix   = server ? '_server' : '';
+    const fileName = `processed_${scriptFile}${suffix}.txt`;
+    const path     = `${projectFolder}/system/database/${fileName}`;
     let existing = [];
     try {
         const blob = await StorageAdapter.getFileBlob(path);
@@ -262,7 +291,7 @@ async function _appendProcessedCache(projectFolder, scriptFile, names) {
     } catch { /* none yet */ }
     const merged = Array.from(new Set([...existing, ...names]));
     const blob   = new Blob([merged.join('\n') + '\n'], { type: 'text/plain' });
-    await StorageAdapter.saveFile(blob, `processed_${scriptFile}.txt`, [projectFolder, 'system', 'database']);
+    await StorageAdapter.saveFile(blob, fileName, [projectFolder, 'system', 'database']);
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +322,7 @@ export async function runJobOnServer(opts) {
     } = opts;
 
     if (!isConfigured()) {
-        throw new Error('Server is not configured. Set Config.server.baseUrl and apiKey.');
+        throw new Error('Server is not configured. Set Config.server.baseUrl.');
     }
 
     const project = MasterData.getActiveProject();
@@ -304,11 +333,14 @@ export async function runJobOnServer(opts) {
     const isBirdnet = stepId === 'birdnet';
     const localJobId = crypto.randomUUID();
 
-    // Assemble the descriptor (datasets/params) so the record matches a watcher job.
+    // Assemble the descriptor — for server mode we exclude input_files
+    // (references) since the server never analyses referenced audio.
     const jobData = buildJobData(
         jobName, currentScript, spotIds, startDate, endDate,
         dynamicParams, spots, externalFiles,
     );
+    // Clean out reference data from the server job record
+    delete jobData.input_files;
 
     const record = {
         ...jobData,
@@ -321,38 +353,30 @@ export async function runJobOnServer(opts) {
         server: { base_url: _base(), job_id: null, task_id: null },
     };
 
-    // Park it in jobs/processing immediately so it shows up live in the dashboard.
+    // Park it in jobs/processing immediately so it shows up in the dashboard.
     await _writeJobRecord(projectFolder, localJobId, record, 'processing');
     EventBus.emit(EVENTS.DATA_UPDATED, null);
 
     try {
-        // 1. Create the server-side job ---------------------------------------
-        onProgress('Creating job on server…');
-        const created     = await _json(_url('/jobs'), { method: 'POST', headers: _authHeaders() }, 15000);
-        const serverJobId = created.job_id;
-        record.server.job_id = serverJobId;
-        await _writeJobRecord(projectFolder, localJobId, record, 'processing');
-
-        // 2. Upload inputs -----------------------------------------------------
+        // ── 1. Upload audio (birdnet) or aggregate (analysis) ────────────
+        //    POST /api/v1/datasets/audio   → mints a server job_id
+        //    POST /api/v1/jobs/{id}/datasets/{kind} → upload extras
+        let serverJobId;
         const processedNames = [];
-        if (isBirdnet) {
-            const { audio, references } = _collectAudioInputs(
-                spotIds, startDate, endDate, currentScript, spots, externalFiles);
 
-            // Server mode = COPIED files only. Reference imports keep no bytes in
-            // the browser (only a disk path the sandbox can't read), so they can't
-            // be uploaded. Skip them with a clear warning; the user should
-            // re-import those as copies to analyse them on the server. (Local
-            // watcher mode still handles references — it reads them off disk.)
+        if (isBirdnet) {
+            const { audio, references, skippedProcessed } = await _collectAudioInputs(
+                projectFolder, spotIds, startDate, endDate, currentScript, spots, externalFiles);
+
             if (references.length) {
-                const names = references.map(r => r.name).join(', ');
                 console.warn(
                     `[ServerService] Skipping ${references.length} referenced file(s) — ` +
-                    `server mode supports copied imports only. Re-import as copies to ` +
-                    `analyse on the server: ${names}`);
+                    `server mode supports copied imports only.`);
                 onProgress(
-                    `Note: skipping ${references.length} referenced file(s) — ` +
-                    `server mode supports copied imports only. Re-import them as copies.`);
+                    `Skipping ${references.length} referenced file(s) (server = copies only).`);
+            }
+            if (skippedProcessed > 0) {
+                onProgress(`Filtered out ${skippedProcessed} already-processed file(s).`);
             }
 
             if (audio.length === 0) {
@@ -360,132 +384,183 @@ export async function runJobOnServer(opts) {
                     references.length
                         ? 'All matching files were imported by reference, which the server ' +
                           'cannot analyse. Re-import them as copies and try again.'
-                        : 'No audio files found for the selected spots and dates.');
+                        : skippedProcessed > 0
+                            ? 'All matching files have already been processed on the server.'
+                            : 'No audio files found for the selected spots and dates.');
             }
 
-            // Copied audio files → one multipart request (kind=audio).
-            onProgress(`Uploading ${audio.length} file(s)…`);
+            // Upload audio → creates the server job
+            onProgress(`Uploading ${audio.length} audio file(s)…`);
             const fd = new FormData();
-            fd.append('kind', 'audio');
             for (const a of audio) {
                 const blob = await StorageAdapter.getFileBlob(a.path);
                 if (!blob) throw new Error(`Could not read local file: ${a.name}`);
                 fd.append('files', blob, a.name);
                 processedNames.push(a.name);
             }
-            await _fetch(_url(`/jobs/${serverJobId}/upload`),
-                { method: 'POST', headers: _authHeaders(), body: fd },
+            const uploadResp = await _json(
+                _url('/api/v1/datasets/audio'),
+                { method: 'POST', body: fd },
                 20 * 60 * 1000);
+            serverJobId = uploadResp.job_id;
+            record.server.job_id = serverJobId;
+            await _writeJobRecord(projectFolder, localJobId, record, 'processing');
+
+            // Also upload the server aggregate so BirdNET can APPEND to it
+            const serverAggPath = `${projectFolder}/system/database/birdnet_results_server.csv`;
+            const serverAggBlob = await StorageAdapter.getFileBlob(serverAggPath);
+            if (serverAggBlob) {
+                onProgress('Uploading existing server aggregate…');
+                const aggFd = new FormData();
+                aggFd.append('files', serverAggBlob, 'aggregate.csv');
+                await _fetch(
+                    _url(`/api/v1/jobs/${serverJobId}/datasets/aggregate`),
+                    { method: 'POST', body: aggFd },
+                    5 * 60 * 1000);
+            }
+
+            // Upload server processed list so script can double-check dedup
+            const serverProcPath = `${projectFolder}/system/database/processed_${currentScript.script_file}_server.txt`;
+            const serverProcBlob = await StorageAdapter.getFileBlob(serverProcPath);
+            if (serverProcBlob) {
+                const procFd = new FormData();
+                procFd.append('files', serverProcBlob, 'processed_files.txt');
+                await _fetch(
+                    _url(`/api/v1/jobs/${serverJobId}/datasets/processed`),
+                    { method: 'POST', body: procFd },
+                    60 * 1000);
+            }
         } else {
-            // Analysis step: ship the locally-cached BirdNET aggregate so the
-            // stateless server has the detections to analyse.
+            // Analysis step: upload the server aggregate (prefer server-specific,
+            // fall back to local).
             onProgress('Uploading BirdNET aggregate…');
-            const aggPath = `${projectFolder}/system/database/birdnet_results.csv`;
-            const aggBlob = await StorageAdapter.getFileBlob(aggPath);
+            const serverAggPath = `${projectFolder}/system/database/birdnet_results_server.csv`;
+            const localAggPath  = `${projectFolder}/system/database/birdnet_results.csv`;
+            let aggBlob = await StorageAdapter.getFileBlob(serverAggPath);
+            if (!aggBlob) aggBlob = await StorageAdapter.getFileBlob(localAggPath);
             if (!aggBlob) {
-                throw new Error('No local BirdNET aggregate found. Run BirdNET ' +
+                throw new Error('No BirdNET aggregate found. Run BirdNET ' +
                     '(locally or on the server) before this analysis.');
             }
+
+            // Upload audio just to mint a job_id (empty audio is fine — the
+            // analysis steps don't need audio, they need the aggregate).
+            // Actually, use the upload_override route to create a job first.
+            // We need a job_id before we can upload the aggregate.
+            // The cleanest path: upload a dummy then override with aggregate.
+            // But the STACD API creates a job on POST /datasets/audio.
+            // For analysis steps we upload the aggregate as the only input.
             const fd = new FormData();
-            fd.append('kind', 'aggregate');
             fd.append('files', aggBlob, 'aggregate.csv');
-            await _fetch(_url(`/jobs/${serverJobId}/upload`),
-                { method: 'POST', headers: _authHeaders(), body: fd }, 5 * 60 * 1000);
+            // We need to create a job first. Use a small dummy upload to mint one.
+            const dummyFd = new FormData();
+            dummyFd.append('files', new Blob([''], { type: 'audio/wav' }), '_placeholder.wav');
+            const uploadResp = await _json(
+                _url('/api/v1/datasets/audio'),
+                { method: 'POST', body: dummyFd },
+                30 * 1000);
+            serverJobId = uploadResp.job_id;
+            record.server.job_id = serverJobId;
+            await _writeJobRecord(projectFolder, localJobId, record, 'processing');
+
+            // Now upload the real aggregate
+            await _fetch(
+                _url(`/api/v1/jobs/${serverJobId}/datasets/aggregate`),
+                { method: 'POST', body: fd },
+                5 * 60 * 1000);
         }
 
-        // 3. Launch the step ---------------------------------------------------
-        onProgress('Starting analysis…');
+        // ── 2. Run the step (SYNCHRONOUS — blocks until done) ────────────
+        //    POST /api/v1/jobs/{serverJobId}/{stepId}
+        onProgress('Running analysis on server…');
         const runBody = {};
-        if (jobData.parameters?.spots)      runBody.spots      = String(jobData.parameters.spots).split(',').filter(Boolean);
+
+        // Spot/date params
+        if (jobData.parameters?.spots) {
+            runBody.spots = String(jobData.parameters.spots);
+        }
         if (jobData.parameters?.start_date) runBody.start_date = jobData.parameters.start_date;
         if (jobData.parameters?.end_date)   runBody.end_date   = jobData.parameters.end_date;
-        if (isBirdnet && dynamicParams?.snr_db != null && dynamicParams.snr_db !== '') {
-            const snr = Number(dynamicParams.snr_db);
-            if (!Number.isNaN(snr)) runBody.snr_db = snr;
-        }
 
-        const run = await _json(_url(`/jobs/${serverJobId}/run/${stepId}`), {
-            method: 'POST',
-            headers: { ...
-                _authHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify(runBody),
-        }, 15000);
-
-        const taskId = run.task_id;
-        record.server.task_id = taskId;
-        await _writeJobRecord(projectFolder, localJobId, record, 'processing');
-
-        // 4. Poll the task -----------------------------------------------------
-        const started = Date.now();
-        const MAX_MS  = 60 * 60 * 1000;   // hard stop after 1h
-        let task;
-        for (;;) {
-            await _sleep(2500);
-            task = await _json(_url(`/jobs/${serverJobId}/tasks/${taskId}`),
-                { headers: _authHeaders() }, 15000);
-            const secs = Math.round((Date.now() - started) / 1000);
-            onProgress(`${task.status} on server… (${secs}s)`);
-            if (task.status === 'success' || task.status === 'failed') break;
-            if (Date.now() - started > MAX_MS) throw new Error('Timed out waiting for the server task.');
-        }
-
-        // Always try to capture the run log for the dashboard.
-        let runLog = '';
-        try {
-            const logResp = await _fetch(_url(`/jobs/${serverJobId}/tasks/${taskId}/log`),
-                { headers: _authHeaders() }, 15000);
-            runLog = await logResp.text();
-        } catch { /* log optional */ }
-
-        // 5. Failure path ------------------------------------------------------
-        if (task.status === 'failed') {
-            if (runLog) {
-                await StorageAdapter.saveFile(
-                    new Blob([runLog], { type: 'text/plain' }),
-                    'error.log', [projectFolder, 'jobs', 'results', localJobId]);
+        // Forward ALL dynamic params from the UI (manifest-driven)
+        for (const [key, val] of Object.entries(dynamicParams)) {
+            if (val != null && val !== '') {
+                runBody[key] = val;
             }
+        }
+
+        // Build spot geo from the project's spot data
+        const spotsGeo = spotIds.map(id => {
+            const s = spots.find(sp => sp.spotId === id);
+            return s ? { name: s.name.replace(/\s+/g, '').toUpperCase(), lat: s.lat, lon: s.lng } : null;
+        }).filter(Boolean);
+        if (spotsGeo.length) runBody.spots_geo = spotsGeo;
+
+        const result = await _json(
+            _url(`/api/v1/jobs/${serverJobId}/${stepId}`),
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(runBody),
+            },
+            60 * 60 * 1000);  // 1h timeout for synchronous run
+
+        const taskId = result.task_id;
+        record.server.task_id = taskId;
+
+        // ── 3. Check result status ───────────────────────────────────────
+        if (result.status === 'skipped' || result.status === 'failed') {
             record.status = 'failed';
-            record.error  = task.error || 'Server task failed.';
+            record.error  = result.message || 'Server task failed.';
             record.finished_at = new Date().toISOString();
             await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'failed');
             EventBus.emit(EVENTS.DATA_UPDATED, null);
             throw new Error(record.error);
         }
 
-        // 6. Download results --------------------------------------------------
+        // ── 4. Download results ──────────────────────────────────────────
         onProgress('Downloading results…');
-        const { results = [] } = await _json(_url(`/jobs/${serverJobId}/results`),
-            { headers: _authHeaders() }, 30000);
+        const { results = [] } = await _json(
+            _url(`/api/v1/jobs/${serverJobId}/results`),
+            {}, 30000);
 
         let saved = 0;
         let aggregateBlob = null;
+        let processedBlob = null;
         for (const rel of results) {
             const resp = await _fetch(
-                _url(`/jobs/${serverJobId}/file?path=${encodeURIComponent(rel)}`),
-                { headers: _authHeaders() }, 5 * 60 * 1000);
+                _url(`/api/v1/jobs/${serverJobId}/file?path=${encodeURIComponent(rel)}`),
+                {}, 5 * 60 * 1000);
             const blob = await resp.blob();
             const base = rel.split('/').pop();
             await StorageAdapter.saveFile(blob, base, [projectFolder, 'jobs', 'results', localJobId]);
             saved++;
+            // Capture aggregate and processed files for local persistence
             if (isBirdnet && /aggregate\.csv$/i.test(rel)) aggregateBlob = blob;
+            if (isBirdnet && /processed_files\.txt$/i.test(rel)) processedBlob = blob;
         }
 
-        if (runLog) {
-            await StorageAdapter.saveFile(
-                new Blob([runLog], { type: 'text/plain' }),
-                '_run.log', [projectFolder, 'jobs', 'results', localJobId]);
-        }
-
-        // 7. For BirdNET: persist aggregate + processed cache for downstream use
+        // ── 5. For BirdNET: persist server aggregate + processed cache ───
         if (isBirdnet) {
+            // Save to SERVER-specific aggregate path (separate from local)
             if (aggregateBlob) {
-                await StorageAdapter.saveFile(aggregateBlob, 'birdnet_results.csv',
+                await StorageAdapter.saveFile(
+                    aggregateBlob, 'birdnet_results_server.csv',
                     [projectFolder, 'system', 'database']);
             }
-            await _appendProcessedCache(projectFolder, currentScript.script_file, processedNames);
+            // Update server-specific processed cache
+            if (processedBlob) {
+                // The server returns the full merged processed list — save it directly
+                await StorageAdapter.saveFile(
+                    processedBlob, `processed_${currentScript.script_file}_server.txt`,
+                    [projectFolder, 'system', 'database']);
+            } else {
+                // Fallback: append the names we uploaded
+                await _appendProcessedCache(projectFolder, currentScript.script_file, processedNames, true);
+            }
         }
 
-        // 8. Mark completed ----------------------------------------------------
+        // ── 6. Mark completed ────────────────────────────────────────────
         record.status      = 'completed';
         record.finished_at = new Date().toISOString();
         record.result_count = saved;
