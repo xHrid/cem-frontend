@@ -37,7 +37,7 @@ set -e
 APP_ID="${GOOGLE_CLIENT_ID%%-*}"
 
 # Default the analysis repo if not provided.
-ANALYSIS_REPO_URL="${ANALYSIS_REPO_URL:-https://raw.githubusercontent.com/xHrid/cem-scripts-new/refs/heads/main}"
+ANALYSIS_REPO_URL="${ANALYSIS_REPO_URL:-https://raw.githubusercontent.com/xHrid/cem-backend/refs/heads/master}"
 
 # Strip any trailing slash the user may have added to the server URL.
 SERVER_BASE_URL="${SERVER_BASE_URL%/}"

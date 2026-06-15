@@ -70,7 +70,7 @@ class WatcherConfig:
     lock_file: str = "system/watcher.lock"
     req_hash_file: str = "system/.req_hash"
     github_repo_url: str = (
-        "https://raw.githubusercontent.com/xHrid/cem-backend/main"
+        "https://raw.githubusercontent.com/xHrid/cem-backend/master"
     )
 
     # Derived paths (computed post-init)
