@@ -493,15 +493,21 @@ class JobProcessor:
             # The webapp runs on Windows and stores Windows paths (D:\...).
             # The watcher may run under WSL where those must become /mnt/d/...
             # for the filesystem to find them — _win_to_wsl handles that.
+            # dataset_spots: aligned 1:1 with datasets — canonical UI spot name
+            raw_dataset_spots = job_data.get("dataset_spots", [])
             resolved_dirs = []
-            for d in job_data.get("datasets", []):
+            resolved_dir_spots = []
+            for idx, d in enumerate(job_data.get("datasets", [])):
+                spot_label = raw_dataset_spots[idx] if idx < len(raw_dataset_spots) else ""
                 p = (cfg.root_path / d).resolve()
                 if p.exists():
                     resolved_dirs.append(str(p))
+                    resolved_dir_spots.append(spot_label)
                 else:
                     p2 = Path(_win_to_wsl(d)).resolve()  # may already be absolute
                     if p2.exists():
                         resolved_dirs.append(str(p2))
+                        resolved_dir_spots.append(spot_label)
                     else:
                         logger.warning("  dataset path not found: %s", d)
 
@@ -532,9 +538,17 @@ class JobProcessor:
                         out.append(x)
                 return out
 
-            unique_dirs = _dedup(resolved_dirs)
+            # Dedup dirs while keeping dataset_spots aligned.
+            seen_d, unique_dirs, unique_dir_spots = set(), [], []
+            for d, sp in zip(resolved_dirs, resolved_dir_spots):
+                if d not in seen_d:
+                    seen_d.add(d)
+                    unique_dirs.append(d)
+                    unique_dir_spots.append(sp)
             if unique_dirs:
                 cmd.extend(["--datasets"] + unique_dirs)
+                if any(s for s in unique_dir_spots):
+                    cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
 
             # Dedup reference files while keeping each one's spot aligned.
             seen_f, unique_files, unique_file_spots = set(), [], []

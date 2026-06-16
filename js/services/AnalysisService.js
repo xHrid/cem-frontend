@@ -313,54 +313,60 @@ export function buildJobData(
     //   - Reference files              → explicit absolute file paths.  These
     //     live OUTSIDE the spot dirs, so the watcher passes each one through
     //     as an INPUT_FILE_LIST entry rather than collapsing it to a directory.
-    const relativePaths = new Set();
-    const referenceFiles = [];   // [{ path, spot }] — spot travels with each file
+    // Track {path: spotName} so we can build dataset_spots aligned with datasets.
+    const pathToSpot = new Map();   // relative-path → canonical spot name
+    const referenceFiles = [];      // [{ path, spot }] — spot travels with each file
 
     externalFiles.forEach(file => {
         if (!file.local_path || !file.linked_spots) return;
-        // Each reference file attaches to a single spot (radio import). Pick the
-        // linked spot that is part of this job's selection.
         const matchId = spotIds.find(id => file.linked_spots.includes(id));
         if (!matchId) return;
 
+        const s = spots.find(sp => sp.spotId === matchId);
+        const spotName = s ? s.name.replace(/\s+/g, '').toUpperCase() : matchId;
+
         if (file.is_reference) {
-            const s = spots.find(sp => sp.spotId === matchId);
-            const spotName = s ? s.name.replace(/\s+/g, '').toUpperCase() : matchId;
             referenceFiles.push({ path: file.local_path, spot: spotName });
         } else {
-            relativePaths.add(file.local_path);
+            pathToSpot.set(file.local_path, spotName);
         }
     });
 
     spotIds.forEach(spotId => {
         const spot = spots.find(s => s.spotId === spotId);
-        if (spot?.audio_local_filename) relativePaths.add(spot.audio_local_filename);
+        if (spot?.audio_local_filename) {
+            const spotName = spot.name.replace(/\s+/g, '').toUpperCase();
+            pathToSpot.set(spot.audio_local_filename, spotName);
+        }
     });
 
     /**
-     * Collapse file paths to their containing directories.
-     * Normalise separators: Windows backslashes → forward slashes so that
-     * split('/') works correctly for paths that leaked from the OS.
+     * Collapse file paths to their containing directories and build an
+     * aligned spot-name array (dataset_spots).
      */
-    function toDirs(pathSet) {
-        return [...new Set(
-            [...pathSet].map(p => {
-                const norm = p.replace(/\\/g, '/');
-                if (/\.(wav|mp3|m4a|flac)$/i.test(norm)) {
-                    const parts = norm.split('/');
-                    parts.pop();
-                    return parts.join('/');
-                }
-                return norm;
-            }).filter(d => d.length > 0)   // drop empty strings
-        )];
+    function toDirsWithSpots(pathMap) {
+        const dirMap = new Map();   // dir → spotName
+        for (const [p, spotName] of pathMap) {
+            const norm = p.replace(/\\/g, '/');
+            let dir = norm;
+            if (/\.(wav|mp3|m4a|flac)$/i.test(norm)) {
+                const parts = norm.split('/');
+                parts.pop();
+                dir = parts.join('/');
+            }
+            if (dir.length > 0 && !dirMap.has(dir)) {
+                dirMap.set(dir, spotName);
+            }
+        }
+        return { dirs: [...dirMap.keys()], spots: [...dirMap.values()] };
     }
 
-    const datasetDirs  = toDirs(relativePaths);
-    // Reference files passed verbatim as {path, spot} — full paths, not dirs.
-    const inputFiles   = referenceFiles;
+    const { dirs: datasetDirs, spots: datasetSpots } = toDirsWithSpots(pathToSpot);
+    const inputFiles = referenceFiles;
 
-    // Build spot-name string for the watcher (e.g. "SITE1,SITE2")
+    // Build spot-name string for CLI --spots flag.
+    // The UI-selected spot name IS the canonical name — BirdNET will write it
+    // into the aggregate via --dataset-spots, so the filter step matches.
     if (spotIds.length > 0) {
         const spotNames = spotIds.map(id => {
             const s = spots.find(spot => spot.spotId === id);
@@ -375,6 +381,7 @@ export function buildJobData(
         job_name:     jobName,
         script_name:  currentScript.script_file,
         datasets:     datasetDirs,
+        dataset_spots: datasetSpots,   // aligned 1:1 with datasets — canonical UI spot name per dir
         input_files:  inputFiles,
         parameters:   params,
     };

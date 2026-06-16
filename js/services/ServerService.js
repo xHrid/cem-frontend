@@ -236,10 +236,11 @@ async function _collectAudioInputs(projectFolder, spotIds, startDate, endDate, c
             if (d < startVal || d > endVal) return;
         }
 
+        const matchId  = spotIds.find(id => file.linked_spots.includes(id));
+        const spot     = spots.find(sp => sp.spotId === matchId);
+        const spotName = spot ? spot.name.replace(/\s+/g, '').toUpperCase() : (matchId || '');
+
         if (file.is_reference) {
-            const matchId  = spotIds.find(id => file.linked_spots.includes(id));
-            const spot     = spots.find(sp => sp.spotId === matchId);
-            const spotName = spot ? spot.name.replace(/\s+/g, '').toUpperCase() : (matchId || '');
             references.push({ path: file.local_path, name: file.name, spot: spotName });
         } else {
             // Skip files already processed on the server
@@ -247,7 +248,7 @@ async function _collectAudioInputs(projectFolder, spotIds, startDate, endDate, c
                 skippedProcessed++;
                 return;
             }
-            audio.push({ path: file.local_path, name: file.name });
+            audio.push({ path: file.local_path, name: file.name, spot: spotName });
         }
     });
 
@@ -364,9 +365,11 @@ export async function runJobOnServer(opts) {
         let serverJobId;
         const processedNames = [];
 
+        let _uploadedAudio = [];   // captured for audio_spots mapping later
         if (isBirdnet) {
             const { audio, references, skippedProcessed } = await _collectAudioInputs(
                 projectFolder, spotIds, startDate, endDate, currentScript, spots, externalFiles);
+            _uploadedAudio = audio;
 
             if (references.length) {
                 console.warn(
@@ -489,12 +492,24 @@ export async function runJobOnServer(opts) {
             }
         }
 
-        // Build spot geo from the project's spot data
+        // Build spot geo from the project's spot data — UI label is canonical.
         const spotsGeo = spotIds.map(id => {
             const s = spots.find(sp => sp.spotId === id);
-            return s ? { name: s.name.replace(/\s+/g, '').toUpperCase(), lat: s.lat, lon: s.lng } : null;
+            if (!s) return null;
+            const name = s.name.replace(/\s+/g, '').toUpperCase();
+            return { name, lat: s.lat, lon: s.lng };
         }).filter(Boolean);
         if (spotsGeo.length) runBody.spots_geo = spotsGeo;
+
+        // Send per-file spot mapping so BirdNET writes UI spot names into the
+        // aggregate CSV (not filename-parsed prefixes).
+        if (_uploadedAudio.length) {
+            const audioSpots = {};
+            for (const a of _uploadedAudio) {
+                if (a.spot) audioSpots[a.name] = a.spot;
+            }
+            if (Object.keys(audioSpots).length) runBody.audio_spots = audioSpots;
+        }
 
         const result = await _json(
             _url(`/api/v1/jobs/${serverJobId}/${stepId}`),
