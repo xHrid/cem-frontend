@@ -10,7 +10,7 @@
  *
  *      1. POST /api/v1/datasets/audio                -> mint a job_id + upload WAVs
  *      2. POST /api/v1/jobs/{id}/datasets/{kind}     -> upload aggregate / processed list
- *      3. POST /api/v1/jobs/{id}/{algo}              -> run step SYNCHRONOUSLY (blocks)
+ *      3. POST /api/v1/jobs/{algo}  body:{job_id}     -> run step SYNCHRONOUSLY (blocks)
  *      4. GET  /api/v1/jobs/{id}/results             -> list produced files
  *         GET  /api/v1/jobs/{id}/file?path=...       -> download each one
  *
@@ -474,9 +474,9 @@ export async function runJobOnServer(opts) {
         }
 
         // ── 2. Run the step (SYNCHRONOUS — blocks until done) ────────────
-        //    POST /api/v1/jobs/{serverJobId}/{stepId}
+        //    POST /api/v1/jobs/{stepId}  (job_id in body)
         onProgress('Running analysis on server…');
-        const runBody = {};
+        const runBody = { job_id: serverJobId };
 
         // Spot/date params
         if (jobData.parameters?.spots) {
@@ -512,7 +512,7 @@ export async function runJobOnServer(opts) {
         }
 
         const result = await _json(
-            _url(`/api/v1/jobs/${serverJobId}/${stepId}`),
+            _url(`/api/v1/jobs/${stepId}`),
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
