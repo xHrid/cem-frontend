@@ -250,18 +250,32 @@
 
                 <!-- Audio slot -->
                 <div class="server-file-slot" id="slot-audio"
-                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
-                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
+                     style="padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
                             border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div>
-                        <strong>Audio Files</strong>
-                        <span id="slot-audio-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                        <div>
+                            <strong>Audio Files</strong>
+                            <span id="slot-audio-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                        </div>
                     </div>
-                    <div style="display:flex; gap:6px; align-items:center;">
+                    <!-- Upload controls: spot dropdown + file picker -->
+                    <div id="audio-upload-controls" style="display:flex; gap:8px; align-items:center;">
+                        <select id="audio-spot-select" style="flex:1; padding:6px 8px; font-size:0.85rem; border:1px solid var(--border-color); border-radius:4px;">
+                            <option value="">Select spot…</option>
+                        </select>
                         <input type="file" id="upload-audio-input" multiple accept=".wav,.mp3,.m4a,.flac" style="display:none;" />
-                        <button type="button" class="small-btn server-upload-btn" data-category="audio">Upload</button>
-                        <button type="button" class="small-btn server-override-btn" data-category="audio"
-                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                        <button type="button" class="small-btn" id="audio-upload-trigger" disabled
+                                style="white-space:nowrap;">Upload Files</button>
+                    </div>
+                    <!-- Progress bar (replaces controls during upload) -->
+                    <div id="audio-upload-progress" style="display:none;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-size:0.8rem;">
+                            <span id="audio-progress-label">Uploading…</span>
+                            <span id="audio-progress-pct">0%</span>
+                        </div>
+                        <div style="height:6px; background:var(--border-color); border-radius:3px; overflow:hidden;">
+                            <div id="audio-progress-bar" style="height:100%; width:0%; background:var(--accent-blue); border-radius:3px; transition:width 0.3s;"></div>
+                        </div>
                     </div>
                 </div>
 
@@ -270,14 +284,16 @@
                      style="display:flex; align-items:center; justify-content:space-between; gap:8px;
                             padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
                             border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div>
+                    <div style="flex:1; min-width:0;">
                         <strong>aggregate.csv</strong>
                         <span id="slot-aggregate-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                        <div id="slot-aggregate-local" style="font-size:0.78rem; color:var(--text-muted); margin-top:2px;"></div>
                     </div>
-                    <div style="display:flex; gap:6px; align-items:center;">
-                        <button type="button" class="small-btn server-upload-btn" data-category="aggregate">Upload</button>
+                    <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
+                        <button type="button" class="small-btn server-upload-btn" data-category="aggregate"
+                                style="display:none;">Upload to Server</button>
                         <button type="button" class="small-btn server-override-btn" data-category="aggregate"
-                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                                style="display:none; background:#ff9800; color:#fff;">Re-upload</button>
                     </div>
                 </div>
 
@@ -286,14 +302,16 @@
                      style="display:flex; align-items:center; justify-content:space-between; gap:8px;
                             padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
                             border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div>
+                    <div style="flex:1; min-width:0;">
                         <strong>processed.csv</strong>
                         <span id="slot-processed-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                        <div id="slot-processed-local" style="font-size:0.78rem; color:var(--text-muted); margin-top:2px;"></div>
                     </div>
-                    <div style="display:flex; gap:6px; align-items:center;">
-                        <button type="button" class="small-btn server-upload-btn" data-category="processed">Upload</button>
+                    <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
+                        <button type="button" class="small-btn server-upload-btn" data-category="processed"
+                                style="display:none;">Upload to Server</button>
                         <button type="button" class="small-btn server-override-btn" data-category="processed"
-                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                                style="display:none; background:#ff9800; color:#fff;">Re-upload</button>
                     </div>
                 </div>
             </div>

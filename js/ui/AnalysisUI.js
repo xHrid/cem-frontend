@@ -57,6 +57,7 @@ import {
 }                                   from '../services/ServerUploadService.js';
 import { getSpots, getExternalFiles, getActiveProject } from '../data/MasterData.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
+import * as StorageAdapter from '../data/StorageAdapter.js';
 import { getWatcherStatus } from '../data/Repository.js';
 import { showToast }                from './Toast.js';
 import { openModal, closeModal }    from './ModalManager.js';
@@ -213,6 +214,20 @@ export function initAnalysis() {
         }
     });
 
+    // Audio spot dropdown → enable/disable upload trigger
+    const spotSelect = document.getElementById('audio-spot-select');
+    const audioTrigger = document.getElementById('audio-upload-trigger');
+    if (spotSelect && audioTrigger) {
+        spotSelect.addEventListener('change', () => {
+            audioTrigger.disabled = !spotSelect.value;
+        });
+        // Click trigger → open file picker
+        audioTrigger.addEventListener('click', () => {
+            const fileInput = document.getElementById('upload-audio-input');
+            if (fileInput) { fileInput.value = ''; fileInput.click(); }
+        });
+    }
+
     // Audio file input change (from file picker)
     const audioInput = document.getElementById('upload-audio-input');
     if (audioInput) {
@@ -305,7 +320,8 @@ function _applyModeStyles() {
 let _serverFileStatus = null;
 
 /**
- * Query the server for existing project files and update the 3 slots.
+ * Query the server for existing project files, detect local files,
+ * and update all 3 upload slots.
  * @private
  */
 async function _refreshServerUploadStatus() {
@@ -314,7 +330,7 @@ async function _refreshServerUploadStatus() {
 
     try {
         _serverFileStatus = await checkProjectFiles();
-        _renderUploadSlots(_serverFileStatus);
+        await _renderUploadSlots(_serverFileStatus);
         if (msgEl) msgEl.textContent = '';
     } catch (e) {
         if (msgEl) msgEl.textContent = `Could not reach server: ${e.message}`;
@@ -323,69 +339,135 @@ async function _refreshServerUploadStatus() {
 }
 
 /**
- * Update the 3 file slot UI elements based on server status.
+ * Populate the audio spot dropdown from the project's spots.
+ * @private
+ */
+function _populateAudioSpotDropdown() {
+    const select = document.getElementById('audio-spot-select');
+    if (!select) return;
+    const spots = getSpots();
+    select.innerHTML = '<option value="">Select spot…</option>';
+    spots.forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.name.replace(/\s+/g, '').toUpperCase();
+        opt.textContent = s.name;
+        opt.dataset.spotId = s.spotId;
+        select.appendChild(opt);
+    });
+}
+
+/**
+ * Check if a file exists in local storage (IndexedDB / native FS).
+ * @param {string} path  Relative storage path
+ * @returns {Promise<boolean>}
+ * @private
+ */
+async function _localFileExists(path) {
+    try {
+        const blob = await StorageAdapter.getFileBlob(path);
+        return blob != null && blob.size > 0;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Update all 3 file slot UI elements based on server + local status.
  * @param {object} status  Response from checkProjectFiles()
  * @private
  */
-function _renderUploadSlots(status) {
+async function _renderUploadSlots(status) {
+    // Populate spot dropdown
+    _populateAudioSpotDropdown();
+
     // ── Audio ──
-    const audioInfo    = document.getElementById('slot-audio-info');
-    const audioUpload  = document.querySelector('#slot-audio .server-upload-btn');
-    const audioOverride = document.querySelector('#slot-audio .server-override-btn');
+    const audioInfo = document.getElementById('slot-audio-info');
     if (audioInfo) {
         if (status.audio_count > 0) {
             audioInfo.textContent = `${status.audio_count} file(s) on server`;
             audioInfo.style.color = '#28a745';
-            if (audioUpload)  audioUpload.textContent = 'Add More';
-            if (audioOverride) audioOverride.style.display = 'inline-block';
         } else {
-            audioInfo.textContent = 'Not uploaded';
+            audioInfo.textContent = 'No audio on server yet';
             audioInfo.style.color = 'var(--text-muted)';
-            if (audioUpload)  audioUpload.textContent = 'Upload';
-            if (audioOverride) audioOverride.style.display = 'none';
         }
     }
 
-    // ── Aggregate ──
-    const aggInfo     = document.getElementById('slot-aggregate-info');
-    const aggUpload   = document.querySelector('#slot-aggregate .server-upload-btn');
+    // ── Aggregate: check local + server ──
+    const project = getActiveProject();
+    const pf = project ? getProjectFolderName(project) : '';
+
+    const aggInfo    = document.getElementById('slot-aggregate-info');
+    const aggLocal   = document.getElementById('slot-aggregate-local');
+    const aggUpload  = document.querySelector('#slot-aggregate .server-upload-btn');
     const aggOverride = document.querySelector('#slot-aggregate .server-override-btn');
-    if (aggInfo) {
+
+    if (aggInfo && pf) {
+        const serverAggPath = `${pf}/system/database/birdnet_results_server.csv`;
+        const localAggPath  = `${pf}/system/database/birdnet_results.csv`;
+        const hasServerLocal = await _localFileExists(serverAggPath);
+        const hasLocalAgg    = hasServerLocal || await _localFileExists(localAggPath);
+
         if (status.has_aggregate) {
-            aggInfo.textContent = 'Found on server';
+            aggInfo.textContent = '✓ On server';
             aggInfo.style.color = '#28a745';
-            if (aggUpload)  aggUpload.style.display = 'none';
+            if (aggUpload)   aggUpload.style.display = 'none';
             if (aggOverride) aggOverride.style.display = 'inline-block';
+            if (aggLocal)    aggLocal.textContent = hasLocalAgg ? 'Local copy also available' : '';
+        } else if (hasLocalAgg) {
+            aggInfo.textContent = 'Not on server';
+            aggInfo.style.color = '#dc3545';
+            if (aggLocal)    aggLocal.textContent = '📁 Found locally — click to upload';
+            aggLocal.style.color = '#0b5394';
+            if (aggUpload)  { aggUpload.style.display = 'inline-block'; aggUpload.textContent = 'Upload to Server'; }
+            if (aggOverride) aggOverride.style.display = 'none';
         } else {
-            aggInfo.textContent = 'Not uploaded';
+            aggInfo.textContent = 'Not found';
             aggInfo.style.color = 'var(--text-muted)';
-            if (aggUpload)  aggUpload.style.display = 'inline-block';
+            if (aggLocal)    aggLocal.textContent = 'Run BirdNET first to generate this file';
+            if (aggUpload)   aggUpload.style.display = 'none';
             if (aggOverride) aggOverride.style.display = 'none';
         }
     }
 
-    // ── Processed ──
-    const procInfo     = document.getElementById('slot-processed-info');
-    const procUpload   = document.querySelector('#slot-processed .server-upload-btn');
+    // ── Processed: check local + server ──
+    const procInfo    = document.getElementById('slot-processed-info');
+    const procLocal   = document.getElementById('slot-processed-local');
+    const procUpload  = document.querySelector('#slot-processed .server-upload-btn');
     const procOverride = document.querySelector('#slot-processed .server-override-btn');
-    if (procInfo) {
+
+    if (procInfo && pf) {
+        const scriptFile = _currentScript?.script_file || 'birdnet_predictions.py';
+        const serverProcPath = `${pf}/system/database/processed_${scriptFile}_server.txt`;
+        const localProcPath  = `${pf}/system/database/processed_${scriptFile}.txt`;
+        const hasServerProc = await _localFileExists(serverProcPath);
+        const hasLocalProc  = hasServerProc || await _localFileExists(localProcPath);
+
         if (status.has_processed) {
-            procInfo.textContent = 'Found on server';
+            procInfo.textContent = '✓ On server';
             procInfo.style.color = '#28a745';
-            if (procUpload)  procUpload.style.display = 'none';
+            if (procUpload)   procUpload.style.display = 'none';
             if (procOverride) procOverride.style.display = 'inline-block';
+            if (procLocal)    procLocal.textContent = hasLocalProc ? 'Local copy also available' : '';
+        } else if (hasLocalProc) {
+            procInfo.textContent = 'Not on server';
+            procInfo.style.color = '#dc3545';
+            if (procLocal)    procLocal.textContent = '📁 Found locally — click to upload';
+            procLocal.style.color = '#0b5394';
+            if (procUpload)  { procUpload.style.display = 'inline-block'; procUpload.textContent = 'Upload to Server'; }
+            if (procOverride) procOverride.style.display = 'none';
         } else {
-            procInfo.textContent = 'Not uploaded';
+            procInfo.textContent = 'Not found';
             procInfo.style.color = 'var(--text-muted)';
-            if (procUpload)  procUpload.style.display = 'inline-block';
+            if (procLocal)    procLocal.textContent = 'Generated after first analysis run';
+            if (procUpload)   procUpload.style.display = 'none';
             if (procOverride) procOverride.style.display = 'none';
         }
     }
 }
 
 /**
- * Handle click on upload/override buttons in the server upload panel.
- * @param {string} category  'audio' | 'aggregate' | 'processed'
+ * Handle click on upload/override buttons for aggregate or processed.
+ * @param {string} category  'aggregate' | 'processed'
  * @param {boolean} force    true = override existing
  * @private
  */
@@ -394,19 +476,6 @@ async function _handleServerUpload(category, force = false) {
     const setMsg = (msg) => { if (msgEl) msgEl.textContent = msg; };
 
     try {
-        if (category === 'audio') {
-            // For audio: collect from local storage using selected spots/dates,
-            // or let user pick files via the hidden file input.
-            const fileInput = document.getElementById('upload-audio-input');
-            if (!fileInput) return;
-
-            // Trigger file picker
-            fileInput.value = '';
-            fileInput.click();
-            // The actual upload happens in the 'change' listener below.
-            return;
-        }
-
         if (category === 'aggregate') {
             setMsg('Uploading aggregate…');
             await uploadAggregate(force, setMsg);
@@ -414,7 +483,6 @@ async function _handleServerUpload(category, force = false) {
         }
 
         if (category === 'processed') {
-            // Use the currently selected script's script_file, or default
             const scriptFile = _currentScript?.script_file || 'birdnet_predictions.py';
             setMsg('Uploading processed list…');
             await uploadProcessed(scriptFile, force, setMsg);
@@ -429,16 +497,30 @@ async function _handleServerUpload(category, force = false) {
 }
 
 /**
- * Handle audio file input change — reads selected files and uploads them
- * directly to the server via FormData.
+ * Handle audio file selection → upload with progress bar + spot mapping.
+ * Replaces controls with progress bar during upload, restores after.
  * @private
  */
 async function _handleAudioFileSelected(e) {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const msgEl = document.getElementById('server-upload-status-msg');
-    const setMsg = (msg) => { if (msgEl) msgEl.textContent = msg; };
+    const spotSelect = document.getElementById('audio-spot-select');
+    const spotName   = spotSelect ? spotSelect.value : '';
+    if (!spotName) {
+        showToast('Select a spot first.', 'failed');
+        return;
+    }
+
+    const controls = document.getElementById('audio-upload-controls');
+    const progress = document.getElementById('audio-upload-progress');
+    const progressBar  = document.getElementById('audio-progress-bar');
+    const progressLbl  = document.getElementById('audio-progress-label');
+    const progressPct  = document.getElementById('audio-progress-pct');
+
+    // Switch to progress view
+    if (controls) controls.style.display = 'none';
+    if (progress) progress.style.display = 'block';
 
     try {
         const project = getActiveProject();
@@ -450,28 +532,52 @@ async function _handleAudioFileSelected(e) {
         for (const file of files) {
             fd.append('files', file, file.name);
         }
+        // Send spot mapping
+        const spotMap = {};
+        for (const file of files) { spotMap[file.name] = spotName; }
+        fd.append('audio_spots', JSON.stringify(spotMap));
 
-        setMsg(`Uploading ${files.length} audio file(s)…`);
+        if (progressLbl) progressLbl.textContent = `Uploading ${files.length} file(s) for ${spotName}…`;
 
-        const resp = await fetch(
-            `${base}/api/v1/projects/${encodeURIComponent(projFolder)}/upload/audio`,
-            {
-                method: 'POST',
-                body: fd,
-                headers: { 'ngrok-skip-browser-warning': 'true' },
-            },
-        );
+        // Use XMLHttpRequest for progress tracking
+        await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${base}/api/v1/projects/${encodeURIComponent(projFolder)}/upload/audio`);
+            xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
 
-        if (!resp.ok) {
-            const body = await resp.json().catch(() => ({}));
-            throw new Error(body.detail || `${resp.status} ${resp.statusText}`);
-        }
+            xhr.upload.onprogress = (evt) => {
+                if (evt.lengthComputable) {
+                    const pct = Math.round((evt.loaded / evt.total) * 100);
+                    if (progressBar) progressBar.style.width = `${pct}%`;
+                    if (progressPct) progressPct.textContent = `${pct}%`;
+                }
+            };
 
-        showToast(`${files.length} audio file(s) uploaded.`, 'success');
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve();
+                } else {
+                    let msg = `${xhr.status} ${xhr.statusText}`;
+                    try { const b = JSON.parse(xhr.responseText); if (b.detail) msg = b.detail; } catch {}
+                    reject(new Error(msg));
+                }
+            };
+            xhr.onerror = () => reject(new Error('Network error'));
+            xhr.send(fd);
+        });
+
+        showToast(`${files.length} audio file(s) uploaded for ${spotName}.`, 'success');
         await _refreshServerUploadStatus();
     } catch (err) {
-        setMsg(`Audio upload failed: ${err.message}`);
         showToast(`Audio upload failed: ${err.message}`, 'failed');
+    } finally {
+        // Restore controls
+        if (progress) progress.style.display = 'none';
+        if (progressBar) progressBar.style.width = '0%';
+        if (controls) controls.style.display = 'flex';
+        // Reset file input
+        const fileInput = document.getElementById('upload-audio-input');
+        if (fileInput) fileInput.value = '';
     }
 }
 
