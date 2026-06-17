@@ -242,8 +242,10 @@
             </div>
 
             <!-- ── Server Upload Panel (visible only in server mode) ────────── -->
-            <div id="server-upload-panel" style="display:none; margin-bottom:18px;">
-                <label class="div-label" style="margin-bottom:8px;">0. Project Files on Server</label>
+            <details id="server-upload-panel" style="display:none; margin-bottom:12px;" open>
+                <summary class="div-label" style="margin-bottom:8px; cursor:pointer; user-select:none;">
+                    0. Project Files on Server <span style="font-weight:normal; font-size:0.8rem; color:var(--text-muted);">(click to collapse)</span>
+                </summary>
                 <div id="server-upload-status-msg" style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">
                     Checking server…
                 </div>
@@ -314,7 +316,7 @@
                                 style="display:none; background:#ff9800; color:#fff;">Re-upload</button>
                     </div>
                 </div>
-            </div>
+            </details>
 
             <div id="watcher-offline-help"
                 style="display:none; background:#fff3cd; color:#856404; padding:15px; border-radius:8px; border:1px solid #ffeeba; margin-bottom:15px; font-size:0.9rem;">

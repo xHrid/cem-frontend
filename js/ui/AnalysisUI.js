@@ -372,6 +372,29 @@ async function _localFileExists(path) {
 }
 
 /**
+ * Build a clickable link that opens a locally-stored file in a new tab.
+ * @param {string} storagePath  Relative path in StorageAdapter
+ * @param {string} label        Visible link text
+ * @returns {HTMLAnchorElement}
+ */
+function _makeLocalFileLink(storagePath, label) {
+    const a = document.createElement('a');
+    a.textContent = label;
+    a.href = '#';
+    a.style.cssText = 'color:#0b5394; text-decoration:underline; cursor:pointer;';
+    a.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const url = await StorageAdapter.getFileUrl(storagePath);
+        if (url) {
+            window.open(url, '_blank');
+        } else {
+            showToast('Could not open file.', 'failed');
+        }
+    });
+    return a;
+}
+
+/**
  * Update all 3 file slot UI elements based on server + local status.
  * @param {object} status  Response from checkProjectFiles()
  * @private
@@ -382,9 +405,11 @@ async function _renderUploadSlots(status) {
 
     // ── Audio ──
     const audioInfo = document.getElementById('slot-audio-info');
+    const totalAudio = status.total_audio || 0;
+    const spotNames = status.spots ? Object.keys(status.spots) : [];
     if (audioInfo) {
-        if (status.audio_count > 0) {
-            audioInfo.textContent = `${status.audio_count} file(s) on server`;
+        if (totalAudio > 0) {
+            audioInfo.textContent = `${totalAudio} file(s) on server (${spotNames.length} spot${spotNames.length !== 1 ? 's' : ''})`;
             audioInfo.style.color = '#28a745';
         } else {
             audioInfo.textContent = 'No audio on server yet';
@@ -407,17 +432,26 @@ async function _renderUploadSlots(status) {
         const hasServerLocal = await _localFileExists(serverAggPath);
         const hasLocalAgg    = hasServerLocal || await _localFileExists(localAggPath);
 
+        const aggFilePath = hasServerLocal ? serverAggPath : localAggPath;
+
         if (status.has_aggregate) {
             aggInfo.textContent = '✓ On server';
             aggInfo.style.color = '#28a745';
             if (aggUpload)   aggUpload.style.display = 'none';
             if (aggOverride) aggOverride.style.display = 'inline-block';
-            if (aggLocal)    aggLocal.textContent = hasLocalAgg ? 'Local copy also available' : '';
+            if (aggLocal) {
+                aggLocal.innerHTML = '';
+                if (hasLocalAgg) {
+                    aggLocal.appendChild(_makeLocalFileLink(aggFilePath, '📁 View local copy'));
+                }
+            }
         } else if (hasLocalAgg) {
             aggInfo.textContent = 'Not on server';
             aggInfo.style.color = '#dc3545';
-            if (aggLocal)    aggLocal.textContent = '📁 Found locally — click to upload';
-            aggLocal.style.color = '#0b5394';
+            if (aggLocal) {
+                aggLocal.innerHTML = '';
+                aggLocal.appendChild(_makeLocalFileLink(aggFilePath, '📁 Found locally — view file'));
+            }
             if (aggUpload)  { aggUpload.style.display = 'inline-block'; aggUpload.textContent = 'Upload to Server'; }
             if (aggOverride) aggOverride.style.display = 'none';
         } else {
@@ -442,17 +476,26 @@ async function _renderUploadSlots(status) {
         const hasServerProc = await _localFileExists(serverProcPath);
         const hasLocalProc  = hasServerProc || await _localFileExists(localProcPath);
 
+        const procFilePath = hasServerProc ? serverProcPath : localProcPath;
+
         if (status.has_processed) {
             procInfo.textContent = '✓ On server';
             procInfo.style.color = '#28a745';
             if (procUpload)   procUpload.style.display = 'none';
             if (procOverride) procOverride.style.display = 'inline-block';
-            if (procLocal)    procLocal.textContent = hasLocalProc ? 'Local copy also available' : '';
+            if (procLocal) {
+                procLocal.innerHTML = '';
+                if (hasLocalProc) {
+                    procLocal.appendChild(_makeLocalFileLink(procFilePath, '📁 View local copy'));
+                }
+            }
         } else if (hasLocalProc) {
             procInfo.textContent = 'Not on server';
             procInfo.style.color = '#dc3545';
-            if (procLocal)    procLocal.textContent = '📁 Found locally — click to upload';
-            procLocal.style.color = '#0b5394';
+            if (procLocal) {
+                procLocal.innerHTML = '';
+                procLocal.appendChild(_makeLocalFileLink(procFilePath, '📁 Found locally — view file'));
+            }
             if (procUpload)  { procUpload.style.display = 'inline-block'; procUpload.textContent = 'Upload to Server'; }
             if (procOverride) procOverride.style.display = 'none';
         } else {
@@ -462,6 +505,12 @@ async function _renderUploadSlots(status) {
             if (procUpload)   procUpload.style.display = 'none';
             if (procOverride) procOverride.style.display = 'none';
         }
+    }
+
+    // Auto-collapse panel when all files confirmed on server
+    const panel = document.getElementById('server-upload-panel');
+    if (panel && totalAudio > 0 && status.has_aggregate && status.has_processed) {
+        panel.removeAttribute('open');
     }
 }
 
@@ -529,20 +578,18 @@ async function _handleAudioFileSelected(e) {
         const base = (Config.server?.baseUrl || '').replace(/\/+$/, '');
 
         const fd = new FormData();
+        fd.append('project', projFolder);
+        fd.append('spot', spotName);
         for (const file of files) {
             fd.append('files', file, file.name);
         }
-        // Send spot mapping
-        const spotMap = {};
-        for (const file of files) { spotMap[file.name] = spotName; }
-        fd.append('audio_spots', JSON.stringify(spotMap));
 
         if (progressLbl) progressLbl.textContent = `Uploading ${files.length} file(s) for ${spotName}…`;
 
         // Use XMLHttpRequest for progress tracking
         await new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', `${base}/api/v1/projects/${encodeURIComponent(projFolder)}/upload/audio`);
+            xhr.open('POST', `${base}/api/v1/projects/upload/audio`);
             xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
 
             xhr.upload.onprogress = (evt) => {
@@ -1195,18 +1242,12 @@ async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParam
 
     if (els.runBtn) { els.runBtn.textContent = 'Running…'; els.runBtn.disabled = true; }
 
-    // Use project-level files if they exist on server (uploaded via Upload step)
-    const useProjectFiles = _serverFileStatus && (
-        _serverFileStatus.audio_count > 0 || _serverFileStatus.has_aggregate
-    );
-
     try {
         const res = await runJobOnServer({
             jobName,
             currentScript: _currentScript,
             spotIds, startDate, endDate, dynamicParams,
             spots, externalFiles,
-            useProjectFiles,
             onProgress: setStatus,
         });
 

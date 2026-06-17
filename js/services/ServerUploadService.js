@@ -1,28 +1,18 @@
 /**
  * ServerUploadService.js — Project-level file upload to the lab server
  *
- * Decouples file upload from job execution. Files are uploaded ONCE per
- * project and reused across multiple analysis runs. The server creates a
- * project folder (keyed by project folder name) that mirrors the local
- * file structure.
+ * Files are uploaded ONCE per project and reused across analysis runs.
+ * Audio is organized by spot on the server: project/{SPOT}/audio/*.wav
  *
- * File categories:
- *   audio      — WAV/MP3/etc. recordings. Shown as a count, not a full list.
- *   aggregate  — aggregate.csv (BirdNET results).
- *   processed  — processed.csv (already-processed file list).
- *
- * API contract (to be implemented on backend):
- *   GET  /api/v1/projects/{name}/status   → { audio_count, has_aggregate, has_processed, audio_files[] }
- *   POST /api/v1/projects/{name}/upload/audio      → FormData(files[])
- *   POST /api/v1/projects/{name}/upload/aggregate   → FormData(file)
- *   POST /api/v1/projects/{name}/upload/processed   → FormData(file)
- *
- * The server deduplicates audio by filename — uploading the same file
- * again is a no-op (server keeps existing copy).
+ * API contract (static paths, project + spot in body):
+ *   GET  /api/v1/projects/status?project=NAME       → { spots, total_audio, has_aggregate, has_processed }
+ *   POST /api/v1/projects/upload/audio              → FormData(project, spot, files[])
+ *   POST /api/v1/projects/upload/aggregate           → FormData(project, file)
+ *   POST /api/v1/projects/upload/processed           → FormData(project, file)
  *
  * Public exports:
  *   checkProjectFiles   — GET status of uploaded files for a project
- *   uploadAudioFiles    — upload audio files (dedup by name)
+ *   uploadAudioFiles    — upload audio files for a specific spot
  *   uploadAggregate     — upload/replace aggregate.csv
  *   uploadProcessed     — upload/replace processed.csv
  */
@@ -70,11 +60,6 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
 
 const _json = (url, opts, t) => _fetch(url, opts, t).then(r => r.json());
 
-/**
- * Get the active project's folder name.
- * @returns {string}
- * @throws if no active project
- */
 function _projectFolder() {
     const project = MasterData.getActiveProject();
     if (!project) throw new Error('No active project.');
@@ -89,8 +74,8 @@ function _projectFolder() {
  * Check what files already exist on the server for the active project.
  *
  * @returns {Promise<{
- *   audio_count: number,
- *   audio_files: string[],
+ *   spots: Object<string, {audio_count: number, audio_files: string[]}>,
+ *   total_audio: number,
  *   has_aggregate: boolean,
  *   has_processed: boolean,
  *   aggregate_modified?: string,
@@ -101,16 +86,15 @@ export async function checkProjectFiles() {
     const name = _projectFolder();
     try {
         return await _json(
-            _url(`/api/v1/projects/${encodeURIComponent(name)}/status`),
+            _url(`/api/v1/projects/status?project=${encodeURIComponent(name)}`),
             {},
             15000,
         );
     } catch (e) {
-        // 404 = project folder doesn't exist yet — that's fine
         if (e.message.includes('404')) {
             return {
-                audio_count: 0,
-                audio_files: [],
+                spots: {},
+                total_audio: 0,
                 has_aggregate: false,
                 has_processed: false,
             };
@@ -120,21 +104,23 @@ export async function checkProjectFiles() {
 }
 
 /**
- * Upload audio files to the project folder on the server.
- * Server deduplicates by filename — re-uploading is safe (no-op for existing).
+ * Upload audio files to a specific spot in the project on the server.
+ * Server deduplicates by filename — re-uploading is safe.
  *
- * @param {Array<{path: string, name: string, spot?: string}>} audioFiles
+ * @param {string} spotName  Spot name (e.g. "SPOT1")
+ * @param {Array<{path: string, name: string}>} audioFiles
  * @param {(msg: string) => void} [onProgress]
  * @returns {Promise<{uploaded: number, skipped: number}>}
  */
-export async function uploadAudioFiles(audioFiles, onProgress = () => {}) {
+export async function uploadAudioFiles(spotName, audioFiles, onProgress = () => {}) {
     const name = _projectFolder();
 
     if (!audioFiles.length) return { uploaded: 0, skipped: 0 };
 
     // Get existing files for dedup
     const status = await checkProjectFiles();
-    const existingSet = new Set(status.audio_files || []);
+    const spotInfo = status.spots?.[spotName] || {};
+    const existingSet = new Set(spotInfo.audio_files || []);
 
     const toUpload = audioFiles.filter(f => !existingSet.has(f.name));
     const skipped = audioFiles.length - toUpload.length;
@@ -147,7 +133,7 @@ export async function uploadAudioFiles(audioFiles, onProgress = () => {}) {
         return { uploaded: 0, skipped };
     }
 
-    // Upload in batches to avoid huge single requests
+    // Upload in batches
     const BATCH_SIZE = 50;
     let uploaded = 0;
 
@@ -156,6 +142,8 @@ export async function uploadAudioFiles(audioFiles, onProgress = () => {}) {
         onProgress(`Uploading audio ${i + 1}–${Math.min(i + BATCH_SIZE, toUpload.length)} of ${toUpload.length}…`);
 
         const fd = new FormData();
+        fd.append('project', name);
+        fd.append('spot', spotName);
         for (const a of batch) {
             const blob = await StorageAdapter.getFileBlob(a.path);
             if (!blob) {
@@ -165,15 +153,8 @@ export async function uploadAudioFiles(audioFiles, onProgress = () => {}) {
             fd.append('files', blob, a.name);
         }
 
-        // Include spot mapping metadata
-        const spotMap = {};
-        batch.forEach(a => { if (a.spot) spotMap[a.name] = a.spot; });
-        if (Object.keys(spotMap).length) {
-            fd.append('audio_spots', JSON.stringify(spotMap));
-        }
-
         await _fetch(
-            _url(`/api/v1/projects/${encodeURIComponent(name)}/upload/audio`),
+            _url('/api/v1/projects/upload/audio'),
             { method: 'POST', body: fd },
             20 * 60 * 1000,
         );
@@ -186,15 +167,12 @@ export async function uploadAudioFiles(audioFiles, onProgress = () => {}) {
 /**
  * Upload (or replace) the aggregate CSV for the project.
  *
- * Prefers the server-specific aggregate; falls back to local.
- *
- * @param {boolean} [force=false]  If true, overrides even if server has one.
+ * @param {boolean} [force=false]
  * @param {(msg: string) => void} [onProgress]
  * @returns {Promise<{uploaded: boolean}>}
  */
 export async function uploadAggregate(force = false, onProgress = () => {}) {
-    const projectFolder = _projectFolder();
-    const name = projectFolder;
+    const name = _projectFolder();
 
     if (!force) {
         const status = await checkProjectFiles();
@@ -204,9 +182,8 @@ export async function uploadAggregate(force = false, onProgress = () => {}) {
         }
     }
 
-    // Prefer server-specific aggregate, fall back to local
-    const serverAggPath = `${projectFolder}/system/database/birdnet_results_server.csv`;
-    const localAggPath = `${projectFolder}/system/database/birdnet_results.csv`;
+    const serverAggPath = `${name}/system/database/birdnet_results_server.csv`;
+    const localAggPath = `${name}/system/database/birdnet_results.csv`;
     let blob = await StorageAdapter.getFileBlob(serverAggPath);
     if (!blob) blob = await StorageAdapter.getFileBlob(localAggPath);
 
@@ -216,10 +193,11 @@ export async function uploadAggregate(force = false, onProgress = () => {}) {
 
     onProgress('Uploading aggregate.csv…');
     const fd = new FormData();
+    fd.append('project', name);
     fd.append('file', blob, 'aggregate.csv');
 
     await _fetch(
-        _url(`/api/v1/projects/${encodeURIComponent(name)}/upload/aggregate`),
+        _url('/api/v1/projects/upload/aggregate'),
         { method: 'POST', body: fd },
         5 * 60 * 1000,
     );
@@ -236,8 +214,7 @@ export async function uploadAggregate(force = false, onProgress = () => {}) {
  * @returns {Promise<{uploaded: boolean}>}
  */
 export async function uploadProcessed(scriptFile, force = false, onProgress = () => {}) {
-    const projectFolder = _projectFolder();
-    const name = projectFolder;
+    const name = _projectFolder();
 
     if (!force) {
         const status = await checkProjectFiles();
@@ -247,23 +224,23 @@ export async function uploadProcessed(scriptFile, force = false, onProgress = ()
         }
     }
 
-    const serverPath = `${projectFolder}/system/database/processed_${scriptFile}_server.txt`;
-    const localPath = `${projectFolder}/system/database/processed_${scriptFile}.txt`;
+    const serverPath = `${name}/system/database/processed_${scriptFile}_server.txt`;
+    const localPath = `${name}/system/database/processed_${scriptFile}.txt`;
     let blob = await StorageAdapter.getFileBlob(serverPath);
     if (!blob) blob = await StorageAdapter.getFileBlob(localPath);
 
     if (!blob) {
-        // No processed list yet — that's OK for first run
         onProgress('No processed list found locally (first run).');
         return { uploaded: false };
     }
 
     onProgress('Uploading processed list…');
     const fd = new FormData();
+    fd.append('project', name);
     fd.append('file', blob, 'processed_files.txt');
 
     await _fetch(
-        _url(`/api/v1/projects/${encodeURIComponent(name)}/upload/processed`),
+        _url('/api/v1/projects/upload/processed'),
         { method: 'POST', body: fd },
         60 * 1000,
     );
@@ -272,7 +249,7 @@ export async function uploadProcessed(scriptFile, force = false, onProgress = ()
 }
 
 /**
- * Convenience: get the active project folder name (for external callers).
+ * Convenience: get the active project folder name.
  * @returns {string}
  */
 export function getActiveProjectFolder() {

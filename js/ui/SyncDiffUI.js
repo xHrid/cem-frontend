@@ -30,6 +30,7 @@ const COLLECTIONS = [
     { key: 'spots',          label: 'Spots' },
     { key: 'routes',         label: 'Routes' },
     { key: 'sites',          label: 'Sites' },
+    { key: 'jobs',           label: 'Jobs' },
     { key: 'external_files', label: 'Files' },
 ];
 
@@ -54,12 +55,13 @@ export function initSyncDiffUI() {
 // Item helpers
 // ---------------------------------------------------------------------------
 
-const _itemId = (it) => it?.spotId || it?.id || null;
+const _itemId = (it) => it?.spotId || it?.job_id || it?.id || null;
 
 function _itemLabel(it, collectionKey) {
     if (collectionKey === 'spots')          return it.name || `Spot ${(_itemId(it) || '').slice(0, 6)}`;
     if (collectionKey === 'routes')         return it.name || `Route ${(_itemId(it) || '').slice(0, 6)}`;
     if (collectionKey === 'sites')          return it.name || `Site ${(_itemId(it) || '').slice(0, 6)}`;
+    if (collectionKey === 'jobs')           return it.name || it.job_name || `Job ${(_itemId(it) || '').slice(0, 8)}`;
     if (collectionKey === 'external_files') return it.name || `File ${(_itemId(it) || '').slice(0, 6)}`;
     return _itemId(it) || 'item';
 }
