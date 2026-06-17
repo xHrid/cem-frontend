@@ -34,6 +34,7 @@
  *   showToast          — ./Toast.js
  */
 
+import Config                       from '../core/Config.js';
 import EventBus, { EVENTS }        from '../core/EventBus.js';
 import {
     getWatcherOnlineStatus,
@@ -48,7 +49,14 @@ import {
     getServerSteps,
     runJobOnServer,
 }                                   from '../services/ServerService.js';
-import { getSpots, getExternalFiles } from '../data/MasterData.js';
+import {
+    checkProjectFiles,
+    uploadAudioFiles,
+    uploadAggregate,
+    uploadProcessed,
+}                                   from '../services/ServerUploadService.js';
+import { getSpots, getExternalFiles, getActiveProject } from '../data/MasterData.js';
+import { getProjectFolderName } from '../data/projectUtils.js';
 import { getWatcherStatus } from '../data/Repository.js';
 import { showToast }                from './Toast.js';
 import { openModal, closeModal }    from './ModalManager.js';
@@ -191,6 +199,25 @@ export function initAnalysis() {
             _loadScriptParams(e.target.value);
         }
     });
+
+    // ── Server Upload Panel — delegated listeners ──────────────────────────
+    document.addEventListener('click', (e) => {
+        const uploadBtn = e.target && e.target.closest && e.target.closest('.server-upload-btn');
+        if (uploadBtn) {
+            _handleServerUpload(uploadBtn.dataset.category, false);
+            return;
+        }
+        const overrideBtn = e.target && e.target.closest && e.target.closest('.server-override-btn');
+        if (overrideBtn) {
+            _handleServerUpload(overrideBtn.dataset.category, true);
+        }
+    });
+
+    // Audio file input change (from file picker)
+    const audioInput = document.getElementById('upload-audio-input');
+    if (audioInput) {
+        audioInput.addEventListener('change', _handleAudioFileSelected);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +258,7 @@ function _setMode(mode) {
     const next = mode === 'server';
     if (next === _serverMode) return;
     _serverMode = next;
+    if (!next) _serverFileStatus = null;   // clear cached status when leaving server mode
     _applyModeStyles();
     // Reset the script dropdown so it reloads from the right source.
     if (els.scriptSelect) els.scriptSelect.innerHTML = '<option value="">Loading scripts...</option>';
@@ -256,10 +284,195 @@ function _applyModeStyles() {
 
     const serverHelp  = document.getElementById('server-help');
     const watcherHelp = document.getElementById('watcher-offline-help');
+    const uploadPanel = document.getElementById('server-upload-panel');
     if (serverHelp)  serverHelp.style.display  = _serverMode ? 'block' : 'none';
+    if (uploadPanel) uploadPanel.style.display  = _serverMode ? 'block' : 'none';
     // The watcher-offline help is only ever relevant in watcher mode; its own
     // visibility within watcher mode is still driven by _checkStatus.
     if (watcherHelp && _serverMode) watcherHelp.style.display = 'none';
+
+    // Auto-check server file status when entering server mode
+    if (_serverMode && serverConfigured()) {
+        _refreshServerUploadStatus();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server Upload Panel — status check + upload handlers
+// ---------------------------------------------------------------------------
+
+/** Cached server file status to avoid redundant fetches. */
+let _serverFileStatus = null;
+
+/**
+ * Query the server for existing project files and update the 3 slots.
+ * @private
+ */
+async function _refreshServerUploadStatus() {
+    const msgEl = document.getElementById('server-upload-status-msg');
+    if (msgEl) msgEl.textContent = 'Checking server…';
+
+    try {
+        _serverFileStatus = await checkProjectFiles();
+        _renderUploadSlots(_serverFileStatus);
+        if (msgEl) msgEl.textContent = '';
+    } catch (e) {
+        if (msgEl) msgEl.textContent = `Could not reach server: ${e.message}`;
+        _serverFileStatus = null;
+    }
+}
+
+/**
+ * Update the 3 file slot UI elements based on server status.
+ * @param {object} status  Response from checkProjectFiles()
+ * @private
+ */
+function _renderUploadSlots(status) {
+    // ── Audio ──
+    const audioInfo    = document.getElementById('slot-audio-info');
+    const audioUpload  = document.querySelector('#slot-audio .server-upload-btn');
+    const audioOverride = document.querySelector('#slot-audio .server-override-btn');
+    if (audioInfo) {
+        if (status.audio_count > 0) {
+            audioInfo.textContent = `${status.audio_count} file(s) on server`;
+            audioInfo.style.color = '#28a745';
+            if (audioUpload)  audioUpload.textContent = 'Add More';
+            if (audioOverride) audioOverride.style.display = 'inline-block';
+        } else {
+            audioInfo.textContent = 'Not uploaded';
+            audioInfo.style.color = 'var(--text-muted)';
+            if (audioUpload)  audioUpload.textContent = 'Upload';
+            if (audioOverride) audioOverride.style.display = 'none';
+        }
+    }
+
+    // ── Aggregate ──
+    const aggInfo     = document.getElementById('slot-aggregate-info');
+    const aggUpload   = document.querySelector('#slot-aggregate .server-upload-btn');
+    const aggOverride = document.querySelector('#slot-aggregate .server-override-btn');
+    if (aggInfo) {
+        if (status.has_aggregate) {
+            aggInfo.textContent = 'Found on server';
+            aggInfo.style.color = '#28a745';
+            if (aggUpload)  aggUpload.style.display = 'none';
+            if (aggOverride) aggOverride.style.display = 'inline-block';
+        } else {
+            aggInfo.textContent = 'Not uploaded';
+            aggInfo.style.color = 'var(--text-muted)';
+            if (aggUpload)  aggUpload.style.display = 'inline-block';
+            if (aggOverride) aggOverride.style.display = 'none';
+        }
+    }
+
+    // ── Processed ──
+    const procInfo     = document.getElementById('slot-processed-info');
+    const procUpload   = document.querySelector('#slot-processed .server-upload-btn');
+    const procOverride = document.querySelector('#slot-processed .server-override-btn');
+    if (procInfo) {
+        if (status.has_processed) {
+            procInfo.textContent = 'Found on server';
+            procInfo.style.color = '#28a745';
+            if (procUpload)  procUpload.style.display = 'none';
+            if (procOverride) procOverride.style.display = 'inline-block';
+        } else {
+            procInfo.textContent = 'Not uploaded';
+            procInfo.style.color = 'var(--text-muted)';
+            if (procUpload)  procUpload.style.display = 'inline-block';
+            if (procOverride) procOverride.style.display = 'none';
+        }
+    }
+}
+
+/**
+ * Handle click on upload/override buttons in the server upload panel.
+ * @param {string} category  'audio' | 'aggregate' | 'processed'
+ * @param {boolean} force    true = override existing
+ * @private
+ */
+async function _handleServerUpload(category, force = false) {
+    const msgEl = document.getElementById('server-upload-status-msg');
+    const setMsg = (msg) => { if (msgEl) msgEl.textContent = msg; };
+
+    try {
+        if (category === 'audio') {
+            // For audio: collect from local storage using selected spots/dates,
+            // or let user pick files via the hidden file input.
+            const fileInput = document.getElementById('upload-audio-input');
+            if (!fileInput) return;
+
+            // Trigger file picker
+            fileInput.value = '';
+            fileInput.click();
+            // The actual upload happens in the 'change' listener below.
+            return;
+        }
+
+        if (category === 'aggregate') {
+            setMsg('Uploading aggregate…');
+            await uploadAggregate(force, setMsg);
+            showToast('Aggregate uploaded.', 'success');
+        }
+
+        if (category === 'processed') {
+            // Use the currently selected script's script_file, or default
+            const scriptFile = _currentScript?.script_file || 'birdnet_predictions.py';
+            setMsg('Uploading processed list…');
+            await uploadProcessed(scriptFile, force, setMsg);
+            showToast('Processed list uploaded.', 'success');
+        }
+
+        await _refreshServerUploadStatus();
+    } catch (e) {
+        setMsg(`Upload failed: ${e.message}`);
+        showToast(`Upload failed: ${e.message}`, 'failed');
+    }
+}
+
+/**
+ * Handle audio file input change — reads selected files and uploads them
+ * directly to the server via FormData.
+ * @private
+ */
+async function _handleAudioFileSelected(e) {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const msgEl = document.getElementById('server-upload-status-msg');
+    const setMsg = (msg) => { if (msgEl) msgEl.textContent = msg; };
+
+    try {
+        const project = getActiveProject();
+        if (!project) throw new Error('No active project.');
+        const projFolder = getProjectFolderName(project);
+        const base = (Config.server?.baseUrl || '').replace(/\/+$/, '');
+
+        const fd = new FormData();
+        for (const file of files) {
+            fd.append('files', file, file.name);
+        }
+
+        setMsg(`Uploading ${files.length} audio file(s)…`);
+
+        const resp = await fetch(
+            `${base}/api/v1/projects/${encodeURIComponent(projFolder)}/upload/audio`,
+            {
+                method: 'POST',
+                body: fd,
+                headers: { 'ngrok-skip-browser-warning': 'true' },
+            },
+        );
+
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            throw new Error(body.detail || `${resp.status} ${resp.statusText}`);
+        }
+
+        showToast(`${files.length} audio file(s) uploaded.`, 'success');
+        await _refreshServerUploadStatus();
+    } catch (err) {
+        setMsg(`Audio upload failed: ${err.message}`);
+        showToast(`Audio upload failed: ${err.message}`, 'failed');
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -876,12 +1089,18 @@ async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParam
 
     if (els.runBtn) { els.runBtn.textContent = 'Running…'; els.runBtn.disabled = true; }
 
+    // Use project-level files if they exist on server (uploaded via Upload step)
+    const useProjectFiles = _serverFileStatus && (
+        _serverFileStatus.audio_count > 0 || _serverFileStatus.has_aggregate
+    );
+
     try {
         const res = await runJobOnServer({
             jobName,
             currentScript: _currentScript,
             spotIds, startDate, endDate, dynamicParams,
             spots, externalFiles,
+            useProjectFiles,
             onProgress: setStatus,
         });
 

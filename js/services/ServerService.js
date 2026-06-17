@@ -311,6 +311,9 @@ async function _appendProcessedCache(projectFolder, scriptFile, names, server = 
  * @param {object}   opts.dynamicParams    e.g. { snr_db: '18' }
  * @param {object[]} opts.spots
  * @param {object[]} opts.externalFiles
+ * @param {boolean}  [opts.useProjectFiles=false]  When true, skip per-job uploads
+ *                   and tell the server to use files from the project folder
+ *                   (uploaded via the separate Upload step).
  * @param {(msg:string)=>void} [opts.onProgress]   UI status callback.
  * @returns {Promise<{ jobId: string, status: 'completed', files: number }>}
  * @throws  {Error} with a user-facing message on any failure (the local job
@@ -319,7 +322,8 @@ async function _appendProcessedCache(projectFolder, scriptFile, names, server = 
 export async function runJobOnServer(opts) {
     const {
         jobName, currentScript, spotIds, startDate, endDate,
-        dynamicParams, spots, externalFiles, onProgress = () => {},
+        dynamicParams, spots, externalFiles,
+        useProjectFiles = false, onProgress = () => {},
     } = opts;
 
     if (!isConfigured()) {
@@ -360,13 +364,31 @@ export async function runJobOnServer(opts) {
 
     try {
         // ── 1. Upload audio (birdnet) or aggregate (analysis) ────────────
-        //    POST /api/v1/datasets/audio   → mints a server job_id
-        //    POST /api/v1/jobs/{id}/datasets/{kind} → upload extras
         let serverJobId;
         const processedNames = [];
+        let _uploadedAudio = [];
 
-        let _uploadedAudio = [];   // captured for audio_spots mapping later
-        if (isBirdnet) {
+        if (useProjectFiles) {
+            // ── PROJECT-FILES MODE: files already uploaded via Upload step ──
+            // Create a job that references the project folder on the server.
+            //    POST /api/v1/projects/{name}/jobs  → mints a job_id using
+            //    the pre-uploaded project files.
+            onProgress('Creating job from project files…');
+            const createResp = await _json(
+                _url(`/api/v1/projects/${encodeURIComponent(projectFolder)}/jobs`),
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ step: stepId }),
+                },
+                30000,
+            );
+            serverJobId = createResp.job_id;
+            record.server.job_id = serverJobId;
+            await _writeJobRecord(projectFolder, localJobId, record, 'processing');
+
+        } else if (isBirdnet) {
+            // ── LEGACY PER-JOB UPLOAD: BirdNET ─────────────────────────────
             const { audio, references, skippedProcessed } = await _collectAudioInputs(
                 projectFolder, spotIds, startDate, endDate, currentScript, spots, externalFiles);
             _uploadedAudio = audio;
@@ -392,7 +414,6 @@ export async function runJobOnServer(opts) {
                             : 'No audio files found for the selected spots and dates.');
             }
 
-            // Upload audio → creates the server job
             onProgress(`Uploading ${audio.length} audio file(s)…`);
             const fd = new FormData();
             for (const a of audio) {
@@ -409,7 +430,6 @@ export async function runJobOnServer(opts) {
             record.server.job_id = serverJobId;
             await _writeJobRecord(projectFolder, localJobId, record, 'processing');
 
-            // Also upload the server aggregate so BirdNET can APPEND to it
             const serverAggPath = `${projectFolder}/system/database/birdnet_results_server.csv`;
             const serverAggBlob = await StorageAdapter.getFileBlob(serverAggPath);
             if (serverAggBlob) {
@@ -422,7 +442,6 @@ export async function runJobOnServer(opts) {
                     5 * 60 * 1000);
             }
 
-            // Upload server processed list so script can double-check dedup
             const serverProcPath = `${projectFolder}/system/database/processed_${currentScript.script_file}_server.txt`;
             const serverProcBlob = await StorageAdapter.getFileBlob(serverProcPath);
             if (serverProcBlob) {
@@ -434,8 +453,7 @@ export async function runJobOnServer(opts) {
                     60 * 1000);
             }
         } else {
-            // Analysis step: upload the server aggregate (prefer server-specific,
-            // fall back to local).
+            // ── LEGACY PER-JOB UPLOAD: Analysis step ───────────────────────
             onProgress('Uploading BirdNET aggregate…');
             const serverAggPath = `${projectFolder}/system/database/birdnet_results_server.csv`;
             const localAggPath  = `${projectFolder}/system/database/birdnet_results.csv`;
@@ -446,16 +464,8 @@ export async function runJobOnServer(opts) {
                     '(locally or on the server) before this analysis.');
             }
 
-            // Upload audio just to mint a job_id (empty audio is fine — the
-            // analysis steps don't need audio, they need the aggregate).
-            // Actually, use the upload_override route to create a job first.
-            // We need a job_id before we can upload the aggregate.
-            // The cleanest path: upload a dummy then override with aggregate.
-            // But the STACD API creates a job on POST /datasets/audio.
-            // For analysis steps we upload the aggregate as the only input.
             const fd = new FormData();
             fd.append('files', aggBlob, 'aggregate.csv');
-            // We need to create a job first. Use a small dummy upload to mint one.
             const dummyFd = new FormData();
             dummyFd.append('files', new Blob([''], { type: 'audio/wav' }), '_placeholder.wav');
             const uploadResp = await _json(
@@ -466,7 +476,6 @@ export async function runJobOnServer(opts) {
             record.server.job_id = serverJobId;
             await _writeJobRecord(projectFolder, localJobId, record, 'processing');
 
-            // Now upload the real aggregate
             await _fetch(
                 _url(`/api/v1/jobs/${serverJobId}/datasets/aggregate`),
                 { method: 'POST', body: fd },

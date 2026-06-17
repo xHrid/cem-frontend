@@ -237,9 +237,65 @@
                 style="display:none; background:#e7f3ff; color:#0b5394; padding:12px; border-radius:8px; border:1px solid #b6dafb; margin-bottom:15px; font-size:0.9rem;">
                 <strong>🖥️ Lab Server mode</strong><br>
                 Compute runs on the lab Docker server — no local watcher needed.
-                Audio is uploaded, the selected step runs there, and results are
-                downloaded back into this project.
+                Upload your project files once, then run any analysis step.
                 <span id="server-help-detail"></span>
+            </div>
+
+            <!-- ── Server Upload Panel (visible only in server mode) ────────── -->
+            <div id="server-upload-panel" style="display:none; margin-bottom:18px;">
+                <label class="div-label" style="margin-bottom:8px;">0. Project Files on Server</label>
+                <div id="server-upload-status-msg" style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">
+                    Checking server…
+                </div>
+
+                <!-- Audio slot -->
+                <div class="server-file-slot" id="slot-audio"
+                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
+                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
+                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
+                    <div>
+                        <strong>Audio Files</strong>
+                        <span id="slot-audio-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <input type="file" id="upload-audio-input" multiple accept=".wav,.mp3,.m4a,.flac" style="display:none;" />
+                        <button type="button" class="small-btn server-upload-btn" data-category="audio">Upload</button>
+                        <button type="button" class="small-btn server-override-btn" data-category="audio"
+                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                    </div>
+                </div>
+
+                <!-- Aggregate slot -->
+                <div class="server-file-slot" id="slot-aggregate"
+                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
+                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
+                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
+                    <div>
+                        <strong>aggregate.csv</strong>
+                        <span id="slot-aggregate-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <button type="button" class="small-btn server-upload-btn" data-category="aggregate">Upload</button>
+                        <button type="button" class="small-btn server-override-btn" data-category="aggregate"
+                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                    </div>
+                </div>
+
+                <!-- Processed slot -->
+                <div class="server-file-slot" id="slot-processed"
+                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
+                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
+                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
+                    <div>
+                        <strong>processed.csv</strong>
+                        <span id="slot-processed-info" style="color:var(--text-muted); margin-left:6px;">—</span>
+                    </div>
+                    <div style="display:flex; gap:6px; align-items:center;">
+                        <button type="button" class="small-btn server-upload-btn" data-category="processed">Upload</button>
+                        <button type="button" class="small-btn server-override-btn" data-category="processed"
+                                style="display:none; background:#ff9800; color:#fff;">Override</button>
+                    </div>
+                </div>
             </div>
 
             <div id="watcher-offline-help"
