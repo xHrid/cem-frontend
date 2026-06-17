@@ -32,41 +32,45 @@
         <button id="menu-toggle" aria-label="Toggle sidebar menu">☰</button>
         <button id="theme-toggle" aria-label="Toggle dark mode">🌙</button>
         <nav id="controls" class="open" aria-label="Control panel">
+            <!-- Storage init — must be completed before anything else -->
+            <div id="auth-section"></div>
+
+            <div id="app-controls" class="app-controls-disabled">
             <div class="control-section"
                 style="margin-bottom: 15px; border-bottom: 1px solid #ccc; padding-bottom: 10px;">
                 <div class="div-label" style="margin-bottom: 5px;">Project</div>
-                <select id="project-select" class="project-dropdown" aria-label="Select project"></select>
+                <select id="project-select" class="project-dropdown" aria-label="Select project" disabled></select>
                 <div style="display: flex; gap: 5px; margin-top: 5px;">
-                    <button id="btn-new-project" class="small-btn">New</button>
-                    <button id="btn-rename-project" class="small-btn">Rename</button>
-                    <button id="btn-share-project" class="small-btn">Share</button>
-                    <button id="btn-import-project" class="small-btn">Import</button>
+                    <button id="btn-new-project" class="small-btn" disabled>New</button>
+                    <button id="btn-rename-project" class="small-btn" disabled>Rename</button>
+                    <button id="btn-share-project" class="small-btn" disabled>Share</button>
+                    <button id="btn-import-project" class="small-btn" disabled>Import</button>
                 </div>
             </div>
-            <div id="auth-section" style="margin-top: 3.5rem;"></div>
 
             <div class="add-site-div">
-                <button class="add_site">Add Site</button>
-                <button id="import-media-btn" class="control-button">Import Media</button>
-                <button id="analysis-btn" class="control-button">Analysis</button>
-                <button id="jobs-btn" class="control-button">Jobs</button>
+                <button class="add_site" disabled>Add Site</button>
+                <button id="import-media-btn" class="control-button" disabled>Import Media</button>
+                <button id="analysis-btn" class="control-button" disabled>Analysis</button>
+                <button id="jobs-btn" class="control-button" disabled>Jobs</button>
             </div>
 
             <div class="control">
                 <div class="div-label">Spots</div>
-                <button id="open-form">Add</button>
+                <button id="open-form" disabled>Add</button>
                 <label class="spot-toggle">
-                    <input type="checkbox" id="display-spots" /> Show
+                    <input type="checkbox" id="display-spots" disabled /> Show
                 </label>
             </div>
             <div class="control">
                 <div class="div-label">Routes</div>
-                <button id="toggle-tracking">Record</button>
+                <button id="toggle-tracking" disabled>Record</button>
                 <label for="show-routes-toggle">
-                    <input type="checkbox" id="show-routes-toggle" /> Show
+                    <input type="checkbox" id="show-routes-toggle" disabled /> Show
                 </label>
             </div>
             <div id="stratification-controls"></div>
+            </div>
         </nav>
         <div id="map"></div>
         <div id="latlon" aria-live="polite"><label>Lat Long</label></div>
@@ -105,13 +109,19 @@
                     <label for="image-upload" class="custom-upload">
                         <span>📷</span>
                     </label>
-                    <input type="file" id="image-upload" name="image" accept="image/*" capture="environment"
+                    <input type="file" id="image-upload" name="image" accept="image/*" multiple
+                        style="display: none;" />
+                    <button type="button" id="camera-capture-btn" class="custom-upload" title="Take photo with camera">
+                        <span>📸</span>
+                    </button>
+                    <input type="file" id="camera-capture" accept="image/*" capture="environment"
                         style="display: none;" />
                     <label id="audio-toggle" class="custom-upload">
                         <span>🎤</span>
                     </label>
                     <audio id="audioPlayback" controls class="audio-player"></audio>
                 </div>
+                <div id="image-preview-grid" class="image-preview-grid"></div>
                 <div class="button-group">
                     <button type="submit" class="popup-btn">Submit</button>
                     <button type="button" id="close-form" class="popup-btn cancel-btn">Cancel</button>

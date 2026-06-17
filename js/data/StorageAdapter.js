@@ -196,9 +196,6 @@ const _blobUrls  = [];
  * @throws  {DOMException} AbortError if the user cancels the native picker.
  */
 export async function initStorage() {
-    // Best-effort: lock storage as persistent (and raise the mobile quota).
-    await _requestPersistentStorage();
-
     if (HAS_NATIVE_FS) {
         try {
             _rootHandle  = await window.showDirectoryPicker();
@@ -211,6 +208,10 @@ export async function initStorage() {
             console.warn('StorageAdapter: Native FS failed, falling back to IDB.', e);
         }
     }
+
+    // Only request persistent storage for the IDB fallback path — not before
+    // the native folder picker (which confused users with a "denied" log).
+    await _requestPersistentStorage();
 
     _memoryMode  = true;
     _initialized = true;

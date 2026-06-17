@@ -93,6 +93,54 @@ let _prefillSpotName = null;
 let _addMoreSpot = null;
 
 /**
+ * Pending image files for the spot form (multi-image support).
+ * Each element: { file: File, id: string }
+ * @type {{ file: File, id: string }[]}
+ */
+let _pendingImages = [];
+
+/**
+ * Render the image preview grid from _pendingImages.
+ */
+function _renderImagePreviews() {
+    const grid = document.getElementById('image-preview-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    _pendingImages.forEach((item) => {
+        const thumb = document.createElement('div');
+        thumb.className = 'image-preview-thumb';
+
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(item.file);
+        img.onload = () => URL.revokeObjectURL(img.src);
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'remove-img-btn';
+        btn.textContent = '✕';
+        btn.addEventListener('click', () => {
+            _pendingImages = _pendingImages.filter(i => i.id !== item.id);
+            _renderImagePreviews();
+        });
+
+        thumb.appendChild(img);
+        thumb.appendChild(btn);
+        grid.appendChild(thumb);
+    });
+}
+
+/**
+ * Add files to _pendingImages and refresh previews.
+ * @param {FileList|File[]} files
+ */
+function _addImageFiles(files) {
+    for (const f of files) {
+        _pendingImages.push({ file: f, id: crypto.randomUUID() });
+    }
+    _renderImagePreviews();
+}
+
+/**
  * Lock or unlock the spot-form name + location inputs.
  *
  * In Add More mode the name field is read-only and the location is pinned to
@@ -267,18 +315,17 @@ async function _handleSpotFormSubmit(e) {
     // Add More mode — name is locked to the original spot.
     const spotName = _addMoreSpot ? _addMoreSpot.name : form.name.value;
 
-    let imageFile = document.getElementById('image-upload').files[0] || null;
-
     const statusEl = document.getElementById('status');
-    if (statusEl) statusEl.textContent = 'Saving to disk...';
 
-    // Downscale large camera photos before storage so a few pictures can't
-    // exhaust the mobile IndexedDB quota ("storage full").
-    if (imageFile) {
-        if (statusEl) statusEl.textContent = 'Optimising photo...';
-        imageFile = await downscaleImage(imageFile);
-        if (statusEl) statusEl.textContent = 'Saving to disk...';
+    // Downscale all pending images before storage
+    const imageBlobs = [];
+    if (_pendingImages.length > 0) {
+        for (let i = 0; i < _pendingImages.length; i++) {
+            if (statusEl) statusEl.textContent = `Optimising photo ${i + 1}/${_pendingImages.length}...`;
+            imageBlobs.push(await downscaleImage(_pendingImages[i].file));
+        }
     }
+    if (statusEl) statusEl.textContent = 'Saving to disk...';
 
     try {
         await saveSpot(
@@ -288,7 +335,7 @@ async function _handleSpotFormSubmit(e) {
                 latitude    : lat,
                 longitude   : lng,
             },
-            imageFile,
+            imageBlobs.length > 0 ? imageBlobs : null,
             _recordedAudioBlob,
             recordDate
         );
@@ -312,7 +359,9 @@ async function _handleSpotFormSubmit(e) {
         closeModal('popup-form');
         if (statusEl) statusEl.textContent = '';
 
-        // Reset audio state
+        // Reset image + audio state
+        _pendingImages = [];
+        _renderImagePreviews();
         _recordedAudioBlob = null;
         _mediaRecorder     = null;
         _audioChunks       = [];
@@ -392,6 +441,7 @@ async function _showSpotDetails(spot) {
                 <button class="edit-spot-entry-btn" data-spot-id="${entry.spotId}" title="Edit this observation">✏️</button>
                 <button class="delete-spot-entry-btn" data-spot-id="${entry.spotId}" title="Delete this observation">🗑</button>
                 <span class="entry-index">Entry ${idx + 1}</span>
+                ${(() => { const ce = entry.created_by || ''; const se = ce.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); return ce ? '<span class="creator-pill" title="' + se + '" tabindex="0">\u{1F464} ' + se + '</span>' : ''; })()}
                 <span class="entry-date"></span>
                 <div class="entry-field"><span class="k">Coordinates</span><span class="entry-coords" style="font-family:var(--font-mono); font-size:0.82rem;"></span></div>
                 <div class="entry-field"><span class="k">Notes</span><span class="entry-desc"></span></div>
@@ -431,6 +481,10 @@ async function _showSpotDetails(spot) {
         div.querySelector('.entry-coords').textContent =
             `${entry.latitude.toFixed(5)}, ${entry.longitude.toFixed(5)}`;
         div.querySelector('.entry-desc').textContent = entry.description || 'No notes';
+
+        // Tap-to-expand creator pill
+        const pill = div.querySelector('.creator-pill');
+        if (pill) pill.addEventListener('click', () => pill.classList.toggle('expanded'));
     });
 
     menu.classList.add('open');
@@ -487,20 +541,27 @@ async function _showSpotDetails(spot) {
         const entry = spotEntries[idx];
 
         const imgContainer = content.querySelector(`.media-container-img-${idx}`);
-        if ((entry.image_local_filename || entry.image_drive_id) && imgContainer) {
-            // Prefer the local file; fall back to the public Drive URL (e.g. an
-            // editor viewing the owner's photo, which isn't on this device).
-            const url = entry.image_local_filename
-                ? await getLocalFileUrl(entry.image_local_filename)
-                : null;
-            if (url) {
-                imgContainer.innerHTML = `<img src="${url}" style="max-width:100%; border-radius:8px;">`;
-            } else if (entry.image_drive_id) {
-                const src = _drivePublicUrl(entry.image_drive_id, 'image');
-                imgContainer.innerHTML = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
-            } else {
-                imgContainer.innerHTML = `<p style="font-size:0.8rem; color:red;">Image file missing from disk</p>`;
+        // Multi-image: prefer `images` array, fall back to single `image_local_filename`
+        const imgPaths = entry.images && entry.images.length > 0
+            ? entry.images
+            : (entry.image_local_filename ? [entry.image_local_filename] : []);
+
+        if ((imgPaths.length > 0 || entry.image_drive_id) && imgContainer) {
+            let imgHtml = '';
+            for (const imgPath of imgPaths) {
+                const url = await getLocalFileUrl(imgPath);
+                if (url) {
+                    imgHtml += `<img src="${url}" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
+                } else {
+                    imgHtml += `<p style="font-size:0.8rem; color:red;">Image file missing from disk</p>`;
+                }
             }
+            // If no local images loaded but a Drive ID exists, show that
+            if (!imgHtml && entry.image_drive_id) {
+                const src = _drivePublicUrl(entry.image_drive_id, 'image');
+                imgHtml = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
+            }
+            imgContainer.innerHTML = imgHtml;
         }
 
         const audioContainer = content.querySelector(`.media-container-audio-${idx}`);
@@ -540,14 +601,24 @@ async function _showSpotDetails(spot) {
  * @param {HTMLElement} div    The .spot-entry card element to take over.
  */
 async function _beginEntryEdit(spot, entry, div) {
-    // Resolve current photo (local first, public Drive fallback) for preview.
-    let currentImgSrc = null;
-    if (entry.image_local_filename) {
-        currentImgSrc = await getLocalFileUrl(entry.image_local_filename);
+    // Resolve all existing images for preview grid.
+    const existingPaths = entry.images && entry.images.length > 0
+        ? [...entry.images]
+        : (entry.image_local_filename ? [entry.image_local_filename] : []);
+
+    const existingImages = []; // { path, src }
+    for (const p of existingPaths) {
+        const url = await getLocalFileUrl(p);
+        if (url) existingImages.push({ path: p, src: url });
     }
-    if (!currentImgSrc && entry.image_drive_id) {
-        currentImgSrc = _drivePublicUrl(entry.image_drive_id, 'image');
+    // Drive-only fallback (single image)
+    if (existingImages.length === 0 && entry.image_drive_id) {
+        existingImages.push({ path: '__drive__', src: _drivePublicUrl(entry.image_drive_id, 'image') });
     }
+
+    // State: tracks deletions + new additions
+    const deletedPaths = new Set();
+    const newFiles = [];   // { file: File, id: string }
 
     div.innerHTML = `
         <span class="entry-index">Editing entry</span>
@@ -556,17 +627,18 @@ async function _beginEntryEdit(spot, entry, div) {
             <textarea class="edit-desc" style="width:100%; min-height:80px; box-sizing:border-box; margin-top:4px;"></textarea>
         </div>
         <div class="entry-field">
-            <span class="k">Photo</span>
-            <div class="edit-img-preview" style="margin-top:6px;">
-                ${currentImgSrc
-                    ? `<img src="${currentImgSrc}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`
-                    : `<span style="font-size:0.82rem; color:var(--text-muted);">No photo yet</span>`}
+            <span class="k">Photos</span>
+            <div class="edit-img-grid image-preview-grid" style="margin-top:6px;"></div>
+            <div style="display:flex; gap:8px; margin-top:8px;">
+                <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; padding:8px 14px; border-radius:8px; background:var(--forest); color:var(--on-accent); font-size:0.85rem; font-weight:600;">
+                    <span>\u{1F5BC}\u{FE0F} Gallery</span>
+                    <input type="file" class="edit-gallery-input" accept="image/*" multiple style="display:none;">
+                </label>
+                <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; padding:8px 14px; border-radius:8px; background:var(--forest); color:var(--on-accent); font-size:0.85rem; font-weight:600;">
+                    <span>\u{1F4F8} Camera</span>
+                    <input type="file" class="edit-camera-input" accept="image/*" capture="environment" style="display:none;">
+                </label>
             </div>
-            <label class="custom-upload" style="cursor:pointer; display:inline-block; margin-top:8px;">
-                <span>📷 Replace photo</span>
-                <input type="file" class="edit-img-input" accept="image/*" capture="environment" style="display:none;">
-            </label>
-            <div class="edit-img-name" style="font-size:0.8rem; color:var(--text-muted); margin-top:4px;"></div>
         </div>
         <div class="button-group" style="display:flex; gap:8px; margin-top:12px;">
             <button type="button" class="popup-btn edit-save-btn" style="background:var(--forest,#2e7d32); color:#fff;">Save</button>
@@ -574,35 +646,84 @@ async function _beginEntryEdit(spot, entry, div) {
         </div>
     `;
 
-    // textContent (not innerHTML) so notes can't inject markup.
+    const grid = div.querySelector('.edit-img-grid');
+
+    function renderEditGrid() {
+        grid.innerHTML = '';
+        // Existing images (not deleted)
+        existingImages.forEach(img => {
+            if (deletedPaths.has(img.path)) return;
+            const thumb = document.createElement('div');
+            thumb.className = 'image-preview-thumb';
+            thumb.innerHTML = `<img src="${img.src}" referrerpolicy="no-referrer"><button type="button" class="remove-img-btn" title="Remove">&times;</button>`;
+            thumb.querySelector('.remove-img-btn').addEventListener('click', () => {
+                deletedPaths.add(img.path);
+                renderEditGrid();
+            });
+            grid.appendChild(thumb);
+        });
+        // New files
+        newFiles.forEach(item => {
+            const thumb = document.createElement('div');
+            thumb.className = 'image-preview-thumb';
+            const url = URL.createObjectURL(item.file);
+            thumb.innerHTML = `<img src="${url}"><button type="button" class="remove-img-btn" title="Remove">&times;</button>`;
+            thumb.querySelector('.remove-img-btn').addEventListener('click', () => {
+                const idx = newFiles.findIndex(f => f.id === item.id);
+                if (idx >= 0) newFiles.splice(idx, 1);
+                renderEditGrid();
+            });
+            grid.appendChild(thumb);
+        });
+        if (grid.children.length === 0) {
+            grid.innerHTML = '<span style="font-size:0.82rem; color:var(--text-muted);">No photos</span>';
+        }
+    }
+    renderEditGrid();
+
     div.querySelector('.edit-desc').value = entry.description || '';
 
-    const imgInput = div.querySelector('.edit-img-input');
-    imgInput.addEventListener('change', () => {
-        const f = imgInput.files[0];
-        const el = div.querySelector('.edit-img-name');
-        if (el) el.textContent = f ? `New photo: ${f.name}` : '';
+    // Gallery — add multiple
+    div.querySelector('.edit-gallery-input').addEventListener('change', (e) => {
+        for (const f of e.target.files) {
+            newFiles.push({ file: f, id: crypto.randomUUID() });
+        }
+        e.target.value = '';
+        renderEditGrid();
     });
 
-    // Cancel → clean revert (re-render from stored data, no writes).
+    // Camera — add one (appends, not override)
+    div.querySelector('.edit-camera-input').addEventListener('change', (e) => {
+        if (e.target.files[0]) {
+            newFiles.push({ file: e.target.files[0], id: crypto.randomUUID() });
+        }
+        e.target.value = '';
+        renderEditGrid();
+    });
+
+    // Cancel → clean revert
     div.querySelector('.edit-cancel-btn').addEventListener('click', () => {
         _showSpotDetails(spot);
     });
 
-    // Save → persist notes + optional new photo, then re-render.
+    // Save → persist notes + image changes
     div.querySelector('.edit-save-btn').addEventListener('click', async (e) => {
         const saveBtn = e.currentTarget;
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving...';
         try {
             const desc = div.querySelector('.edit-desc').value;
-            let blob = imgInput.files[0] || null;
-            if (blob) blob = await downscaleImage(blob);
+            const addBlobs = [];
+            for (const item of newFiles) {
+                addBlobs.push(await downscaleImage(item.file));
+            }
+            const removePaths = [...deletedPaths].filter(p => p !== '__drive__');
+            const clearDriveImg = deletedPaths.has('__drive__');
 
-            await updateSpot(entry.spotId, { description: desc }, blob);
+            await updateSpot(entry.spotId, { description: desc }, addBlobs, removePaths, clearDriveImg);
             showToast('Observation updated.', 'success');
 
-            _showSpotDetails(spot);            // rebuild panel with fresh data
+            _showSpotDetails(spot);
             if (_isSpotsCheckboxChecked()) displaySpots();
         } catch (err) {
             console.error('[SpotManager] updateSpot failed:', err);
@@ -740,12 +861,34 @@ export function initSpots() {
     // --- Audio toggle ---
     _bindAudioToggle();
 
+    // --- Multi-image: gallery picker (multiple) ---
+    const imageUpload = document.getElementById('image-upload');
+    if (imageUpload) {
+        imageUpload.addEventListener('change', () => {
+            if (imageUpload.files.length) _addImageFiles(imageUpload.files);
+            imageUpload.value = '';   // allow re-selecting same files
+        });
+    }
+
+    // --- Multi-image: camera capture (single shot, appended) ---
+    const cameraInput = document.getElementById('camera-capture');
+    const cameraBtn   = document.getElementById('camera-capture-btn');
+    if (cameraBtn && cameraInput) {
+        cameraBtn.addEventListener('click', () => cameraInput.click());
+        cameraInput.addEventListener('change', () => {
+            if (cameraInput.files.length) _addImageFiles(cameraInput.files);
+            cameraInput.value = '';
+        });
+    }
+
     // --- Spot form submission ---
     const spotForm = document.getElementById('spot-form');
     if (spotForm) spotForm.addEventListener('submit', _handleSpotFormSubmit);
 
     // --- Normal "Add" button clears any Add More lock (fresh, editable spot) ---
     document.getElementById('open-form')?.addEventListener('click', () => {
+        _pendingImages = [];
+        _renderImagePreviews();
         _setAddMoreMode(null);
     });
 

@@ -478,12 +478,25 @@ export async function runJobOnServer(opts) {
         onProgress('Running analysis on server…');
         const runBody = { job_id: serverJobId };
 
-        // Spot/date params
-        if (jobData.parameters?.spots) {
-            runBody.spots = String(jobData.parameters.spots);
-        }
-        if (jobData.parameters?.start_date) runBody.start_date = jobData.parameters.start_date;
-        if (jobData.parameters?.end_date)   runBody.end_date   = jobData.parameters.end_date;
+        // Required fields — spots as array, dates, spots_geo with lat/lon.
+        const spotNames = spotIds.map(id => {
+            const s = spots.find(sp => sp.spotId === id);
+            return s ? s.name.replace(/\s+/g, '').toUpperCase() : null;
+        }).filter(Boolean);
+        runBody.spots      = spotNames;
+        runBody.start_date = jobData.parameters?.start_date || startDate;
+        runBody.end_date   = jobData.parameters?.end_date   || endDate;
+
+        // Build spot geo from the project's spot data (latitude/longitude).
+        // All spots with valid coordinates are included; the centroid of all
+        // spots is used for geometry if individual coords are missing.
+        const spotsGeo = spotIds.map(id => {
+            const s = spots.find(sp => sp.spotId === id);
+            if (!s || s.latitude == null || s.longitude == null) return null;
+            const name = s.name.replace(/\s+/g, '').toUpperCase();
+            return { name, lat: s.latitude, lon: s.longitude };
+        }).filter(Boolean);
+        runBody.spots_geo = spotsGeo;
 
         // Forward ALL dynamic params from the UI (manifest-driven)
         for (const [key, val] of Object.entries(dynamicParams)) {
@@ -491,15 +504,6 @@ export async function runJobOnServer(opts) {
                 runBody[key] = val;
             }
         }
-
-        // Build spot geo from the project's spot data — UI label is canonical.
-        const spotsGeo = spotIds.map(id => {
-            const s = spots.find(sp => sp.spotId === id);
-            if (!s) return null;
-            const name = s.name.replace(/\s+/g, '').toUpperCase();
-            return { name, lat: s.lat, lon: s.lng };
-        }).filter(Boolean);
-        if (spotsGeo.length) runBody.spots_geo = spotsGeo;
 
         // Send per-file spot mapping so BirdNET writes UI spot names into the
         // aggregate CSV (not filename-parsed prefixes).

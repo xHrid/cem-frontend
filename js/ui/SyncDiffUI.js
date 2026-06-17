@@ -312,15 +312,14 @@ function _open() {
         return;
     }
 
-    // Additive-only changes (new spots / new temporal entries on either side,
-    // nothing edited differently on BOTH) are not a real conflict — auto-merge
-    // the union silently instead of nagging the user. The dialog only appears
-    // when the same item was edited differently on both sides.
-    if (diff.conflictCount === 0) {
-        _model = { diff, ..._defaultChoices(diff) }; // defaults keep everything
-        applyResolvedConflict(_assembleResolved());
-        return;
-    }
+    // Always show the diff dialog when there are ANY differences — even
+    // additive-only changes. The user should see what's merging.
+    // Defaults pre-check "keep" for one-sided items, so applying is one click
+    // when there are no true conflicts.
+
+    // Pause sync while the user is reviewing to prevent push cycles from
+    // re-triggering the conflict check or overwriting mid-review.
+    import('../services/SyncEngine.js').then(m => m.pauseSync()).catch(() => {});
 
     _model = { diff, ..._defaultChoices(diff) };
     _render();
@@ -525,6 +524,11 @@ function _ensureDialog() {
         try {
             const resolved = _assembleResolved();
             await applyResolvedConflict(resolved);
+            // Resume sync engine after successful resolution
+            try {
+                const { resumeSync } = await import('../services/SyncEngine.js');
+                resumeSync();
+            } catch (_) {}
             if (dlg.open) dlg.close();
         } catch (err) {
             console.error('[SyncDiffUI] apply failed:', err);

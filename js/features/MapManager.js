@@ -188,8 +188,16 @@ export function initMap() {
     const _tileLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         maxZoom      : 19,
         attribution  : '&copy; OpenStreetMap contributors',
-        // crossOrigin lets the browser reuse cached tiles cleanly.
         crossOrigin  : true,
+        // Preload 4 tiles beyond the visible edge so panning feels instant.
+        keepBuffer   : 4,
+        // On HiDPI / Retina screens, request standard 256px tiles and let
+        // Leaflet upscale them. Without this, some devices request 512px
+        // tiles that OSM doesn't serve → systematic missing-tile pattern.
+        detectRetina : false,
+        // Spread requests across all three subdomains to avoid the browser's
+        // per-host connection limit (6 in Chrome). Explicit for clarity.
+        subdomains   : ['a', 'b', 'c'],
         // Transparent 1px PNG shown instead of a broken-image icon when a
         // tile request times out. OSM occasionally throttles / a lab
         // firewall may stall requests — this keeps the map usable; tiles
@@ -197,10 +205,18 @@ export function initMap() {
         errorTileUrl : 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
     }).addTo(_map);
 
-    // Quietly log tile timeouts (do NOT toast — they are transient and the
-    // errorTileUrl already prevents broken-image icons).
+    // Auto-retry failed tiles once after a short delay.
+    // OSM throttle is transient — a single retry usually succeeds and
+    // eliminates the "checkerboard holes" pattern the user reported.
     _tileLayer.on('tileerror', (ev) => {
-        console.warn('[MapManager] Tile failed to load:', ev?.coords);
+        const tile = ev.tile;
+        const src  = tile?._origSrc || tile?.src;
+        if (src && !tile._retried) {
+            tile._retried = true;
+            setTimeout(() => { tile.src = src; }, 1500);
+        } else {
+            console.warn('[MapManager] Tile failed to load after retry:', ev?.coords);
+        }
     });
 
     // Dedicated high pane so the "you are here" marker always sits ABOVE spot

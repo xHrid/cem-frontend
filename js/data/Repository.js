@@ -85,40 +85,40 @@ function _safeName(name, fallback = 'Unknown') {
  * the observation was actually made.  Now `recordDate` drives the timestamp
  * when provided.
  *
- * @param {object}    spotData    Plain spot object (name, coords, notes, …).
- * @param {Blob|null} imageBlob   Cover image; null if no photo was taken.
- * @param {Blob|null} audioBlob   Voice note; null if no audio was recorded.
- * @param {Date|null} recordDate  The real observation date/time. When omitted
- *                                the current system clock is used.
- * @returns {Promise<object>}     The fully populated spot record that was saved.
+ * @param {object}         spotData     Plain spot object (name, coords, notes, …).
+ * @param {Blob[]|Blob|null} imageBlobs  One or more cover images. Accepts a
+ *                                       single Blob for backward compat.
+ * @param {Blob|null}      audioBlob    Voice note; null if no audio was recorded.
+ * @param {Date|null}      recordDate   The real observation date/time. When omitted
+ *                                      the current system clock is used.
+ * @returns {Promise<object>}           The fully populated spot record that was saved.
  */
-export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
+export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
     const spotId        = spotData.spotId || crypto.randomUUID();
 
-    // Derive a safe folder name from the spot's display name.
     const safeSpot    = _safeName(spotData.name, `Spot_${spotId.substring(0, 8)}`);
     const spotPath    = [projectFolder, 'spots', safeSpot];
-
-    // Per-entry unique suffix. Multiple observations on the SAME spot share the
-    // same display name (the "Add observation" / Add More flow), so the media
-    // filename MUST be keyed on the unique spotId. Otherwise every new entry's
-    // cover/note is written to an identical path, overwriting the previous
-    // entry's file — and all entries end up referencing the single latest image.
     const shortId     = spotId.substring(0, 8);
 
-    let imgPath   = null;
-    let audioPath = null;
+    // Normalise: single Blob → array, null/undefined → empty array
+    const blobs = imageBlobs
+        ? (Array.isArray(imageBlobs) ? imageBlobs : [imageBlobs])
+        : [];
 
-    if (imageBlob) {
-        imgPath = await StorageAdapter.saveFile(
-            imageBlob,
-            `${safeSpot}_${shortId}_cover.jpg`,
+    const imagePaths = [];
+    for (let i = 0; i < blobs.length; i++) {
+        const suffix = i === 0 ? 'cover' : `img${i + 1}`;
+        const path = await StorageAdapter.saveFile(
+            blobs[i],
+            `${safeSpot}_${shortId}_${suffix}.jpg`,
             [...spotPath, 'images']
         );
+        imagePaths.push(path);
     }
 
+    let audioPath = null;
     if (audioBlob) {
         audioPath = await StorageAdapter.saveFile(
             audioBlob,
@@ -127,7 +127,6 @@ export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
         );
     }
 
-    // Bug fix: use recordDate for the canonical timestamp when provided.
     const timestamp = (recordDate instanceof Date)
         ? recordDate.toISOString()
         : new Date().toISOString();
@@ -138,7 +137,10 @@ export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
         projectId              : project.id,
         created_by             : spotData.created_by || getUserEmail() || null,
         timestamp,
-        image_local_filename   : imgPath,
+        // First image stays here for backward compat with sync/sharing services
+        image_local_filename   : imagePaths[0] || null,
+        // Full list of all image paths (includes first)
+        images                 : imagePaths.length > 0 ? imagePaths : null,
         audio_local_filename   : audioPath
     };
 
@@ -147,11 +149,10 @@ export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 
-    // Auto-sync media files (non-external → automatic)
-    if (imgPath) {
-        EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: imgPath, isExternal: false });
+    // Auto-sync media files
+    for (const p of imagePaths) {
+        EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: p, isExternal: false });
     }
     if (audioPath) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: audioPath, isExternal: false });
@@ -177,7 +178,7 @@ export async function saveSpot(spotData, imageBlob, audioBlob, recordDate) {
  * @param {Blob|null}   imageBlob  Optional NEW photo; replaces the existing one.
  * @returns {Promise<object>}      The updated spot record.
  */
-export async function updateSpot(spotId, fields, imageBlob) {
+export async function updateSpot(spotId, fields, addBlobs = [], removePaths = [], clearDriveImg = false) {
     const project = _requireActiveProject();
     const spot    = (project.spots || []).find(s => s.spotId === spotId);
     if (!spot) throw new Error(`Spot "${spotId}" not found.`);
@@ -187,32 +188,59 @@ export async function updateSpot(spotId, fields, imageBlob) {
         spot.description = fields.description;
     }
 
-    let newImgPath = null;
-    if (imageBlob) {
-        const projectFolder = getProjectFolderName(project);
-        const safeSpot      = _safeName(spot.name, `Spot_${spotId.substring(0, 8)}`);
-        const shortId       = spotId.substring(0, 8);
-        // Deterministic per-entry cover path → overwrites this entry's old photo
-        // in place (no orphan), and re-syncs under the same relative path.
-        newImgPath = await StorageAdapter.saveFile(
-            imageBlob,
-            `${safeSpot}_${shortId}_cover.jpg`,
-            [projectFolder, 'spots', safeSpot, 'images']
-        );
-        spot.image_local_filename = newImgPath;
-        // A fresh local photo supersedes any inherited Drive copy.
+    // --- Backward compat: single imageBlob as legacy call ---
+    const blobs = addBlobs instanceof Blob ? [addBlobs] : (Array.isArray(addBlobs) ? addBlobs : []);
+
+    // Current images array (normalise from old single-image entries)
+    let images = spot.images && spot.images.length > 0
+        ? [...spot.images]
+        : (spot.image_local_filename ? [spot.image_local_filename] : []);
+
+    // Remove deleted paths
+    if (removePaths.length > 0) {
+        const removeSet = new Set(removePaths);
+        images = images.filter(p => !removeSet.has(p));
+    }
+
+    // Clear Drive-only image if user deleted it
+    if (clearDriveImg) {
         spot.image_drive_id = null;
     }
 
-    // Version marker for last-write-wins merge (kept separate from `timestamp`,
-    // which remains the observation date shown in the UI).
+    // Add new images
+    const projectFolder = getProjectFolderName(project);
+    const safeSpot      = _safeName(spot.name, `Spot_${spotId.substring(0, 8)}`);
+    const shortId       = spotId.substring(0, 8);
+    const newPaths      = [];
+
+    for (let i = 0; i < blobs.length; i++) {
+        const suffix = `add_${Date.now()}_${i}`;
+        const path = await StorageAdapter.saveFile(
+            blobs[i],
+            `${safeSpot}_${shortId}_${suffix}.jpg`,
+            [projectFolder, 'spots', safeSpot, 'images']
+        );
+        images.push(path);
+        newPaths.push(path);
+    }
+
+    // Persist multi-image array + backward-compat single field
+    spot.images = images.length > 0 ? images : null;
+    spot.image_local_filename = images[0] || null;
+
+    // If all local images removed and no Drive fallback, clear drive id too
+    if (!spot.image_local_filename && !clearDriveImg) {
+        // keep existing drive id as fallback
+    }
+
+    // Version marker for last-write-wins merge
     spot.updated_at = new Date().toISOString();
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
 
-    if (newImgPath) {
-        EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: newImgPath, isExternal: false });
+    for (const p of newPaths) {
+        EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: p, isExternal: false });
     }
 
     return spot;
