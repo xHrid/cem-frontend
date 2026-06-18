@@ -21,7 +21,7 @@ import {
 }                                    from '../data/ProjectManager.js';
 import { resolveMasterConflict }     from '../services/SyncService.js';
 import { getSpots, getLocalState }   from '../data/MasterData.js';
-import { saveExternalFile, saveExternalFileByReference } from '../data/Repository.js';
+import { saveExternalFile, saveExternalFileByReference, saveExternalFilesByReferenceBatch, saveExternalFilesBatch } from '../data/Repository.js';
 import { showToast }                 from './Toast.js';
 import { openModal, closeModal }     from './ModalManager.js';
 
@@ -302,18 +302,23 @@ function _initImportMediaForm() {
                 baseDir = baseDir.replace(/[\\/]+$/, '');
             }
 
-            for (const file of files) {
-                if (importAsRef) {
-                    // Build full absolute path: baseDir + separator + filename
-                    // Use webkitRelativePath (folder picker) if available, else just filename
-                    const relPart  = file.webkitRelativePath || file.name;
-                    const filePath = baseDir + '/' + relPart;
-                    await saveExternalFileByReference(
-                        file.name, filePath, file.type, selectedSpotIds, importDate
-                    );
-                } else {
-                    await saveExternalFile(file, selectedSpotIds, importDate);
-                }
+            const progressCb = (done, total) => {
+                if (submitBtn) submitBtn.textContent = `Importing ${done}/${total}...`;
+            };
+
+            if (importAsRef) {
+                // Build descriptors, then batch-import in one shot
+                const descriptors = files.map(file => {
+                    const relPart = file.webkitRelativePath || file.name;
+                    return { name: file.name, path: baseDir + '/' + relPart, type: file.type };
+                });
+                await saveExternalFilesByReferenceBatch(
+                    descriptors, selectedSpotIds, importDate, progressCb
+                );
+            } else {
+                await saveExternalFilesBatch(
+                    files, selectedSpotIds, importDate, progressCb
+                );
             }
 
             showToast(`${importAsRef ? 'Referenced' : 'Imported'} ${files.length} file(s) successfully.`, 'success');

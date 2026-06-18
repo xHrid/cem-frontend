@@ -46,10 +46,14 @@ export function initSyncPanel() {
     // Keep the pill in sync with engine status.
     EventBus.on(EVENTS.SYNC_STATUS, ({ data }) => _renderPill(data.status, data.lastSyncAt));
 
-    // Refresh pill when media uploads start/finish
+    // Refresh pill when media uploads start/finish (debounced for bulk imports)
+    let _mediaPillTimer = null;
     EventBus.on(EVENTS.MEDIA_SAVED, () => {
-        const st = getSyncState();
-        setTimeout(() => _renderPill(st.status, st.lastSyncAt), 100);
+        clearTimeout(_mediaPillTimer);
+        _mediaPillTimer = setTimeout(() => {
+            const st = getSyncState();
+            _renderPill(st.status, st.lastSyncAt);
+        }, 500);
     });
     EventBus.on(EVENTS.SYNC_BATCH_COMPLETE, () => {
         const st = getSyncState();

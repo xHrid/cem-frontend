@@ -98,7 +98,14 @@ export function initSyncDashboard() {
     });
 
     // ── Also refresh the sidebar button on data changes ───────────────────────
-    EventBus.on(EVENTS.DATA_UPDATED,   () => _updateSyncIndicators());
+    // Debounce: during bulk imports DATA_UPDATED fires per-file (legacy callers)
+    // or once (batch callers). Either way, avoid hammering Drive API.
+    let _syncIndicatorTimer = null;
+    const _debouncedUpdateSyncIndicators = () => {
+        clearTimeout(_syncIndicatorTimer);
+        _syncIndicatorTimer = setTimeout(() => _updateSyncIndicators(), 2000);
+    };
+    EventBus.on(EVENTS.DATA_UPDATED,   _debouncedUpdateSyncIndicators);
     EventBus.on(EVENTS.STORAGE_READY,  () => _updateSyncIndicators());
 }
 

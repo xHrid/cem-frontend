@@ -633,6 +633,133 @@ export async function saveExternalFileByReference(fileName, filePath, fileType, 
     return newFileEntry;
 }
 
+/**
+ * Batch-import external files by reference (path only, no file copy).
+ * Pushes all entries into masterData in memory first, then persists once
+ * and emits a single DATA_UPDATED event — O(1) I/O instead of O(n).
+ *
+ * @param {Array<{name:string, path:string, type:string}>} fileDescriptors
+ * @param {string[]}  spotIds     UUIDs of spots to link.
+ * @param {Date|null} importDate  Canonical import timestamp.
+ * @param {function}  [onProgress] Optional callback(processed, total).
+ * @returns {Promise<object[]>}   All saved file entries.
+ */
+export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds, importDate, onProgress) {
+    const project = _requireActiveProject();
+
+    const timestamp = (importDate instanceof Date)
+        ? importDate.toISOString()
+        : new Date().toISOString();
+
+    if (!project.external_files) project.external_files = [];
+
+    const entries = [];
+    const total   = fileDescriptors.length;
+
+    for (let i = 0; i < total; i++) {
+        const { name, path, type } = fileDescriptors[i];
+        const entry = {
+            id           : crypto.randomUUID(),
+            name,
+            type,
+            linked_spots : spotIds,
+            projectId    : project.id,
+            timestamp,
+            sync_status  : 'reference',
+            local_path   : path,
+            is_reference : true
+        };
+        project.external_files.push(entry);
+        entries.push(entry);
+
+        // Yield to UI thread periodically so progress updates render
+        if (onProgress && (i % 200 === 0 || i === total - 1)) {
+            onProgress(i + 1, total);
+            await new Promise(r => setTimeout(r, 0));
+        }
+    }
+
+    // Single persist + single event
+    await MasterData.saveMasterData();
+    EventBus.emit(EVENTS.DATA_UPDATED);
+
+    return entries;
+}
+
+/**
+ * Batch-import external files (copy into storage).
+ * Copies files with bounded concurrency, persists masterData once at the
+ * end, and emits a single DATA_UPDATED + MEDIA_SAVED event.
+ *
+ * @param {File[]}    files       File objects to import.
+ * @param {string[]}  spotIds     UUIDs of spots to link.
+ * @param {Date|null} importDate  Canonical import timestamp.
+ * @param {function}  [onProgress] Optional callback(processed, total).
+ * @param {number}    [concurrency=5] Max parallel file writes.
+ * @returns {Promise<object[]>}   All saved file entries.
+ */
+export async function saveExternalFilesBatch(files, spotIds, importDate, onProgress, concurrency = 5) {
+    const project       = _requireActiveProject();
+    const projectFolder = getProjectFolderName(project);
+    const primarySpotId = spotIds[0];
+    const spot          = (project.spots || []).find(s => s.spotId === primarySpotId);
+    const safeSpot      = _safeName(
+        spot?.name,
+        `Spot_${(primarySpotId || '').substring(0, 8)}`
+    );
+    const pathArray = [projectFolder, 'spots', safeSpot, 'external_data'];
+
+    const timestamp = (importDate instanceof Date)
+        ? importDate.toISOString()
+        : new Date().toISOString();
+
+    if (!project.external_files) project.external_files = [];
+
+    const total   = files.length;
+    let processed = 0;
+    const entries = new Array(total);
+
+    // Process file copies with bounded concurrency
+    const queue = files.map((file, idx) => ({ file, idx }));
+    const workers = [];
+
+    for (let w = 0; w < Math.min(concurrency, total); w++) {
+        workers.push((async () => {
+            while (queue.length > 0) {
+                const { file, idx } = queue.shift();
+                const savedPath = await StorageAdapter.saveFile(file, file.name, pathArray);
+
+                entries[idx] = {
+                    id           : crypto.randomUUID(),
+                    name         : file.name,
+                    type         : file.type,
+                    linked_spots : spotIds,
+                    projectId    : project.id,
+                    timestamp,
+                    sync_status  : 'pending',
+                    local_path   : savedPath
+                };
+
+                processed++;
+                if (onProgress) onProgress(processed, total);
+            }
+        })());
+    }
+
+    await Promise.all(workers);
+
+    // Push all entries at once, persist once, emit once
+    for (const entry of entries) {
+        if (entry) project.external_files.push(entry);
+    }
+
+    await MasterData.saveMasterData();
+    EventBus.emit(EVENTS.DATA_UPDATED);
+    EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, isExternal: true, batch: true });
+
+    return entries.filter(Boolean);
+}
+
 // ---------------------------------------------------------------------------
 // File URL helper
 // ---------------------------------------------------------------------------
