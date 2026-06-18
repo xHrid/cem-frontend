@@ -533,37 +533,43 @@ class JobProcessor:
             cmd.extend(["--root-dir", str(cfg.root_path)])
             cmd.extend(["--project-dir", str(project_root)])
 
-            # 2. Resolve input directories + reference files.
-            #    - "datasets"    → spot/audio dirs (relative to root_path). The
-            #                      script scans these recursively → INPUT_DIRECTORIES.
-            #    - "input_files" → explicit reference WAV paths (absolute OS paths)
-            #                      that live OUTSIDE the spot dirs → INPUT_FILE_LIST.
+            # 2. Resolve ALL inputs — both copy-imported dirs AND reference files.
             #
-            # The webapp runs on Windows and stores Windows paths (D:\...).
-            # The watcher may run under WSL where those must become /mnt/d/...
-            # for the filesystem to find them — _win_to_wsl handles that.
-            # dataset_spots: aligned 1:1 with datasets — canonical UI spot name
+            # The webapp stores two lists in the job JSON:
+            #   - "datasets"    → dirs of copy-imported files (relative to root).
+            #   - "input_files" → reference files with absolute OS paths + spot name.
+            #
+            # Scripts receive everything as --datasets (directories to scan) plus
+            # --dataset-spots (aligned spot names). Reference files are collapsed
+            # into their parent directories and merged into the same lists so
+            # existing scripts see ALL files — no separate --input-file-list needed.
+            #
+            # Spot info is preserved: each directory carries the canonical spot name
+            # so the script stamps it onto every detection from that directory.
+
             raw_dataset_spots = job_data.get("dataset_spots", [])
-            resolved_dirs = []
-            resolved_dir_spots = []
+
+            # dir_path → spot_name (preserves first-seen spot per dir)
+            dir_to_spot = {}
+
+            # (A) Copy-imported dataset dirs
             for idx, d in enumerate(job_data.get("datasets", [])):
                 spot_label = raw_dataset_spots[idx] if idx < len(raw_dataset_spots) else ""
-                # Normalize first, then try as relative to root, then as absolute
                 norm_d = _normalize_path(d)
                 p = (cfg.root_path / norm_d).resolve()
                 if not p.exists():
                     p = Path(norm_d).resolve()
                 if p.exists():
-                    resolved_dirs.append(str(p))
-                    resolved_dir_spots.append(spot_label)
+                    key = str(p)
+                    if key not in dir_to_spot:
+                        dir_to_spot[key] = spot_label
                 else:
-                    logger.warning("  dataset path not found: %s (tried: %s)", d, p)
+                    logger.warning("  ⚠ dataset dir not found: %s", d)
 
-            # Each input_files entry is {"path": ..., "spot": ...} (newer webapp)
-            # or a bare path string (back-compat). The spot travels alongside the
-            # file so the script can stamp it onto reference-file detections.
-            resolved_files = []        # aligned with resolved_file_spots
-            resolved_file_spots = []
+            # (B) Reference files — collapse each into its parent directory.
+            #     This way the script scans the dir and finds the file naturally.
+            ref_file_count = 0
+            ref_missing    = 0
             for entry in job_data.get("input_files", []):
                 if isinstance(entry, dict):
                     raw, spot = entry.get("path"), entry.get("spot", "")
@@ -571,48 +577,34 @@ class JobProcessor:
                     raw, spot = entry, ""
                 if not raw:
                     continue
+
                 p = Path(_normalize_path(raw)).resolve()
                 if p.exists():
-                    resolved_files.append(str(p))
-                    resolved_file_spots.append(spot or "")
+                    parent = str(p.parent)
+                    if parent not in dir_to_spot:
+                        dir_to_spot[parent] = spot or ""
+                    ref_file_count += 1
                 else:
-                    logger.warning("  reference file not found: %s (resolved: %s)", raw, p)
+                    ref_missing += 1
+                    logger.debug("  ref file not found: %s → %s", raw, p)
 
-            def _dedup(seq):
-                seen, out = set(), []
-                for x in seq:
-                    if x not in seen:
-                        seen.add(x)
-                        out.append(x)
-                return out
+            if ref_missing:
+                logger.warning(
+                    "  ⚠ %d reference file(s) not found (check paths in master_data.json)",
+                    ref_missing,
+                )
 
-            # Dedup dirs while keeping dataset_spots aligned.
-            seen_d, unique_dirs, unique_dir_spots = set(), [], []
-            for d, sp in zip(resolved_dirs, resolved_dir_spots):
-                if d not in seen_d:
-                    seen_d.add(d)
-                    unique_dirs.append(d)
-                    unique_dir_spots.append(sp)
+            # Build final deduped lists (aligned: dirs ↔ spots)
+            unique_dirs      = list(dir_to_spot.keys())
+            unique_dir_spots = [dir_to_spot[d] for d in unique_dirs]
 
-            # Dedup reference files while keeping each one's spot aligned.
-            seen_f, unique_files, unique_file_spots = set(), [], []
-            for pth, sp in zip(resolved_files, resolved_file_spots):
-                if pth not in seen_f:
-                    seen_f.add(pth)
-                    unique_files.append(pth)
-                    unique_file_spots.append(sp)
-
-            # Write large lists to temp files to avoid WinError 206
-            # ("filename or extension is too long") — Windows has a ~32k char
-            # command-line limit which 85k file paths easily exceed.
-            #
-            # Strategy: always write file lists to disk. Pass --*-file args
-            # pointing to those files. For small lists (< 50 items), also pass
-            # inline args for backward compat with older scripts.
+            # Write to temp files to avoid WinError 206 on Windows (~32k char limit).
+            # Always pass --datasets-file / --dataset-spots-file.
+            # For small lists, also pass inline args for backward compat.
             job_tmp_dir = job_result_dir / "_tmp"
             job_tmp_dir.mkdir(parents=True, exist_ok=True)
 
-            _INLINE_THRESHOLD = 50  # safe under any OS command-line limit
+            _INLINE_THRESHOLD = 50
 
             if unique_dirs:
                 dirs_file = job_tmp_dir / "datasets.txt"
@@ -620,30 +612,15 @@ class JobProcessor:
                 cmd.extend(["--datasets-file", str(dirs_file)])
                 if len(unique_dirs) <= _INLINE_THRESHOLD:
                     cmd.extend(["--datasets"] + unique_dirs)
-                if any(s for s in unique_dir_spots):
-                    spots_file = job_tmp_dir / "dataset_spots.txt"
-                    spots_file.write_text(
-                        "\n".join(s or "_" for s in unique_dir_spots),
-                        encoding="utf-8",
-                    )
-                    cmd.extend(["--dataset-spots-file", str(spots_file)])
-                    if len(unique_dir_spots) <= _INLINE_THRESHOLD:
-                        cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
 
-            if unique_files:
-                files_file = job_tmp_dir / "input_files.txt"
-                files_file.write_text("\n".join(unique_files), encoding="utf-8")
-                cmd.extend(["--input-file-list-file", str(files_file)])
-                if len(unique_files) <= _INLINE_THRESHOLD:
-                    cmd.extend(["--input-file-list"] + unique_files)
-                file_spots_file = job_tmp_dir / "input_file_spots.txt"
-                file_spots_file.write_text(
-                    "\n".join(s or "_" for s in unique_file_spots),
+                spots_file = job_tmp_dir / "dataset_spots.txt"
+                spots_file.write_text(
+                    "\n".join(s or "_" for s in unique_dir_spots),
                     encoding="utf-8",
                 )
-                cmd.extend(["--input-file-spots-file", str(file_spots_file)])
-                if len(unique_file_spots) <= _INLINE_THRESHOLD:
-                    cmd.extend(["--input-file-spots"] + [s or "_" for s in unique_file_spots])
+                cmd.extend(["--dataset-spots-file", str(spots_file)])
+                if len(unique_dir_spots) <= _INLINE_THRESHOLD:
+                    cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
 
             # 3. Unpack UI parameters (spots, start_date, end_date, snr_db, ...)
             for key, val in params.items():
@@ -671,24 +648,33 @@ class JobProcessor:
             processed_path = str(db_dir / f"processed_{script_stem}.txt")
             cmd.extend(["--processed-file", processed_path])
 
-            # ── Meaningful job summary instead of dumping the raw command ──
+            # ── Meaningful job summary ──────────────────────────────────
+            logger.info("  Scanning input directories for audio files...")
+            total_files = sum(_count_audio_files(d) for d in unique_dirs)
+            spot_names = sorted(set(s for s in unique_dir_spots if s and s != "_"))
+
+            if total_files == 0 and unique_dirs:
+                logger.warning(
+                    "  ⚠ 0 audio files found in %d dirs — check paths and file extensions",
+                    len(unique_dirs),
+                )
+                for d in unique_dirs[:5]:
+                    logger.warning("    dir: %s (exists: %s)", d, Path(d).exists())
+
             logger.info("  ┌─ Job Summary ─────────────────────────────")
             logger.info("  │ Script:          %s", script_name)
-            logger.info("  │ Dataset dirs:    %d", len(unique_dirs))
-            logger.info("  │ Reference files: %d", len(unique_files))
-            if unique_dir_spots:
-                spot_names = sorted(set(s for s in unique_dir_spots if s and s != "_"))
-                logger.info("  │ Spots:           %s", ", ".join(spot_names) if spot_names else "(none)")
+            logger.info("  │ Input dirs:      %d (from copies + reference parents)", len(unique_dirs))
+            if ref_file_count:
+                logger.info("  │ Reference files: %d included", ref_file_count)
+            logger.info("  │ Total audio:     %d files to process", total_files)
+            if spot_names:
+                logger.info("  │ Spots:           %s", ", ".join(spot_names))
             param_strs = [f"{k}={v}" for k, v in params.items()]
             if param_strs:
                 logger.info("  │ Params:          %s", ", ".join(param_strs))
             logger.info("  └─────────────────────────────────────────")
             logger.debug("  Full CMD: %s", " ".join(str(c) for c in cmd))
             self.setup.update_heartbeat("processing_job")
-
-            total_files = len(unique_files) + sum(
-                _count_audio_files(d) for d in unique_dirs
-            )
 
             start_time = time.time()
             stdout_log = []
