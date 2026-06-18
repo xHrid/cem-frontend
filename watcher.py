@@ -676,107 +676,52 @@ class JobProcessor:
             logger.debug("  Full CMD: %s", " ".join(str(c) for c in cmd))
             self.setup.update_heartbeat("processing_job")
 
+            # ── Launch script with inherited terminal ──────────────────
+            # Script's own stdout/stderr go directly to this terminal —
+            # no capturing, no buffering, no stuck progress bars.
+            # Tee stdout to a log file so we still have a record.
+            stdout_log_path = job_result_dir / "stdout.log"
+
+            logger.info("  ── Script output ─────────────────────────")
             start_time = time.time()
-            stdout_log = []
-            stderr_log = []
 
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,       # line-buffered
-            )
-
-            # ── Stream stdout with live progress bar ──────────────────
-            files_done = 0
-            last_pct   = -1
-            _PROG_RE   = _re.compile(
-                r'(?:processing|analyzing|analysing|processed|done)[:\s]*(\d+)',
-                _re.IGNORECASE,
-            )
-            _FILE_DONE_RE = _re.compile(
-                r'(?:saved|wrote|finished|complete|done|processed)\b',
-                _re.IGNORECASE,
-            )
-
-            try:
+            with open(stdout_log_path, "w", encoding="utf-8") as log_fh:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge stderr into stdout
+                    text=True,
+                    bufsize=1,
+                )
+                # Stream line-by-line: print to terminal AND write to log file.
+                # No parsing, no buffering — script's progress bars render live.
                 for line in proc.stdout:
-                    stdout_log.append(line)
-                    stripped = line.rstrip()
-
-                    # Try to extract explicit count from script output
-                    m = _PROG_RE.search(stripped)
-                    if m:
-                        files_done = int(m.group(1))
-                    elif _FILE_DONE_RE.search(stripped):
-                        files_done += 1
-
-                    # Render progress bar
-                    if total_files > 0:
-                        pct = min(int(files_done * 100 / total_files), 100)
-                    else:
-                        pct = 0
-
-                    if pct != last_pct:
-                        bar_w   = 30
-                        filled  = int(bar_w * pct / 100)
-                        bar     = '█' * filled + '░' * (bar_w - filled)
-                        elapsed = time.time() - start_time
-                        eta_str = ""
-                        if pct > 0 and pct < 100:
-                            eta_sec = elapsed / pct * (100 - pct)
-                            eta_m, eta_s = divmod(int(eta_sec), 60)
-                            eta_str = f" ETA {eta_m}m{eta_s:02d}s"
-                        # \r overwrite on terminals, logged as INFO for file loggers
-                        print(
-                            f"\r  ⏳ [{bar}] {pct:3d}% "
-                            f"({files_done}/{total_files}) "
-                            f"{int(elapsed)}s elapsed{eta_str}   ",
-                            end="", flush=True,
-                        )
-                        last_pct = pct
+                    print(line, end="", flush=True)
+                    log_fh.write(line)
 
                 proc.wait(timeout=cfg.job_timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-                raise
-
-            # Read any remaining stderr
-            stderr_text = proc.stderr.read()
-            if stderr_text:
-                stderr_log.append(stderr_text)
-
-            # Final newline after progress bar
-            print()
 
             execution_duration = time.time() - start_time
-            stdout_text = "".join(stdout_log)
-            stderr_combined = "".join(stderr_log)
+            logger.info("  ─────────────────────────────────────────")
 
             # Clean up temp list files
             if job_tmp_dir.exists():
                 shutil.rmtree(job_tmp_dir, ignore_errors=True)
 
+            elapsed_m, elapsed_s = divmod(int(execution_duration), 60)
+
             if proc.returncode == 0:
-                elapsed_m, elapsed_s = divmod(int(execution_duration), 60)
+                rate = total_files / max(execution_duration, 0.1)
                 logger.info(
                     "  ✅ Done! %d files in %dm%02ds (%.1f files/sec)",
-                    files_done or total_files,
-                    elapsed_m, elapsed_s,
-                    (files_done or total_files) / max(execution_duration, 0.1),
+                    total_files, elapsed_m, elapsed_s, rate,
                 )
-                (job_result_dir / "stdout.log").write_text(stdout_text)
 
-                # Write execution stats
                 stats_data = {
                     "execution_time_seconds": execution_duration,
                     "execution_time_formatted": f"{elapsed_m}m {elapsed_s}s",
-                    "files_processed": files_done or total_files,
-                    "files_per_second": round(
-                        (files_done or total_files) / max(execution_duration, 0.1), 2
-                    ),
+                    "files_processed": total_files,
+                    "files_per_second": round(rate, 2),
                 }
                 with open(job_result_dir / "run_stats.json", "w") as fh:
                     json.dump(stats_data, fh)
@@ -787,22 +732,20 @@ class JobProcessor:
                 )
             else:
                 logger.error(
-                    "  ❌ Failed after %.2fs (code %d)",
-                    execution_duration,
-                    proc.returncode,
+                    "  ❌ Failed after %dm%02ds (code %d)",
+                    elapsed_m, elapsed_s, proc.returncode,
                 )
-                error_text = stderr_combined
-                if stdout_text:
-                    error_text += (
-                        "\n--- stdout ---\n" + stdout_text
-                        if error_text
-                        else stdout_text
-                    )
-                (job_result_dir / "error.log").write_text(error_text)
+                # Copy stdout log as error log too for easy finding
+                error_log = job_result_dir / "error.log"
+                if stdout_log_path.exists():
+                    shutil.copy2(str(stdout_log_path), str(error_log))
                 raise RuntimeError("Script execution failed. Check error.log")
 
         except subprocess.TimeoutExpired:
             logger.error("  Job %s timed out after %ds", job_id, cfg.job_timeout)
+            if 'proc' in locals():
+                proc.kill()
+                proc.wait()
             shutil.move(str(processing_path), str(failed_dir / job_file.name))
         except Exception as exc:
             logger.error("  Job failed: %s", exc)

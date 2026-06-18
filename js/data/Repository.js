@@ -607,6 +607,11 @@ export async function deleteJob(jobId, currentStatus) {
 export async function saveExternalFileByReference(fileName, filePath, fileType, spotIds, importDate) {
     const project = _requireActiveProject();
 
+    if (!project.external_files) project.external_files = [];
+
+    // Silent duplicate skip
+    if (project.external_files.some(f => f.local_path === filePath)) return null;
+
     const timestamp = (importDate instanceof Date)
         ? importDate.toISOString()
         : new Date().toISOString();
@@ -623,12 +628,10 @@ export async function saveExternalFileByReference(fileName, filePath, fileType, 
         is_reference : true
     };
 
-    if (!project.external_files) project.external_files = [];
     project.external_files.push(newFileEntry);
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 
     return newFileEntry;
 }
@@ -653,11 +656,22 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
 
     if (!project.external_files) project.external_files = [];
 
+    // Build set of existing paths for O(1) duplicate detection
+    const existingPaths = new Set(
+        project.external_files.map(f => f.local_path).filter(Boolean)
+    );
+
     const entries = [];
     const total   = fileDescriptors.length;
+    let skipped   = 0;
 
     for (let i = 0; i < total; i++) {
         const { name, path, type } = fileDescriptors[i];
+
+        // Silent skip if path already exists
+        if (existingPaths.has(path)) { skipped++; continue; }
+        existingPaths.add(path);
+
         const entry = {
             id           : crypto.randomUUID(),
             name,
@@ -680,8 +694,10 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
     }
 
     // Single persist + single event
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    if (entries.length > 0) {
+        await MasterData.saveMasterData();
+        EventBus.emit(EVENTS.DATA_UPDATED);
+    }
 
     return entries;
 }
@@ -715,12 +731,27 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
 
     if (!project.external_files) project.external_files = [];
 
-    const total   = files.length;
+    // Build set of existing file names for duplicate detection (copy imports
+    // don't have stable absolute paths, so match on name within same spot)
+    const existingNames = new Set(
+        project.external_files
+            .filter(f => !f.is_reference && f.linked_spots?.includes(primarySpotId))
+            .map(f => f.name)
+    );
+
+    // Filter out duplicates before queuing any work
+    const uniqueFiles = files.filter(f => {
+        if (existingNames.has(f.name)) return false;
+        existingNames.add(f.name);
+        return true;
+    });
+
+    const total   = uniqueFiles.length;
     let processed = 0;
     const entries = new Array(total);
 
     // Process file copies with bounded concurrency
-    const queue = files.map((file, idx) => ({ file, idx }));
+    const queue = uniqueFiles.map((file, idx) => ({ file, idx }));
     const workers = [];
 
     for (let w = 0; w < Math.min(concurrency, total); w++) {
@@ -753,9 +784,11 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
         if (entry) project.external_files.push(entry);
     }
 
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
-    EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, isExternal: true, batch: true });
+    if (total > 0) {
+        await MasterData.saveMasterData();
+        EventBus.emit(EVENTS.DATA_UPDATED);
+        EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, isExternal: true, batch: true });
+    }
 
     return entries.filter(Boolean);
 }
