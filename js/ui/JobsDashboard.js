@@ -154,7 +154,27 @@ async function _loadJobsSidebar() {
     els.listSidebar.innerHTML = "<p style='padding:15px; color:var(--text-muted);'>Loading jobs...</p>";
 
     try {
-        const jobs = await getAllJobs();
+        // Local disk jobs (own jobs that were run on this device)
+        const localJobs = await getAllJobs();
+        const localIds = new Set(localJobs.map(j => j.job_id));
+
+        // Merge in project.jobs[] from shared project_data.json — these carry
+        // jobs run by the owner (or other editors) that exist only on Drive.
+        const project = getActiveProject();
+        const sharedJobs = (project?.jobs || [])
+            .filter(j => !localIds.has(j.job_id))
+            .map(j => ({
+                ...j,
+                job_name: j.job_name || j.job_id,
+                current_status: j.status || 'completed',
+                created_at: j.completed_at || j.timestamp || new Date().toISOString(),
+                _remote: true, // flag: no local files, results on Drive only
+            }));
+
+        const jobs = [...localJobs, ...sharedJobs].sort((a, b) => {
+            return new Date(b.created_at || 0) - new Date(a.created_at || 0);
+        });
+
         els.listSidebar.innerHTML = '';
 
         if (jobs.length === 0) {

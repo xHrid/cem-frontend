@@ -20,6 +20,7 @@ import {
     getSyncState,
     flush,
 } from '../services/SyncEngine.js';
+import { getMediaSyncStatus } from '../services/SharedMediaSync.js';
 import { showToast } from './Toast.js';
 
 // ---------------------------------------------------------------------------
@@ -45,16 +46,26 @@ export function initSyncPanel() {
     // Keep the pill in sync with engine status.
     EventBus.on(EVENTS.SYNC_STATUS, ({ data }) => _renderPill(data.status, data.lastSyncAt));
 
+    // Refresh pill when media uploads start/finish
+    EventBus.on(EVENTS.MEDIA_SAVED, () => {
+        const st = getSyncState();
+        setTimeout(() => _renderPill(st.status, st.lastSyncAt), 100);
+    });
+    EventBus.on(EVENTS.SYNC_BATCH_COMPLETE, () => {
+        const st = getSyncState();
+        _renderPill(st.status, st.lastSyncAt);
+    });
+
     // Delegated click — works regardless of when the pill is injected.
     document.addEventListener('click', (e) => {
         if (e.target.closest?.('#btn-sync-pill')) _openPanel();
     });
 
-    // Refresh the relative "X ago" label on a slow tick (not a live clock).
+    // Refresh pill periodically — catches media queue draining + relative time label.
     setInterval(() => {
         const st = getSyncState();
-        if (st.status === 'idle') _renderPill(st.status, st.lastSyncAt);
-    }, 30 * 1000);
+        _renderPill(st.status, st.lastSyncAt);
+    }, 5 * 1000);
 
     const st = getSyncState();
     _renderPill(st.status, st.lastSyncAt);
@@ -82,11 +93,27 @@ function _relTime(ts) {
 function _renderPill(status, lastSyncAt) {
     const pill = document.getElementById('btn-sync-pill');
     if (!pill) return;
+
+    // Check if media is still uploading — override "Synced" label
+    const media = getMediaSyncStatus();
+    const mediaBusy = media.pending > 0 || media.active > 0;
+
     const m = STATUS_META[status] || STATUS_META.idle;
     let label = m.text;
-    if (status === 'idle' && lastSyncAt) label = `Synced · ${_relTime(lastSyncAt)}`;
-    pill.textContent = `${m.icon} ${label}`;
-    pill.style.color = m.color;
+    let color = m.color;
+    let icon  = m.icon;
+
+    if (status === 'idle' && mediaBusy) {
+        // JSON is synced but media files still uploading
+        icon  = '☁️';
+        label = `Uploading ${media.pending + media.active} file${(media.pending + media.active) > 1 ? 's' : ''}…`;
+        color = '#4285F4';
+    } else if (status === 'idle' && lastSyncAt) {
+        label = `Synced · ${_relTime(lastSyncAt)}`;
+    }
+
+    pill.textContent = `${icon} ${label}`;
+    pill.style.color = color;
 }
 
 // ---------------------------------------------------------------------------

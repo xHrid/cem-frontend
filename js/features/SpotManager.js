@@ -547,10 +547,10 @@ async function _showSpotDetails(spot) {
                     if (did) {
                         const src = getPublicUrl(did, 'image');
                         imgHtml += `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
-                        imgHtml += `<button class="on-demand-dl" data-drive-id="${did}" data-rel-path="${imgPath}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Image not on disk — download?</button>`;
+                        imgHtml += `<button class="on-demand-dl" data-drive-id="${did}" data-rel-path="${imgPath}" data-kind="image" style="font-size:0.72rem; background:none; border:none; padding:2px 8px; cursor:pointer; color:var(--text-muted); opacity:0.7;">☁️ Streaming from Drive · tap to save locally</button>`;
                         anyLocal = true; // prevent fallback
                     } else {
-                        imgHtml += `<p style="font-size:0.8rem; color:var(--text-muted);">Image not available locally</p>`;
+                        imgHtml += `<p style="font-size:0.8rem; color:var(--text-muted);">⏳ Image syncing to Drive…</p>`;
                     }
                 }
             }
@@ -558,7 +558,7 @@ async function _showSpotDetails(spot) {
             if (!anyLocal && entry.image_drive_id) {
                 const src = getPublicUrl(entry.image_drive_id, 'image');
                 imgHtml = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
-                imgHtml += `<button class="on-demand-dl" data-drive-id="${entry.image_drive_id}" data-rel-path="${entry.image_local_filename || ''}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Image not on disk — download?</button>`;
+                imgHtml += `<button class="on-demand-dl" data-drive-id="${entry.image_drive_id}" data-rel-path="${entry.image_local_filename || ''}" data-kind="image" style="font-size:0.72rem; background:none; border:none; padding:2px 8px; cursor:pointer; color:var(--text-muted); opacity:0.7;">☁️ Streaming from Drive · tap to save locally</button>`;
             }
             imgContainer.innerHTML = imgHtml;
         }
@@ -577,14 +577,14 @@ async function _showSpotDetails(spot) {
                     // Proxy adds CORS headers → inline <audio> playback works
                     audioContainer.innerHTML =
                         `<audio controls src="${dl}" style="width:100%;"></audio>` +
-                        `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Audio not on disk — download?</button>`;
+                        `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.72rem; background:none; border:none; padding:2px 8px; cursor:pointer; color:var(--text-muted); opacity:0.7;">☁️ Streaming from Drive · tap to save locally</button>`;
                 } else {
                     // No proxy — CORS blocks <audio>. Show download button.
                     audioContainer.innerHTML =
                         `<div class="on-demand-audio" style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-surface-alt, #f5f5f5); border-radius:8px; margin-top:4px;">` +
                             `<span style="font-size:1.1rem;">🎤</span>` +
-                            `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio not on disk</span>` +
-                            `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.82rem; padding:5px 12px; border-radius:6px; border:none; background:var(--forest, #2e7d32); color:#fff; cursor:pointer; font-weight:600;">⬇ Download</button>` +
+                            `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio on Drive only</span>` +
+                            `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.82rem; padding:5px 12px; border-radius:6px; border:none; background:var(--forest, #2e7d32); color:#fff; cursor:pointer; font-weight:600;">⬇ Save to device</button>` +
                             `<a href="${dl}" target="_blank" rel="noopener" style="font-size:0.78rem; color:var(--text-muted); text-decoration:none;" title="Open in browser">↗</a>` +
                         `</div>`;
                 }
