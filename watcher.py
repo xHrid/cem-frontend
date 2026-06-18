@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import ssl
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,34 +24,82 @@ from pathlib import Path
 from typing import Optional
 import re as _re
 
+# ---------------------------------------------------------------------------
+# SSL context — use system certificates so corporate proxies / custom CAs work.
+# Falls back to unverified context only if system certs unavailable.
+# ---------------------------------------------------------------------------
+_ssl_ctx = ssl.create_default_context()
+try:
+    import certifi
+    _ssl_ctx.load_verify_locations(cafile=certifi.where())
+except ImportError:
+    pass
+
+_opener = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=_ssl_ctx),
+    urllib.request.ProxyHandler(),  # reads HTTP(S)_PROXY env vars automatically
+)
+urllib.request.install_opener(_opener)
+
 
 # ---------------------------------------------------------------------------
 # Path utilities
 # ---------------------------------------------------------------------------
 
-def _win_to_wsl(path_str: str) -> str:
-    """Convert a Windows-style path to a WSL /mnt/ path if running under WSL.
+_IS_WSL = Path('/mnt').is_dir() and sys.platform != "darwin"
+_IS_WINDOWS = sys.platform == "win32"
 
-    E.g.  "D:/CEM-Cloud/data"  → "/mnt/d/CEM-Cloud/data"
-          "D:\\CEM-Cloud\\data" → "/mnt/d/CEM-Cloud/data"
 
-    If the path is already POSIX or we're not on WSL, returns it unchanged.
+def _normalize_path(path_str: str) -> str:
+    """Normalize a path for the *current* OS, handling cross-platform inputs.
+
+    Webapp stores paths with forward slashes (JS).  Windows uses backslashes.
+    WSL needs /mnt/d/... form.  This function accepts ANY mix and returns
+    a consistent native path string.
+
+    Rules:
+      - WSL  + Windows path  → /mnt/<drive>/...   (forward slashes)
+      - Windows + any path   → os.sep backslashes  (via Path)
+      - Linux/Mac + POSIX    → unchanged
     """
-    # Normalise backslashes first
+    if not path_str:
+        return path_str
+
+    # Unify separators to forward slashes for pattern matching
     norm = path_str.replace('\\', '/')
 
-    # Match a Windows drive letter at the start: D:/ or D:
+    # Detect Windows drive letter: D:/... or D:
     m = _re.match(r'^([A-Za-z]):(/.*)?$', norm)
-    if not m:
-        return path_str  # already a POSIX path or relative
 
-    # Only convert if /mnt exists (i.e. we're likely in WSL)
-    if not Path('/mnt').is_dir():
-        return path_str  # native Windows — keep as-is
+    if m and _IS_WSL:
+        # Convert  D:/foo/bar  →  /mnt/d/foo/bar
+        drive = m.group(1).lower()
+        rest  = m.group(2) or ''
+        return f'/mnt/{drive}{rest}'
 
-    drive = m.group(1).lower()
-    rest  = m.group(2) or ''
-    return f'/mnt/{drive}{rest}'
+    if _IS_WINDOWS:
+        # On native Windows, let Path normalize separators consistently.
+        # This handles both "D:/foo/bar" and "D:\\foo/bar" → "D:\\foo\\bar"
+        return str(Path(norm))
+
+    # POSIX (Linux / Mac) — just return with consistent forward slashes
+    return norm
+
+
+# Keep old name as alias for backward compat
+_win_to_wsl = _normalize_path
+
+_AUDIO_EXTS = frozenset({'.wav', '.mp3', '.flac', '.ogg', '.opus', '.m4a', '.wma', '.aac'})
+
+def _count_audio_files(directory: str) -> int:
+    """Count audio files recursively in a directory (for progress estimation)."""
+    try:
+        return sum(
+            1 for f in Path(directory).rglob('*')
+            if f.suffix.lower() in _AUDIO_EXTS
+        )
+    except (OSError, PermissionError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -499,17 +548,16 @@ class JobProcessor:
             resolved_dir_spots = []
             for idx, d in enumerate(job_data.get("datasets", [])):
                 spot_label = raw_dataset_spots[idx] if idx < len(raw_dataset_spots) else ""
-                p = (cfg.root_path / d).resolve()
+                # Normalize first, then try as relative to root, then as absolute
+                norm_d = _normalize_path(d)
+                p = (cfg.root_path / norm_d).resolve()
+                if not p.exists():
+                    p = Path(norm_d).resolve()
                 if p.exists():
                     resolved_dirs.append(str(p))
                     resolved_dir_spots.append(spot_label)
                 else:
-                    p2 = Path(_win_to_wsl(d)).resolve()  # may already be absolute
-                    if p2.exists():
-                        resolved_dirs.append(str(p2))
-                        resolved_dir_spots.append(spot_label)
-                    else:
-                        logger.warning("  dataset path not found: %s", d)
+                    logger.warning("  dataset path not found: %s (tried: %s)", d, p)
 
             # Each input_files entry is {"path": ..., "spot": ...} (newer webapp)
             # or a bare path string (back-compat). The spot travels alongside the
@@ -523,7 +571,7 @@ class JobProcessor:
                     raw, spot = entry, ""
                 if not raw:
                     continue
-                p = Path(_win_to_wsl(raw)).resolve()
+                p = Path(_normalize_path(raw)).resolve()
                 if p.exists():
                     resolved_files.append(str(p))
                     resolved_file_spots.append(spot or "")
@@ -545,10 +593,6 @@ class JobProcessor:
                     seen_d.add(d)
                     unique_dirs.append(d)
                     unique_dir_spots.append(sp)
-            if unique_dirs:
-                cmd.extend(["--datasets"] + unique_dirs)
-                if any(s for s in unique_dir_spots):
-                    cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
 
             # Dedup reference files while keeping each one's spot aligned.
             seen_f, unique_files, unique_file_spots = set(), [], []
@@ -557,10 +601,49 @@ class JobProcessor:
                     seen_f.add(pth)
                     unique_files.append(pth)
                     unique_file_spots.append(sp)
+
+            # Write large lists to temp files to avoid WinError 206
+            # ("filename or extension is too long") — Windows has a ~32k char
+            # command-line limit which 85k file paths easily exceed.
+            #
+            # Strategy: always write file lists to disk. Pass --*-file args
+            # pointing to those files. For small lists (< 50 items), also pass
+            # inline args for backward compat with older scripts.
+            job_tmp_dir = job_result_dir / "_tmp"
+            job_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            _INLINE_THRESHOLD = 50  # safe under any OS command-line limit
+
+            if unique_dirs:
+                dirs_file = job_tmp_dir / "datasets.txt"
+                dirs_file.write_text("\n".join(unique_dirs), encoding="utf-8")
+                cmd.extend(["--datasets-file", str(dirs_file)])
+                if len(unique_dirs) <= _INLINE_THRESHOLD:
+                    cmd.extend(["--datasets"] + unique_dirs)
+                if any(s for s in unique_dir_spots):
+                    spots_file = job_tmp_dir / "dataset_spots.txt"
+                    spots_file.write_text(
+                        "\n".join(s or "_" for s in unique_dir_spots),
+                        encoding="utf-8",
+                    )
+                    cmd.extend(["--dataset-spots-file", str(spots_file)])
+                    if len(unique_dir_spots) <= _INLINE_THRESHOLD:
+                        cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
+
             if unique_files:
-                cmd.extend(["--input-file-list"] + unique_files)
-                cmd.extend(["--input-file-spots"] + [s or "_" for s in unique_file_spots])
-                logger.info("  Reference files: %d", len(unique_files))
+                files_file = job_tmp_dir / "input_files.txt"
+                files_file.write_text("\n".join(unique_files), encoding="utf-8")
+                cmd.extend(["--input-file-list-file", str(files_file)])
+                if len(unique_files) <= _INLINE_THRESHOLD:
+                    cmd.extend(["--input-file-list"] + unique_files)
+                file_spots_file = job_tmp_dir / "input_file_spots.txt"
+                file_spots_file.write_text(
+                    "\n".join(s or "_" for s in unique_file_spots),
+                    encoding="utf-8",
+                )
+                cmd.extend(["--input-file-spots-file", str(file_spots_file)])
+                if len(unique_file_spots) <= _INLINE_THRESHOLD:
+                    cmd.extend(["--input-file-spots"] + [s or "_" for s in unique_file_spots])
 
             # 3. Unpack UI parameters (spots, start_date, end_date, snr_db, ...)
             for key, val in params.items():
@@ -582,40 +665,135 @@ class JobProcessor:
             if aggregate_path:
                 cmd.extend(["--aggregate-file", aggregate_path])
                 logger.info("  Aggregate: %s", aggregate_path)
-            processed_path = str(db_dir / f"processed_{script_name}.txt")
+            # Strip .py extension so we get "processed_birdnet_predictions.txt"
+            # instead of "processed_birdnet_predictions.py.txt"
+            script_stem = Path(script_name).stem
+            processed_path = str(db_dir / f"processed_{script_stem}.txt")
             cmd.extend(["--processed-file", processed_path])
 
-            logger.info("  Running %s in isolated venv...", script_name)
-            logger.info("  CMD: %s", " ".join(str(c) for c in cmd))
+            # ── Meaningful job summary instead of dumping the raw command ──
+            logger.info("  ┌─ Job Summary ─────────────────────────────")
+            logger.info("  │ Script:          %s", script_name)
+            logger.info("  │ Dataset dirs:    %d", len(unique_dirs))
+            logger.info("  │ Reference files: %d", len(unique_files))
+            if unique_dir_spots:
+                spot_names = sorted(set(s for s in unique_dir_spots if s and s != "_"))
+                logger.info("  │ Spots:           %s", ", ".join(spot_names) if spot_names else "(none)")
+            param_strs = [f"{k}={v}" for k, v in params.items()]
+            if param_strs:
+                logger.info("  │ Params:          %s", ", ".join(param_strs))
+            logger.info("  └─────────────────────────────────────────")
+            logger.debug("  Full CMD: %s", " ".join(str(c) for c in cmd))
             self.setup.update_heartbeat("processing_job")
 
-            start_time = time.time()
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=cfg.job_timeout,
+            total_files = len(unique_files) + sum(
+                _count_audio_files(d) for d in unique_dirs
             )
-            execution_duration = time.time() - start_time
 
-            if result.returncode == 0:
-                logger.info("  Success! (%.2fs)", execution_duration)
-                (job_result_dir / "stdout.log").write_text(result.stdout)
+            start_time = time.time()
+            stdout_log = []
+            stderr_log = []
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,       # line-buffered
+            )
+
+            # ── Stream stdout with live progress bar ──────────────────
+            files_done = 0
+            last_pct   = -1
+            _PROG_RE   = _re.compile(
+                r'(?:processing|analyzing|analysing|processed|done)[:\s]*(\d+)',
+                _re.IGNORECASE,
+            )
+            _FILE_DONE_RE = _re.compile(
+                r'(?:saved|wrote|finished|complete|done|processed)\b',
+                _re.IGNORECASE,
+            )
+
+            try:
+                for line in proc.stdout:
+                    stdout_log.append(line)
+                    stripped = line.rstrip()
+
+                    # Try to extract explicit count from script output
+                    m = _PROG_RE.search(stripped)
+                    if m:
+                        files_done = int(m.group(1))
+                    elif _FILE_DONE_RE.search(stripped):
+                        files_done += 1
+
+                    # Render progress bar
+                    if total_files > 0:
+                        pct = min(int(files_done * 100 / total_files), 100)
+                    else:
+                        pct = 0
+
+                    if pct != last_pct:
+                        bar_w   = 30
+                        filled  = int(bar_w * pct / 100)
+                        bar     = '█' * filled + '░' * (bar_w - filled)
+                        elapsed = time.time() - start_time
+                        eta_str = ""
+                        if pct > 0 and pct < 100:
+                            eta_sec = elapsed / pct * (100 - pct)
+                            eta_m, eta_s = divmod(int(eta_sec), 60)
+                            eta_str = f" ETA {eta_m}m{eta_s:02d}s"
+                        # \r overwrite on terminals, logged as INFO for file loggers
+                        print(
+                            f"\r  ⏳ [{bar}] {pct:3d}% "
+                            f"({files_done}/{total_files}) "
+                            f"{int(elapsed)}s elapsed{eta_str}   ",
+                            end="", flush=True,
+                        )
+                        last_pct = pct
+
+                proc.wait(timeout=cfg.job_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise
+
+            # Read any remaining stderr
+            stderr_text = proc.stderr.read()
+            if stderr_text:
+                stderr_log.append(stderr_text)
+
+            # Final newline after progress bar
+            print()
+
+            execution_duration = time.time() - start_time
+            stdout_text = "".join(stdout_log)
+            stderr_combined = "".join(stderr_log)
+
+            # Clean up temp list files
+            if job_tmp_dir.exists():
+                shutil.rmtree(job_tmp_dir, ignore_errors=True)
+
+            if proc.returncode == 0:
+                elapsed_m, elapsed_s = divmod(int(execution_duration), 60)
+                logger.info(
+                    "  ✅ Done! %d files in %dm%02ds (%.1f files/sec)",
+                    files_done or total_files,
+                    elapsed_m, elapsed_s,
+                    (files_done or total_files) / max(execution_duration, 0.1),
+                )
+                (job_result_dir / "stdout.log").write_text(stdout_text)
 
                 # Write execution stats
                 stats_data = {
                     "execution_time_seconds": execution_duration,
-                    "execution_time_formatted": (
-                        f"{int(execution_duration // 60)}m "
-                        f"{int(execution_duration % 60)}s"
+                    "execution_time_formatted": f"{elapsed_m}m {elapsed_s}s",
+                    "files_processed": files_done or total_files,
+                    "files_per_second": round(
+                        (files_done or total_files) / max(execution_duration, 0.1), 2
                     ),
                 }
                 with open(job_result_dir / "run_stats.json", "w") as fh:
                     json.dump(stats_data, fh)
-
-                # No UI cache to write: the script maintains its own
-                # processed_<script>.txt (single source of truth) and the
-                # frontend reads that directly.
 
                 shutil.move(
                     str(processing_path),
@@ -623,18 +801,16 @@ class JobProcessor:
                 )
             else:
                 logger.error(
-                    "  Failed after %.2fs (code %d)",
+                    "  ❌ Failed after %.2fs (code %d)",
                     execution_duration,
-                    result.returncode,
+                    proc.returncode,
                 )
-                # Combine stderr + stdout so error messages aren't lost
-                # (scripts often print errors to stdout before sys.exit(1))
-                error_text = result.stderr or ""
-                if result.stdout:
+                error_text = stderr_combined
+                if stdout_text:
                     error_text += (
-                        "\n--- stdout ---\n" + result.stdout
+                        "\n--- stdout ---\n" + stdout_text
                         if error_text
-                        else result.stdout
+                        else stdout_text
                     )
                 (job_result_dir / "error.log").write_text(error_text)
                 raise RuntimeError("Script execution failed. Check error.log")

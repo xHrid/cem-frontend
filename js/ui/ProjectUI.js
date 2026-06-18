@@ -307,10 +307,13 @@ function _initImportMediaForm() {
             };
 
             if (importAsRef) {
-                // Build descriptors, then batch-import in one shot
+                // Build descriptors, then batch-import in one shot.
+                // Normalize all separators to forward slashes so paths are
+                // consistent regardless of OS the webapp runs on.
+                const normBase = baseDir.replace(/\\/g, '/');
                 const descriptors = files.map(file => {
-                    const relPart = file.webkitRelativePath || file.name;
-                    return { name: file.name, path: baseDir + '/' + relPart, type: file.type };
+                    const relPart = (file.webkitRelativePath || file.name).replace(/\\/g, '/');
+                    return { name: file.name, path: normBase + '/' + relPart, type: file.type };
                 });
                 await saveExternalFilesByReferenceBatch(
                     descriptors, selectedSpotIds, importDate, progressCb
