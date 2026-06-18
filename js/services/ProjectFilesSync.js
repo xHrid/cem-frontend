@@ -47,7 +47,14 @@ const _unfetchable = new Set();
 export function enumerateFileRefs(project) {
     const refs = [];
     for (const s of (project.spots || [])) {
-        if (s.image_local_filename) refs.push({ relPath: s.image_local_filename, driveId: s.image_drive_id || null, kind: 'image' });
+        // Multi-image support: iterate images[] with parallel drive IDs
+        const imgPaths = s.images && s.images.length > 0
+            ? s.images
+            : (s.image_local_filename ? [s.image_local_filename] : []);
+        const imgDriveIds = s.image_drive_ids || [];
+        for (let i = 0; i < imgPaths.length; i++) {
+            refs.push({ relPath: imgPaths[i], driveId: imgDriveIds[i] || (i === 0 ? s.image_drive_id : null) || null, kind: 'image' });
+        }
         if (s.audio_local_filename) refs.push({ relPath: s.audio_local_filename, driveId: s.audio_drive_id || null, kind: 'audio' });
     }
     for (const st of (project.sites || [])) {

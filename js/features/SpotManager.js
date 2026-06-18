@@ -43,6 +43,7 @@ import { showToast }                 from '../ui/Toast.js';
 import { openModal, closeModal }     from '../ui/ModalManager.js';
 import { downscaleImage }            from '../data/imageUtils.js';
 import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
+import { getUserEmail } from '../services/AuthService.js';
 
 // ---------------------------------------------------------------------------
 // Module-private state
@@ -425,7 +426,7 @@ async function _showSpotDetails(spot) {
                 <button class="edit-spot-entry-btn" data-spot-id="${entry.spotId}" title="Edit this observation">✏️</button>
                 <button class="delete-spot-entry-btn" data-spot-id="${entry.spotId}" title="Delete this observation">🗑</button>
                 <span class="entry-index">Entry ${idx + 1}</span>
-                ${(() => { const ce = entry.created_by || ''; const se = ce.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); return ce ? '<span class="creator-pill" title="' + se + '" tabindex="0">\u{1F464} ' + se + '</span>' : ''; })()}
+                ${(() => { const ce = entry.created_by || ''; const me = getUserEmail() || ''; const isMe = !ce || ce === me; const label = isMe ? 'You' : ce; const se = label.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); return '<span class="creator-pill' + (isMe ? ' is-me' : '') + '" title="' + se + '" tabindex="0">\u{1F464} ' + se + '</span>'; })()}
                 <span class="entry-date"></span>
                 <div class="entry-field"><span class="k">Coordinates</span><span class="entry-coords" style="font-family:var(--font-mono); font-size:0.82rem;"></span></div>
                 <div class="entry-field"><span class="k">Notes</span><span class="entry-desc"></span></div>
@@ -532,25 +533,32 @@ async function _showSpotDetails(spot) {
 
         if ((imgPaths.length > 0 || entry.image_drive_id) && imgContainer) {
             let imgHtml = '';
+            const driveIds = entry.image_drive_ids || [];
             let anyLocal = false;
-            for (const imgPath of imgPaths) {
+            for (let imgI = 0; imgI < imgPaths.length; imgI++) {
+                const imgPath = imgPaths[imgI];
                 const url = await getLocalFileUrl(imgPath);
                 if (url) {
                     imgHtml += `<img src="${url}" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
                     anyLocal = true;
+                } else {
+                    // Not local — try Drive ID for this specific image
+                    const did = driveIds[imgI] || (imgI === 0 ? entry.image_drive_id : null);
+                    if (did) {
+                        const src = getPublicUrl(did, 'image');
+                        imgHtml += `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
+                        imgHtml += `<button class="on-demand-dl" data-drive-id="${did}" data-rel-path="${imgPath}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Image not on disk — download?</button>`;
+                        anyLocal = true; // prevent fallback
+                    } else {
+                        imgHtml += `<p style="font-size:0.8rem; color:var(--text-muted);">Image not available locally</p>`;
+                    }
                 }
-                // Not local — will fall through to Drive URL below
             }
-            // No local images but a Drive ID exists → show from public URL
-            // (images don't have CORS issues with <img> tags)
+            // All images missing locally but legacy single Drive ID exists
             if (!anyLocal && entry.image_drive_id) {
                 const src = getPublicUrl(entry.image_drive_id, 'image');
                 imgHtml = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
-                // Offer to cache locally
-                imgHtml += `<button class="on-demand-dl" data-drive-id="${entry.image_drive_id}" data-rel-path="${entry.image_local_filename || ''}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
-            } else if (!anyLocal && imgPaths.length > 0) {
-                // Has paths but not on disk and no drive_id
-                imgHtml = `<p style="font-size:0.8rem; color:var(--text-muted);">Image not available locally</p>`;
+                imgHtml += `<button class="on-demand-dl" data-drive-id="${entry.image_drive_id}" data-rel-path="${entry.image_local_filename || ''}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Image not on disk — download?</button>`;
             }
             imgContainer.innerHTML = imgHtml;
         }
@@ -569,13 +577,13 @@ async function _showSpotDetails(spot) {
                     // Proxy adds CORS headers → inline <audio> playback works
                     audioContainer.innerHTML =
                         `<audio controls src="${dl}" style="width:100%;"></audio>` +
-                        `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
+                        `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">Audio not on disk — download?</button>`;
                 } else {
                     // No proxy — CORS blocks <audio>. Show download button.
                     audioContainer.innerHTML =
                         `<div class="on-demand-audio" style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-surface-alt, #f5f5f5); border-radius:8px; margin-top:4px;">` +
                             `<span style="font-size:1.1rem;">🎤</span>` +
-                            `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio on Drive</span>` +
+                            `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio not on disk</span>` +
                             `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.82rem; padding:5px 12px; border-radius:6px; border:none; background:var(--forest, #2e7d32); color:#fff; cursor:pointer; font-weight:600;">⬇ Download</button>` +
                             `<a href="${dl}" target="_blank" rel="noopener" style="font-size:0.78rem; color:var(--text-muted); text-decoration:none;" title="Open in browser">↗</a>` +
                         `</div>`;

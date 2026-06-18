@@ -137,7 +137,11 @@ async function _catchUpUnsyncedMedia() {
     // Gather all media paths for active project
     const mediaPaths = [];
     for (const spot of (project.spots || [])) {
-        if (spot.image_local_filename) mediaPaths.push(spot.image_local_filename);
+        // Multi-image: iterate images[] array
+        const imgPaths = spot.images && spot.images.length > 0
+            ? spot.images
+            : (spot.image_local_filename ? [spot.image_local_filename] : []);
+        for (const p of imgPaths) mediaPaths.push(p);
         if (spot.audio_local_filename) mediaPaths.push(spot.audio_local_filename);
     }
     for (const site of (project.sites || [])) {
@@ -412,8 +416,22 @@ function _recordDriveId(project, relPath, fileId) {
     // dropped on merge and the media never shows on the other side).
     const now = new Date().toISOString();
     for (const spot of (project.spots || [])) {
-        if (spot.image_local_filename === relPath && spot.image_drive_id !== fileId) {
-            spot.image_drive_id = fileId; spot.timestamp = now; changed = true;
+        // Multi-image: check images[] array first, then legacy single field
+        const imgPaths = spot.images && spot.images.length > 0
+            ? spot.images
+            : (spot.image_local_filename ? [spot.image_local_filename] : []);
+        const imgIdx = imgPaths.indexOf(relPath);
+        if (imgIdx >= 0) {
+            if (!spot.image_drive_ids) spot.image_drive_ids = [];
+            // Pad array to match index
+            while (spot.image_drive_ids.length < imgPaths.length) spot.image_drive_ids.push(null);
+            if (spot.image_drive_ids[imgIdx] !== fileId) {
+                spot.image_drive_ids[imgIdx] = fileId;
+                // Keep legacy field in sync with first image
+                if (imgIdx === 0) spot.image_drive_id = fileId;
+                spot.timestamp = now;
+                changed = true;
+            }
         }
         if (spot.audio_local_filename === relPath && spot.audio_drive_id !== fileId) {
             spot.audio_drive_id = fileId; spot.timestamp = now; changed = true;

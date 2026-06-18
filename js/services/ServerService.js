@@ -303,6 +303,13 @@ export async function runJobOnServer(opts) {
         record.finished_at = new Date().toISOString();
         record.result_count = saved;
         await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'completed');
+
+        // Fold into project.jobs[] so shared projects sync job records
+        try {
+            const { recordCompletedJobs } = await import('./ProjectFilesSync.js');
+            await recordCompletedJobs(project);
+        } catch (e) { console.warn('[ServerService] recordCompletedJobs:', e.message); }
+
         EventBus.emit(EVENTS.DATA_UPDATED, null);
 
         onProgress(`Done — ${saved} file(s) downloaded.`);
