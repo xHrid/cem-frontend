@@ -31,7 +31,7 @@ import { showToast } from './Toast.js';
 import { openModal, closeModal } from './ModalManager.js';
 import { getActiveProject } from '../data/MasterData.js';
 import { revokeObjectUrls } from '../data/StorageAdapter.js';
-import { recordCompletedJobs, materializeProjectFiles } from '../services/ProjectFilesSync.js';
+import { recordCompletedJobs, downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 
 // ---------------------------------------------------------------------------
 // Module-private state — DOM element cache (lazy)
@@ -125,13 +125,11 @@ export async function openJobsModal() {
     if (els.viewerContent)     els.viewerContent.style.display     = 'none';
 
     // Fold any newly-completed jobs into the project (queues their results for
-    // upload + share when shared), then pull down shared results we lack locally
-    // — so the list + previews render from local files for owner AND collaborators.
+    // upload + share when shared). Pull is on-demand — no materializeProjectFiles.
     try {
         const active = getActiveProject();
         if (active) {
             await recordCompletedJobs(active);
-            await materializeProjectFiles(active);
         }
     } catch (e) {
         console.warn('[JobsDashboard] job/result sync skipped:', e.message);
@@ -247,15 +245,37 @@ async function _renderJobDetails(job, statusColor) {
     els.viewerFileList.innerHTML = "<span style='color:var(--text-muted);'>Loading output files...</span>";
 
     if (job.current_status === 'completed' || job.current_status === 'failed') {
-        const files = await getJobResultFiles(job.job_id);
+        // Local result files on disk
+        const localFiles = await getJobResultFiles(job.job_id);
+
+        // Merge with project-level job records (which carry drive_id for shared files)
+        const project  = getActiveProject();
+        const projJob  = (project?.jobs || []).find(j => j.job_id === job.job_id);
+        const driveMap = new Map(); // rel_path → drive_id
+        for (const rf of (projJob?.result_files || [])) {
+            if (rf.rel_path && rf.drive_id) driveMap.set(rf.rel_path, rf.drive_id);
+        }
+
+        // Enrich local files with drive_id; add Drive-only files not on disk
+        const enriched = localFiles.map(f => ({
+            ...f,
+            drive_id: driveMap.get(f.path) || null
+        }));
+        const localPaths = new Set(localFiles.map(f => f.path));
+        for (const rf of (projJob?.result_files || [])) {
+            if (rf.rel_path && !localPaths.has(rf.rel_path)) {
+                enriched.push({ name: rf.name || rf.rel_path.split('/').pop(), path: rf.rel_path, drive_id: rf.drive_id || null });
+            }
+        }
+
         els.viewerFileList.innerHTML = '';
 
-        if (files.length === 0) {
+        if (enriched.length === 0) {
             els.viewerFileList.innerHTML = "<span style='color:var(--text-muted);'>No output files found.</span>";
             return;
         }
 
-        files.forEach(file => {
+        enriched.forEach(file => {
             const btn       = document.createElement('button');
             btn.textContent = file.name;
             btn.className   = 'job-file-chip';
@@ -264,6 +284,12 @@ async function _renderJobDetails(job, statusColor) {
             if (file.name.endsWith('.csv'))                               btn.style.borderColor = '#3f8f4f';
             if (file.name.endsWith('.log'))                               btn.style.borderColor = 'var(--danger-red)';
             if (file.name.endsWith('.png') || file.name.endsWith('.jpg')) btn.style.borderColor = 'var(--sky)';
+
+            // Dim chip if file is Drive-only (not on disk)
+            if (!localPaths.has(file.path) && file.drive_id) {
+                btn.style.opacity = '0.7';
+                btn.title = 'On Drive — click to download & preview';
+            }
 
             btn.addEventListener('click', () => _previewFile(file));
             els.viewerFileList.appendChild(btn);
@@ -284,7 +310,9 @@ async function _renderJobDetails(job, statusColor) {
  *    dark pre-formatted block
  *  - Everything else — download link fallback
  *
- * @param {{ name: string, path: string }} file
+ * If the file isn't on disk but has a drive_id, offers on-demand download.
+ *
+ * @param {{ name: string, path: string, drive_id?: string }} file
  * @private
  */
 async function _previewFile(file) {
@@ -293,8 +321,33 @@ async function _previewFile(file) {
     els.viewerPreview.innerHTML = "<p style='color:var(--text-muted); text-align:center;'>Loading preview...</p>";
 
     try {
-        const url = await getLocalFileUrl(file.path);
-        if (!url) throw new Error('Could not generate local file URL');
+        let url = await getLocalFileUrl(file.path);
+
+        // Not local — try on-demand download if we have a drive_id
+        if (!url && file.drive_id) {
+            const kind = /\.(png|jpe?g)$/i.test(file.name) ? 'image' : 'result';
+            const result = await downloadMediaFile(file.drive_id, file.path, kind);
+            if (result) {
+                url = result.url;
+                showToast('File downloaded.', 'success');
+            }
+        }
+
+        // Still no URL — show Drive-only fallback
+        if (!url) {
+            if (file.drive_id) {
+                const dl = getPublicUrl(file.drive_id, 'result');
+                els.viewerPreview.innerHTML = `
+                    <div style="text-align:center; padding:40px;">
+                        <p style="color:var(--text-muted);">File is on Drive but could not be fetched (CORS).</p>
+                        <a href="${dl}" target="_blank" rel="noopener" style="display:inline-block; margin-top:10px; padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download from Drive ↗</a>
+                    </div>
+                `;
+            } else {
+                els.viewerPreview.innerHTML = `<p style='color:var(--text-muted); text-align:center;'>File not available locally or on Drive.</p>`;
+            }
+            return;
+        }
 
         // ── Image preview ────────────────────────────────────────────────────
         if (/\.(png|jpe?g)$/i.test(file.name)) {

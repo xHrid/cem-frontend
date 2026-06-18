@@ -4,8 +4,12 @@ master_data.json
 media/
 spots/
 sites/
+cloudflare-proxy/
 
 # 2. Ignore System Files
 .DS_Store
 Thumbs.db
 js/core/Config.js
+
+.gitignore
+FILE_MAP.md

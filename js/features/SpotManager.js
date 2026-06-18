@@ -33,6 +33,7 @@
  *   showToast                 → ../ui/Toast.js
  */
 
+import Config                         from '../core/Config.js';
 import EventBus, { EVENTS }          from '../core/EventBus.js';
 import { saveSpot, updateSpot, getLocalFileUrl, deleteSpot, deleteExternalFile } from '../data/Repository.js';
 import { getSpots, getExternalFiles, getActiveProjectId } from '../data/MasterData.js';
@@ -41,6 +42,7 @@ import { getMap, getCurrentPosition } from './MapManager.js';
 import { showToast }                 from '../ui/Toast.js';
 import { openModal, closeModal }     from '../ui/ModalManager.js';
 import { downscaleImage }            from '../data/imageUtils.js';
+import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 
 // ---------------------------------------------------------------------------
 // Module-private state
@@ -53,25 +55,7 @@ let _spotsLayer = null;
  *  background data refresh (sync also emits PROJECT_CHANGED). */
 let _lastProjectId = null;
 
-/**
- * Build a PUBLIC (unauthenticated) hot-link URL for a Drive media file.
- *
- * Why not the Drive API: this app uses the drive.file scope, which only grants
- * API access to files THIS user created or opened via the Picker. A
- * collaborator's media (e.g. an editor's photo viewed on the owner's side) is
- * NOT in that set, so files.get?alt=media returns 404. Those files ARE made
- * link-public at share/sync time, so the public hot-link URL works
- * cross-account without the API.
- *
- * @param {string} fileId  Drive file ID (link-public).
- * @param {'image'|'audio'} kind
- * @returns {string}
- */
-function _drivePublicUrl(fileId, kind) {
-    return kind === 'image'
-        ? `https://drive.google.com/thumbnail?id=${fileId}&sz=w1600`
-        : `https://drive.usercontent.google.com/download?id=${fileId}&export=download`;
-}
+// _drivePublicUrl is now the shared getPublicUrl() from ProjectFilesSync.
 
 // Audio recording state — encapsulated here (Bug 3 fix)
 /** @type {MediaRecorder|null} */
@@ -540,30 +524,38 @@ async function _showSpotDetails(spot) {
     for (let idx = 0; idx < spotEntries.length; idx++) {
         const entry = spotEntries[idx];
 
+        // ── Images ──────────────────────────────────────────────────────────
         const imgContainer = content.querySelector(`.media-container-img-${idx}`);
-        // Multi-image: prefer `images` array, fall back to single `image_local_filename`
         const imgPaths = entry.images && entry.images.length > 0
             ? entry.images
             : (entry.image_local_filename ? [entry.image_local_filename] : []);
 
         if ((imgPaths.length > 0 || entry.image_drive_id) && imgContainer) {
             let imgHtml = '';
+            let anyLocal = false;
             for (const imgPath of imgPaths) {
                 const url = await getLocalFileUrl(imgPath);
                 if (url) {
                     imgHtml += `<img src="${url}" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
-                } else {
-                    imgHtml += `<p style="font-size:0.8rem; color:red;">Image file missing from disk</p>`;
+                    anyLocal = true;
                 }
+                // Not local — will fall through to Drive URL below
             }
-            // If no local images loaded but a Drive ID exists, show that
-            if (!imgHtml && entry.image_drive_id) {
-                const src = _drivePublicUrl(entry.image_drive_id, 'image');
+            // No local images but a Drive ID exists → show from public URL
+            // (images don't have CORS issues with <img> tags)
+            if (!anyLocal && entry.image_drive_id) {
+                const src = getPublicUrl(entry.image_drive_id, 'image');
                 imgHtml = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
+                // Offer to cache locally
+                imgHtml += `<button class="on-demand-dl" data-drive-id="${entry.image_drive_id}" data-rel-path="${entry.image_local_filename || ''}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
+            } else if (!anyLocal && imgPaths.length > 0) {
+                // Has paths but not on disk and no drive_id
+                imgHtml = `<p style="font-size:0.8rem; color:var(--text-muted);">Image not available locally</p>`;
             }
             imgContainer.innerHTML = imgHtml;
         }
 
+        // ── Audio (on-demand: CORS blocks public URL playback) ──────────────
         const audioContainer = content.querySelector(`.media-container-audio-${idx}`);
         if ((entry.audio_local_filename || entry.audio_drive_id) && audioContainer) {
             const url = entry.audio_local_filename
@@ -572,20 +564,53 @@ async function _showSpotDetails(spot) {
             if (url) {
                 audioContainer.innerHTML = `<audio controls src="${url}" style="width:100%;"></audio>`;
             } else if (entry.audio_drive_id) {
-                // drive.file can't fetch a collaborator's audio via the API
-                // (404), so play the link-public file directly. Two hosts + a
-                // download link in case inline playback is blocked.
-                const dl = `https://drive.usercontent.google.com/download?id=${entry.audio_drive_id}&export=download`;
-                const uc = `https://drive.google.com/uc?export=download&id=${entry.audio_drive_id}`;
-                audioContainer.innerHTML =
-                    `<audio controls style="width:100%;">` +
-                        `<source src="${dl}">` +
-                        `<source src="${uc}">` +
-                    `</audio>` +
-                    `<a href="${dl}" target="_blank" rel="noopener" style="font-size:0.8rem; display:inline-block; margin-top:4px;">Open audio ↗</a>`;
+                const dl = getPublicUrl(entry.audio_drive_id, 'audio');
+                if (Config.proxy?.workerUrl) {
+                    // Proxy adds CORS headers → inline <audio> playback works
+                    audioContainer.innerHTML =
+                        `<audio controls src="${dl}" style="width:100%;"></audio>` +
+                        `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
+                } else {
+                    // No proxy — CORS blocks <audio>. Show download button.
+                    audioContainer.innerHTML =
+                        `<div class="on-demand-audio" style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-surface-alt, #f5f5f5); border-radius:8px; margin-top:4px;">` +
+                            `<span style="font-size:1.1rem;">🎤</span>` +
+                            `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio on Drive</span>` +
+                            `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.82rem; padding:5px 12px; border-radius:6px; border:none; background:var(--forest, #2e7d32); color:#fff; cursor:pointer; font-weight:600;">⬇ Download</button>` +
+                            `<a href="${dl}" target="_blank" rel="noopener" style="font-size:0.78rem; color:var(--text-muted); text-decoration:none;" title="Open in browser">↗</a>` +
+                        `</div>`;
+                }
             }
         }
     }
+
+    // Wire up on-demand download buttons
+    content.querySelectorAll('.on-demand-dl').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const { driveId, relPath, kind } = btn.dataset;
+            if (!driveId) return;
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+            try {
+                const result = await downloadMediaFile(driveId, relPath, kind);
+                if (result) {
+                    showToast('Downloaded — rendering.', 'success');
+                    _showSpotDetails(spot); // re-render with local file
+                } else {
+                    // CORS blocked — open download link in new tab
+                    const dl = getPublicUrl(driveId, kind);
+                    window.open(dl, '_blank');
+                    showToast('Opened download in new tab.', 'info');
+                    btn.disabled = false;
+                    btn.textContent = '⬇ Download';
+                }
+            } catch (err) {
+                showToast(`Download failed: ${err.message}`, 'failed');
+                btn.disabled = false;
+                btn.textContent = '⬇ Download';
+            }
+        });
+    });
 }
 
 /**
@@ -613,7 +638,7 @@ async function _beginEntryEdit(spot, entry, div) {
     }
     // Drive-only fallback (single image)
     if (existingImages.length === 0 && entry.image_drive_id) {
-        existingImages.push({ path: '__drive__', src: _drivePublicUrl(entry.image_drive_id, 'image') });
+        existingImages.push({ path: '__drive__', src: getPublicUrl(entry.image_drive_id, 'image') });
     }
 
     // State: tracks deletions + new additions

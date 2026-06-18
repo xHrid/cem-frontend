@@ -29,6 +29,9 @@
 # Optional (override the analysis script repo; defaults to the main repo):
 #   ANALYSIS_REPO_URL  Raw GitHub content URL, no trailing slash.
 #
+# Optional (Cloudflare Worker CORS proxy for Drive media + COG access):
+#   CORS_PROXY_URL     e.g. https://cem-proxy.cem-cors.workers.dev
+#
 # appId (Cloud project number) is derived from the client ID's leading segment.
 
 set -e
@@ -38,6 +41,9 @@ APP_ID="${GOOGLE_CLIENT_ID%%-*}"
 
 # Default the analysis repo if not provided.
 ANALYSIS_REPO_URL="${ANALYSIS_REPO_URL:-https://raw.githubusercontent.com/xHrid/cem-backend/refs/heads/master}"
+
+# Default the CORS proxy (hardcoded fallback matches the deployed worker).
+CORS_PROXY_URL="${CORS_PROXY_URL:-https://cem-proxy.cem-cors.workers.dev}"
 
 # Strip any trailing slash the user may have added to the server URL.
 SERVER_BASE_URL="${SERVER_BASE_URL%/}"
@@ -80,6 +86,9 @@ const Config = deepFreeze({
     server: {
         baseUrl: '${SERVER_BASE_URL}',
     },
+    proxy: {
+        workerUrl: '${CORS_PROXY_URL}',
+    },
     ui: {
         toastDuration: 3000,
     },
@@ -98,3 +107,4 @@ echo "Configuration file generated successfully at js/core/Config.js"
 echo "  google.clientId    : ${GOOGLE_CLIENT_ID:-(unset!)}"
 echo "  google.pickerApiKey: ${PICKER_API_KEY:+set}"
 echo "  server.baseUrl     : ${SERVER_BASE_URL:-(unset — server mode disabled)}"
+echo "  proxy.workerUrl    : ${CORS_PROXY_URL}"

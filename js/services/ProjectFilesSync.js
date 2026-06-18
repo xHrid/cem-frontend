@@ -1,22 +1,32 @@
 /**
  * ProjectFilesSync.js — One model for syncing ALL project file artifacts
  *
- * Single source of truth: project_data.json lists every file a project owns —
- * spot photos/audio, site KML, and (new) completed-job records with their
- * result files. Each entry carries a Drive file ID. When the project is shared
- * those files are made link-public (by SharedMediaSync), so a collaborator can
- * download the bytes from the public URL into their OWN local storage and the
- * existing render code (spot popups, Jobs dashboard) works unchanged — no
- * "open file" buttons, no per-account Drive API access required.
+ * Architecture (v3 — on-demand pull):
+ *   project_data.json lists every file a project owns — spot photos/audio,
+ *   site KML, and completed-job records with their result files. Each entry
+ *   carries a Drive file ID. When the project is shared those files are made
+ *   link-public (by SharedMediaSync).
+ *
+ *   PUSH is automatic: SharedMediaSync uploads media + publishes + stamps
+ *   drive_id back on the entity record.
+ *
+ *   PULL is on-demand: the UI shows a placeholder for files that are on Drive
+ *   but not local, with a download button. Clicking it calls
+ *   downloadMediaFile() which fetches the blob (API for own files, public URL
+ *   for cross-account images), saves it locally, and returns a local URL.
+ *   For audio/text where CORS blocks the public download host, we fall back
+ *   to opening the file in a new tab so the user can save it manually.
  *
  * Exports:
- *   enumerateFileRefs(project)      — every {relPath, driveId, kind} the project references
- *   recordCompletedJobs(project)    — owner: fold completed jobs + results into project.jobs[]
- *   materializeProjectFiles(project)— download any drive_id'd file missing locally
- *   reconcileProjectFiles(project)  — materialize (pull) + push local-only files (bidirectional)
+ *   enumerateFileRefs(project)        — every {relPath, driveId, kind} the project references
+ *   recordCompletedJobs(project)      — owner: fold completed jobs + results into project.jobs[]
+ *   downloadMediaFile(driveId, relPath, kind) — on-demand single-file download
+ *   getPublicUrl(driveId, kind)       — public hot-link URL for display / download
+ *   reconcileProjectFiles(project)    — push local-only files (upload direction only)
  */
 
 import EventBus, { EVENTS } from '../core/EventBus.js';
+import Config from '../core/Config.js';
 import * as DriveService from './DriveService.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
 import * as MasterData from '../data/MasterData.js';
@@ -24,90 +34,8 @@ import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
 import { getAllJobs, getJobResultFiles } from '../data/Repository.js';
 
-/** Drive IDs that failed to fetch this session — skip to avoid hammering each poll. */
+/** Drive IDs that failed to fetch this session — skip to avoid hammering. */
 const _unfetchable = new Set();
-
-/**
- * Max per-file size to inline as base64 inside project_data.json. A collaborator
- * under drive.file can ONLY read the project_data.json they picked (API 404s on
- * the owner's other files; the public download host has no CORS header). So the
- * bytes of small media/results travel inline in that one readable file, and are
- * decoded to local files on the other side. Larger files are skipped (rare).
- */
-const MAX_INLINE_BYTES = 25 * 1024 * 1024;
-
-/** Blob -> "data:<mime>;base64,..." string. */
-function _blobToDataUri(blob) {
-    return new Promise((resolve, reject) => {
-        const r = new FileReader();
-        r.onload  = () => resolve(r.result);
-        r.onerror = () => reject(r.error);
-        r.readAsDataURL(blob);
-    });
-}
-
-/** "data:...;base64,..." -> Blob (fetch on a data: URI is local, no CORS). */
-async function _dataUriToBlob(dataUri) {
-    const res = await fetch(dataUri);
-    return await res.blob();
-}
-
-/**
- * Build the inline_files map for a project: { relPath -> dataURI } for every
- * referenced file present locally and under the size cap. Keys are remapped via
- * remapKey so they match the namespace used inside project_data.json (the
- * owner's folder name).
- *
- * @param {object} project
- * @param {(relPath:string)=>string} [remapKey]  local relPath -> json-key relPath
- * @returns {Promise<Object<string,string>>}
- */
-export async function buildInlineFiles(project, remapKey) {
-    const out = {};
-    for (const ref of enumerateFileRefs(project)) {
-        try {
-            const blob = await StorageAdapter.getFileBlob(ref.relPath);
-            if (!blob || blob.size === 0 || blob.size > MAX_INLINE_BYTES) continue;
-            const key = remapKey ? remapKey(ref.relPath) : ref.relPath;
-            out[key] = await _blobToDataUri(blob);
-        } catch (e) {
-            console.warn(`[ProjectFilesSync] inline encode failed "${ref.relPath}":`, e.message);
-        }
-    }
-    return out;
-}
-
-/**
- * Decode an inline_files map to local files (skips ones already present).
- * Keys are remapped via remapToLocal to this device's folder namespace.
- *
- * @param {Object<string,string>} inlineMap  { relPath -> dataURI }
- * @param {(relPath:string)=>string} [remapToLocal]  json-key relPath -> local relPath
- * @returns {Promise<number>} files written
- */
-export async function applyInlineFiles(inlineMap, remapToLocal) {
-    if (!inlineMap || typeof inlineMap !== 'object') return 0;
-    let n = 0;
-    for (const [key, dataUri] of Object.entries(inlineMap)) {
-        try {
-            const localPath = remapToLocal ? remapToLocal(key) : key;
-            if (await StorageAdapter.checkFileExists(localPath)) continue;
-            const blob  = await _dataUriToBlob(dataUri);
-            if (!blob || blob.size === 0) continue;
-            const parts = localPath.split('/');
-            const name  = parts.pop();
-            await StorageAdapter.saveFile(blob, name, parts);
-            n++;
-        } catch (e) {
-            console.warn('[ProjectFilesSync] inline decode failed:', e.message);
-        }
-    }
-    if (n > 0) {
-        console.log(`[ProjectFilesSync] Decoded ${n} inline file(s) to local storage.`);
-        EventBus.emit(EVENTS.DATA_UPDATED);
-    }
-    return n;
-}
 
 /**
  * Enumerate every file the project references, as {relPath, driveId, kind}.
@@ -199,57 +127,116 @@ export async function recordCompletedJobs(project) {
     return added;
 }
 
+// ---------------------------------------------------------------------------
+// On-demand single-file download
+// ---------------------------------------------------------------------------
+
 /**
- * Download any file the project references that has a Drive ID but is missing
- * from local storage. Fetches the bytes from the public URL (cross-account) or
- * the Drive API (own files), then saves them at the referenced relative path so
- * the normal local-file render path works — for spot media AND job results.
+ * Build a PUBLIC (unauthenticated) hot-link URL for a Drive media file.
  *
- * @param {object} project
- * @returns {Promise<number>} number of files downloaded
+ * Images use the thumbnail CDN (sends CORS headers → <img> works cross-origin).
+ * Everything else uses the usercontent download host. When a Cloudflare Worker
+ * proxy is configured (Config.proxy.workerUrl), non-image URLs are routed
+ * through /drive?id=… which adds CORS headers — enabling inline <audio>
+ * playback and fetch() for text/CSV/JSON that otherwise fail cross-origin.
+ *
+ * @param {string} fileId  Drive file ID (must be link-public).
+ * @param {string} [kind]  'image' | 'audio' | 'kml' | 'job' | 'result'
+ * @returns {string}
  */
-export async function materializeProjectFiles(project) {
-    if (!project || !getAccessToken()) return 0;
-
-    let got = 0;
-    for (const ref of enumerateFileRefs(project)) {
-        if (!ref.driveId || _unfetchable.has(ref.driveId)) continue;
-        try {
-            if (await StorageAdapter.checkFileExists(ref.relPath)) continue;
-            const blob = await DriveService.fetchPublicBlob(ref.driveId, ref.kind);
-            if (!blob || blob.size === 0) { _unfetchable.add(ref.driveId); continue; }
-
-            const parts = ref.relPath.split('/');
-            const name  = parts.pop();
-            await StorageAdapter.saveFile(blob, name, parts);
-            got++;
-        } catch (e) {
-            _unfetchable.add(ref.driveId);
-            console.warn(`[ProjectFilesSync] Could not materialize "${ref.relPath}":`, e.message);
-        }
+export function getPublicUrl(fileId, kind = '') {
+    if (kind === 'image') {
+        return `https://drive.google.com/thumbnail?id=${fileId}&sz=w1600`;
     }
-
-    if (got > 0) {
-        console.log(`[ProjectFilesSync] Materialized ${got} file(s) locally.`);
-        EventBus.emit(EVENTS.DATA_UPDATED);
+    const proxy = Config.proxy?.workerUrl;
+    if (proxy) {
+        // Route through CORS proxy → audio plays inline, text fetches work
+        return `${proxy}/drive?id=${fileId}`;
     }
-    return got;
+    return `https://drive.usercontent.google.com/download?id=${fileId}&export=download`;
 }
 
 /**
- * Bidirectional reconcile for a project: download anything on Drive missing
- * locally, then queue anything local that has no Drive ID yet for upload.
- * Used after a conflict resolution (Drive-wins / merge) and on shared sync so
- * media + results actually follow the metadata.
+ * Download a SINGLE media file on demand: fetch from Drive (authenticated API
+ * first, then public URL), save to local storage, and return a usable local
+ * object URL.
+ *
+ * Returns `{ url, source }` on success, `null` when every fetch path fails
+ * (e.g. CORS blocks the public download host for audio/text). Callers should
+ * show a "Open in Drive" fallback link in that case.
+ *
+ * @param {string} driveId   Drive file ID (link-public for shared projects).
+ * @param {string} relPath   Local relative path to save under.
+ * @param {string} [kind]    'image' | 'audio' | 'kml' | 'job' | 'result'
+ * @returns {Promise<{url: string, source: 'local'}|null>}
+ */
+export async function downloadMediaFile(driveId, relPath, kind = '') {
+    if (!driveId) return null;
+
+    // Already local?
+    try {
+        if (await StorageAdapter.checkFileExists(relPath)) {
+            const url = await StorageAdapter.getFileUrl(relPath);
+            if (url) return { url, source: 'local' };
+        }
+    } catch { /* fall through */ }
+
+    // Skip IDs that already failed this session
+    if (_unfetchable.has(driveId)) return null;
+
+    // Try fetching: authenticated API → public URL → CORS proxy fallback
+    try {
+        let blob = await DriveService.fetchPublicBlob(driveId, kind);
+
+        // If DriveService failed and we have a CORS proxy, try that
+        if ((!blob || blob.size === 0) && Config.proxy?.workerUrl) {
+            try {
+                const proxyUrl = `${Config.proxy.workerUrl}/drive?id=${driveId}`;
+                const resp = await fetch(proxyUrl);
+                if (resp.ok) blob = await resp.blob();
+            } catch { /* fall through */ }
+        }
+
+        if (!blob || blob.size === 0) {
+            _unfetchable.add(driveId);
+            return null;
+        }
+
+        // Save locally so future renders use the local copy
+        const parts = relPath.split('/');
+        const name  = parts.pop();
+        await StorageAdapter.saveFile(blob, name, parts);
+
+        const url = await StorageAdapter.getFileUrl(relPath);
+        if (url) {
+            console.log(`[ProjectFilesSync] Downloaded on-demand: ${relPath}`);
+            return { url, source: 'local' };
+        }
+    } catch (e) {
+        _unfetchable.add(driveId);
+        console.warn(`[ProjectFilesSync] On-demand download failed "${relPath}":`, e.message);
+    }
+
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Push-only reconcile (no auto-pull)
+// ---------------------------------------------------------------------------
+
+/**
+ * Push-side reconcile: queue any locally-present file that has no Drive ID yet
+ * for upload. Called after conflict resolution or project switch so media that
+ * exists locally but wasn't uploaded yet gets pushed.
+ *
+ * Pull is intentionally absent — media download is on-demand only (UI-driven).
  *
  * @param {object} project
- * @returns {Promise<number>} files downloaded
+ * @returns {Promise<void>}
  */
 export async function reconcileProjectFiles(project) {
-    if (!project) return 0;
-    const got = await materializeProjectFiles(project);
+    if (!project) return;
 
-    // Push direction: any locally-present file that isn't on Drive yet.
     for (const ref of enumerateFileRefs(project)) {
         if (ref.driveId) continue;
         try {
@@ -258,5 +245,4 @@ export async function reconcileProjectFiles(project) {
             }
         } catch { /* ignore */ }
     }
-    return got;
 }

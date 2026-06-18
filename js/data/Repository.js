@@ -951,14 +951,9 @@ export async function pushProjectDataToDrive(project) {
                 } catch { /* unreadable remote — fall back to local */ }
             }
 
-            // Inline media/result bytes so collaborators (who can read only this
-            // one project_data.json under drive.file) can decode them locally.
-            try {
-                const { buildInlineFiles } = await import('../services/ProjectFilesSync.js');
-                projectData.inline_files = await buildInlineFiles(project, null);
-            } catch (e) {
-                console.warn('[Repository] inline build failed:', e.message);
-            }
+            // Media bytes travel via Drive files (public links) — no inline
+            // encoding. Strip any legacy inline_files from the data.
+            delete projectData.inline_files;
         }
 
         const blob = new Blob(

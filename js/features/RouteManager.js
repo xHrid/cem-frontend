@@ -28,6 +28,7 @@
  * displayed because no render path existed; annotations were not supported.
  */
 
+import Config                   from '../core/Config.js';
 import EventBus, { EVENTS }     from '../core/EventBus.js';
 import {
     saveRoute,
@@ -40,6 +41,7 @@ import { getMap }               from './MapManager.js';
 import { showToast }            from '../ui/Toast.js';
 import { openModal, closeModal } from '../ui/ModalManager.js';
 import { downscaleImage }       from '../data/imageUtils.js';
+import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 
 // ---------------------------------------------------------------------------
 // Module-private state — recording
@@ -444,28 +446,71 @@ async function _showAnnotationDetails(route, ann) {
     `;
     content.querySelector('#route-ann-desc-view').textContent = ann.description || 'No notes';
 
-    // Image (local first, public Drive fallback for collaborators).
+    // ── Image (local first, public URL for Drive-only — no CORS issue with <img>) ──
     const imgBox = content.querySelector('#route-ann-img');
     if (ann.image_local_filename || ann.image_drive_id) {
         const url = ann.image_local_filename ? await getLocalFileUrl(ann.image_local_filename) : null;
         if (url) {
             imgBox.innerHTML = `<img src="${url}" style="max-width:100%; border-radius:8px;">`;
         } else if (ann.image_drive_id) {
-            imgBox.innerHTML = `<img src="https://drive.google.com/thumbnail?id=${ann.image_drive_id}&sz=w1600" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
+            const src = getPublicUrl(ann.image_drive_id, 'image');
+            imgBox.innerHTML =
+                `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">` +
+                `<button class="on-demand-dl" data-drive-id="${ann.image_drive_id}" data-rel-path="${ann.image_local_filename || ''}" data-kind="image" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
         }
     }
 
-    // Audio.
+    // ── Audio (on-demand: CORS blocks public URL playback) ──
     const audBox = content.querySelector('#route-ann-aud');
     if (ann.audio_local_filename || ann.audio_drive_id) {
         const url = ann.audio_local_filename ? await getLocalFileUrl(ann.audio_local_filename) : null;
         if (url) {
             audBox.innerHTML = `<audio controls src="${url}" style="width:100%;"></audio>`;
         } else if (ann.audio_drive_id) {
-            const dl = `https://drive.usercontent.google.com/download?id=${ann.audio_drive_id}&export=download`;
-            audBox.innerHTML = `<audio controls style="width:100%;"><source src="${dl}"></audio>`;
+            const dl = getPublicUrl(ann.audio_drive_id, 'audio');
+            if (Config.proxy?.workerUrl) {
+                // Proxy adds CORS headers → inline <audio> works
+                audBox.innerHTML =
+                    `<audio controls src="${dl}" style="width:100%;"></audio>` +
+                    `<button class="on-demand-dl" data-drive-id="${ann.audio_drive_id}" data-rel-path="${ann.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
+            } else {
+                audBox.innerHTML =
+                    `<div class="on-demand-audio" style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-surface-alt, #f5f5f5); border-radius:8px; margin-top:4px;">` +
+                        `<span style="font-size:1.1rem;">🎤</span>` +
+                        `<span style="flex:1; font-size:0.85rem; color:var(--text-dark);">Audio on Drive</span>` +
+                        `<button class="on-demand-dl" data-drive-id="${ann.audio_drive_id}" data-rel-path="${ann.audio_local_filename || ''}" data-kind="audio" style="font-size:0.82rem; padding:5px 12px; border-radius:6px; border:none; background:var(--forest, #2e7d32); color:#fff; cursor:pointer; font-weight:600;">⬇ Download</button>` +
+                        `<a href="${dl}" target="_blank" rel="noopener" style="font-size:0.78rem; color:var(--text-muted); text-decoration:none;" title="Open in browser">↗</a>` +
+                    `</div>`;
+            }
         }
     }
+
+    // Wire up on-demand download buttons
+    content.querySelectorAll('.on-demand-dl').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const { driveId, relPath, kind } = btn.dataset;
+            if (!driveId) return;
+            btn.disabled = true;
+            btn.textContent = 'Downloading...';
+            try {
+                const result = await downloadMediaFile(driveId, relPath, kind);
+                if (result) {
+                    showToast('Downloaded — rendering.', 'success');
+                    _showAnnotationDetails(route, ann); // re-render
+                } else {
+                    const dl = getPublicUrl(driveId, kind);
+                    window.open(dl, '_blank');
+                    showToast('Opened download in new tab.', 'info');
+                    btn.disabled = false;
+                    btn.textContent = '⬇ Download';
+                }
+            } catch (err) {
+                showToast(`Download failed: ${err.message}`, 'failed');
+                btn.disabled = false;
+                btn.textContent = '⬇ Download';
+            }
+        });
+    });
 
     content.querySelector('#route-ann-close')?.addEventListener('click', _closeRoutePanel);
     content.querySelector('#route-ann-addmore')?.addEventListener('click', () => {

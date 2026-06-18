@@ -466,15 +466,7 @@ export async function importSharedProject(projectFileId) {
     importedProject.shared.ownerFolderName = ownerFolder;
     _remapMediaPaths(importedProject, ownerFolder, localFolder);
 
-    // Decode inline media/result bytes to local files, then drop the inline
-    // payload so it is never kept in local state.
-    try {
-        const { applyInlineFiles } = await import('./ProjectFilesSync.js');
-        const toLocal = (p) => p.startsWith(ownerFolder + '/') ? localFolder + p.substring(ownerFolder.length) : p;
-        await applyInlineFiles(sharedProject.inline_files, toLocal);
-    } catch (e) {
-        console.warn('[SharingService] inline decode failed:', e.message);
-    }
+    // Strip any legacy inline_files payload — media is on-demand now.
     delete importedProject.inline_files;
 
     // Add to local state
@@ -574,16 +566,6 @@ export async function syncImportedProject(projectId) {
             || getProjectFolderName({ ...updatedProject, id: updatedProject.id });
         const localFolder = getProjectFolderName(project);
 
-        // Decode inline media/result bytes into local files — the only channel a
-        // collaborator can read under drive.file.
-        try {
-            const { applyInlineFiles } = await import('./ProjectFilesSync.js');
-            const toLocal = (p) => p.startsWith(ownerFolder + '/') ? localFolder + p.substring(ownerFolder.length) : p;
-            await applyInlineFiles(updatedProject.inline_files, toLocal);
-        } catch (e) {
-            console.warn('[SharingService] inline decode failed:', e.message);
-        }
-
         // Remap remote data paths before merge
         const remoteForMerge = { ...updatedProject };
         _remapMediaPaths(remoteForMerge, ownerFolder, localFolder);
@@ -612,101 +594,10 @@ export async function syncImportedProject(projectId) {
         EventBus.emit(EVENTS.DATA_UPDATED);
         EventBus.emit(EVENTS.PROJECT_CHANGED);
 
-        // Auto-pull media files referenced by public URL (drive.file can't list
-        // the owner's folder, so path-based pulls are best-effort only).
-        await _pullMediaFromSharedFolder(project);
-
-        // Download any shared media/results missing locally (public URL) so
-        // everything renders from a local copy — no "open file" buttons.
-        try {
-            const { materializeProjectFiles } = await import('./ProjectFilesSync.js');
-            await materializeProjectFiles(project);
-        } catch (e) {
-            console.warn('[SharingService] materialize after sync failed:', e.message);
-        }
+        // Media pull is ON-DEMAND now — the UI shows placeholders for missing
+        // files with download buttons. No auto-pull here.
     } else {
         throw new Error('Could not read the shared project_data.json (file may have been removed).');
-    }
-}
-
-/**
- * Pull media files from the shared folder that we don't have locally.
- * Runs after project_data.json sync — downloads images, audio, KMLs, etc.
- * Skips external_files (manual sync).
- *
- * @param {object} project  The imported project (already merged with remote data).
- * @returns {Promise<void>}
- */
-async function _pullMediaFromSharedFolder(project) {
-    const { sourceFolderId, ownerFolderName } = project.shared;
-    if (!sourceFolderId) return;
-
-    const localFolder = getProjectFolderName(project);
-    const ownerFolder = ownerFolderName || localFolder;
-
-    // Collect all media paths referenced by the project (non-external)
-    const mediaPaths = [];
-
-    for (const spot of (project.spots || [])) {
-        if (spot.image_local_filename) mediaPaths.push(spot.image_local_filename);
-        if (spot.audio_local_filename) mediaPaths.push(spot.audio_local_filename);
-    }
-    for (const site of (project.sites || [])) {
-        if (site.kml_filename) mediaPaths.push(site.kml_filename);
-    }
-    // Skip external_files — those are manual sync only
-
-    // For each path, check if we have it locally; if not, try to download from shared folder
-    let downloaded = 0;
-    for (const localPath of mediaPaths) {
-        try {
-            const exists = await StorageAdapter.checkFileExists(localPath);
-            if (exists) continue; // Already have it
-
-            // Map local path → owner path → find in shared folder
-            let ownerPath = localPath;
-            if (localPath.startsWith(localFolder + '/')) {
-                ownerPath = ownerFolder + localPath.substring(localFolder.length);
-            }
-
-            // Remove project folder prefix to get subfolder path inside shared folder
-            const subPath = ownerPath.startsWith(ownerFolder + '/')
-                ? ownerPath.substring(ownerFolder.length + 1)
-                : ownerPath;
-
-            // Walk the subfolder path to find the file on Drive
-            const parts = subPath.split('/');
-            const filename = parts.pop();
-
-            let parentId = sourceFolderId;
-            // Navigate to parent folder
-            for (const folderName of parts) {
-                const folder = await DriveService.findFileByName(folderName, parentId);
-                if (!folder) { parentId = null; break; }
-                parentId = folder.id;
-            }
-
-            if (!parentId) continue; // Folder path doesn't exist on Drive yet
-
-            // Find the file
-            const driveFile = await DriveService.findFileByName(filename, parentId);
-            if (!driveFile) continue; // File not on Drive yet (owner hasn't synced it)
-
-            // Download and save locally
-            const blob = await DriveService.downloadBlob(driveFile.id);
-            const localParts = localPath.split('/');
-            const localFilename = localParts.pop();
-            await StorageAdapter.saveFile(blob, localFilename, localParts);
-
-            downloaded++;
-        } catch (err) {
-            console.warn(`[SharingService] Could not pull media "${localPath}":`, err.message);
-        }
-    }
-
-    if (downloaded > 0) {
-        console.log(`[SharingService] Auto-pulled ${downloaded} media file(s) from shared folder.`);
-        EventBus.emit(EVENTS.DATA_UPDATED);
     }
 }
 
@@ -781,15 +672,9 @@ export async function pushToSharedProject(projectId) {
     delete remote.shared;         // never leak local collaboration metadata
     delete remote.sharing;
 
-    // Inline our local media/result bytes (keyed in the owner's namespace) so the
-    // owner + other collaborators can decode them locally under drive.file.
-    try {
-        const { buildInlineFiles } = await import('./ProjectFilesSync.js');
-        const toOwner = (p) => p.startsWith(localFolder + '/') ? ownerFolder + p.substring(localFolder.length) : p;
-        remote.inline_files = { ...(remote.inline_files || {}), ...(await buildInlineFiles(project, toOwner)) };
-    } catch (e) {
-        console.warn('[SharingService] inline build failed:', e.message);
-    }
+    // Media bytes travel via Drive files (public links), not inline in the JSON.
+    // Strip any legacy inline_files from the remote before writing back.
+    delete remote.inline_files;
 
     const blob = new Blob([JSON.stringify(remote, null, 2)], { type: 'application/json' });
 
@@ -908,14 +793,6 @@ export async function pullEditorContributions(projectId) {
         return { merged: false, contributionCount: 0 };
     }
 
-    // Decode any inline media/result bytes an editor sent (same namespace).
-    try {
-        const { applyInlineFiles } = await import('./ProjectFilesSync.js');
-        await applyInlineFiles(remote.inline_files, null);
-    } catch (e) {
-        console.warn('[SharingService] inline decode failed:', e.message);
-    }
-
     // Merge editor edits into local (same namespace).
     project.spots          = _mergeArray(project.spots,          remote.spots);
     project.routes         = _mergeArray(project.routes,         remote.routes);
@@ -927,88 +804,10 @@ export async function pullEditorContributions(projectId) {
     EventBus.emit(EVENTS.DATA_UPDATED);
     EventBus.emit(EVENTS.PROJECT_CHANGED);
 
-    // Pull any media editors uploaded into the shared folder.
-    await _pullEditorMediaFromSharedFolder(project, folderId);
-
-    // Pull editor-added media/results locally (public URL) for local rendering.
-    try {
-        const { materializeProjectFiles } = await import('./ProjectFilesSync.js');
-        await materializeProjectFiles(project);
-    } catch (e) {
-        console.warn('[SharingService] materialize after editor pull failed:', e.message);
-    }
+    // Media pull is ON-DEMAND — the UI shows download buttons for missing media.
+    // No auto-pull of editor media here.
 
     return { merged: true, contributionCount: 1 };
-}
-
-/**
- * Pull media files that editors uploaded into the shared project folder.
- * Owner-side: downloads any media in the shared folder that we don't have locally.
- *
- * @param {object} project   Owner's project.
- * @param {string} folderId  Drive folder ID of the shared project folder.
- */
-async function _pullEditorMediaFromSharedFolder(project, folderId) {
-    const projectFolder = getProjectFolderName(project);
-
-    // List all files in shared folder recursively
-    let allFiles;
-    try {
-        allFiles = await DriveService.listAllFilesInFolder(folderId);
-    } catch (err) {
-        console.warn('[SharingService] Could not list shared folder for media pull:', err);
-        return;
-    }
-
-    // Build folder-ID-to-path map
-    const folderMap = new Map();
-    folderMap.set(folderId, '');
-    for (const f of allFiles) {
-        if (f.mimeType === 'application/vnd.google-apps.folder') {
-            const parentId = f.parents?.[0];
-            const parentPath = folderMap.get(parentId) ?? '';
-            folderMap.set(f.id, parentPath ? `${parentPath}/${f.name}` : f.name);
-        }
-    }
-
-    let downloaded = 0;
-
-    for (const file of allFiles) {
-        // Skip folders and metadata files
-        if (file.mimeType === 'application/vnd.google-apps.folder') continue;
-        if (file.name === 'project_data.json') continue;
-        if (file.name === 'editor_contributions.json') continue;
-
-        // Determine local path
-        const parentId = file.parents?.[0];
-        const parentPath = folderMap.get(parentId);
-        if (parentPath === undefined) continue;
-
-        const subPath = parentPath ? `${parentPath}/${file.name}` : file.name;
-        const localPath = `${projectFolder}/${subPath}`;
-
-        // Skip if we already have it
-        try {
-            const exists = await StorageAdapter.checkFileExists(localPath);
-            if (exists) continue;
-        } catch { continue; }
-
-        // Download and save locally
-        try {
-            const blob = await DriveService.downloadBlob(file.id);
-            const parts = localPath.split('/');
-            const filename = parts.pop();
-            await StorageAdapter.saveFile(blob, filename, parts);
-            downloaded++;
-        } catch (err) {
-            console.warn(`[SharingService] Could not download editor media "${file.name}":`, err.message);
-        }
-    }
-
-    if (downloaded > 0) {
-        console.log(`[SharingService] Auto-pulled ${downloaded} editor media file(s).`);
-        EventBus.emit(EVENTS.DATA_UPDATED);
-    }
 }
 
 // ---------------------------------------------------------------------------
