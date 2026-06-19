@@ -237,9 +237,10 @@ export async function runJobOnServer(opts) {
             }
         }
 
-        // ── 2. POST /scripts/{stepId} (creates job + runs script) ───────
+        // ── 2. POST /scripts (single endpoint, script name in body) ────
+        runBody.script = stepId;
         const result = await _json(
-            _url(`/api/v1/scripts/${stepId}`),
+            _url('/api/v1/scripts'),
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },

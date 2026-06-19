@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.request
 import ssl
+import platform
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -676,30 +677,68 @@ class JobProcessor:
             logger.debug("  Full CMD: %s", " ".join(str(c) for c in cmd))
             self.setup.update_heartbeat("processing_job")
 
-            # ── Launch script with inherited terminal ──────────────────
-            # Script's own stdout/stderr go directly to this terminal —
-            # no capturing, no buffering, no stuck progress bars.
-            # Tee stdout to a log file so we still have a record.
+            # ── Launch script in a NEW terminal window ────────────────
+            # Opens a separate terminal so script logs are clearly visible
+            # and don't clutter the watcher's own output.
+            # Stdout is also tee'd to a log file for the job record.
             stdout_log_path = job_result_dir / "stdout.log"
 
-            logger.info("  ── Script output ─────────────────────────")
+            logger.info("  ── Launching script in new terminal ──────")
             start_time = time.time()
 
-            with open(stdout_log_path, "w", encoding="utf-8") as log_fh:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,  # merge stderr into stdout
-                    text=True,
-                    bufsize=1,
-                )
-                # Stream line-by-line: print to terminal AND write to log file.
-                # No parsing, no buffering — script's progress bars render live.
-                for line in proc.stdout:
-                    print(line, end="", flush=True)
-                    log_fh.write(line)
+            # Build a shell command that runs the script and tees to log.
+            # The script cmd list needs to be quoted for shell invocation.
+            _shell_cmd = " ".join(f'"{c}"' if " " in str(c) else str(c) for c in cmd)
+            _tee_cmd = f'{_shell_cmd} 2>&1 | tee "{stdout_log_path}"'
 
-                proc.wait(timeout=cfg.job_timeout)
+            _sys = platform.system()
+            if _sys == "Windows":
+                # cmd /k keeps the window open after script finishes so user can read output.
+                # /c would close immediately.
+                terminal_cmd = ["cmd", "/c", "start", "cmd", "/k", _tee_cmd]
+                proc = subprocess.Popen(terminal_cmd, shell=True)
+            elif _sys == "Darwin":
+                # macOS: use osascript to open Terminal.app
+                apple_script = (
+                    f'tell application "Terminal" to do script "{_tee_cmd}"'
+                )
+                terminal_cmd = ["osascript", "-e", apple_script]
+                proc = subprocess.Popen(terminal_cmd)
+            else:
+                # Linux: try common terminal emulators in order
+                for term in ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"]:
+                    if shutil.which(term):
+                        if term == "gnome-terminal":
+                            terminal_cmd = [term, "--", "bash", "-c", f'{_tee_cmd}; echo "\\n[Done — press Enter to close]"; read']
+                        elif term == "konsole":
+                            terminal_cmd = [term, "-e", "bash", "-c", f'{_tee_cmd}; echo "\\n[Done — press Enter to close]"; read']
+                        elif term == "xfce4-terminal":
+                            terminal_cmd = [term, "-e", f'bash -c \'{_tee_cmd}; echo "\\n[Done — press Enter to close]"; read\'']
+                        else:  # xterm
+                            terminal_cmd = [term, "-hold", "-e", "bash", "-c", _tee_cmd]
+                        break
+                else:
+                    # Fallback: no GUI terminal found, run inline like before
+                    logger.warning("  No GUI terminal found — running inline")
+                    terminal_cmd = None
+
+                if terminal_cmd:
+                    proc = subprocess.Popen(terminal_cmd)
+                else:
+                    # Inline fallback
+                    with open(stdout_log_path, "w", encoding="utf-8") as log_fh:
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                        )
+                        for line in proc.stdout:
+                            print(line, end="", flush=True)
+                            log_fh.write(line)
+
+            proc.wait(timeout=cfg.job_timeout)
 
             execution_duration = time.time() - start_time
             logger.info("  ─────────────────────────────────────────")
