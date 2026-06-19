@@ -40,12 +40,22 @@ function _url(path) {
     return _base() + path;
 }
 
+function _airflowUrl() {
+    return (Config.airflow?.triggerUrl || '').replace(/\/+$/, '') || '';
+}
+
+function _generateJobId() {
+    const hex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+    return `job_${hex}`;
+}
+
 export function isConfigured() {
     return Boolean(_base());
 }
 
 export function getServerConfig() {
-    return { baseUrl: _base() };
+    return { baseUrl: _base(), airflowUrl: _airflowUrl() };
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +137,52 @@ export async function getServerSteps() {
 
 const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ---------------------------------------------------------------------------
+// Airflow helpers
+// ---------------------------------------------------------------------------
+
+async function _triggerAirflow(body) {
+    const url = _airflowUrl();
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        throw new Error(`Airflow trigger failed: ${resp.status}${text ? ' — ' + text : ''}`);
+    }
+}
+
+async function _pollJobCompletion(jobId, onProgress) {
+    const POLL_MS = 5000;
+    const MAX_MS  = 60 * 60 * 1000;          // 1 hour
+    const start   = Date.now();
+
+    while (Date.now() - start < MAX_MS) {
+        await _sleep(POLL_MS);
+        let data;
+        try {
+            data = await _json(_url(`/api/v1/jobs/${jobId}`), {}, 10000);
+        } catch (e) {
+            // 404 → Airflow hasn't called the server yet
+            if (e.message.includes('404')) {
+                onProgress('Waiting for pipeline to start…');
+                continue;
+            }
+            throw e;
+        }
+        const tasks = data.tasks || [];
+        if (!tasks.length) { onProgress('Job created — waiting for task…'); continue; }
+        const task = tasks[tasks.length - 1];
+        if (task.status === 'success' || task.status === 'failed') {
+            return { jobData: data, task };
+        }
+        onProgress(`Server processing… (${task.status})`);
+    }
+    throw new Error('Timed out waiting for pipeline (1 hour).');
+}
+
 async function _writeJobRecord(projectFolder, jobId, record, status) {
     const blob = new Blob([JSON.stringify(record, null, 2)], { type: 'application/json' });
     await StorageAdapter.saveFile(blob, `${jobId}.json`, [projectFolder, 'jobs', status]);
@@ -157,7 +213,16 @@ async function _appendProcessedCache(projectFolder, scriptFile, names, server = 
 // ---------------------------------------------------------------------------
 
 /**
- * Run one analysis step on the lab server end-to-end.
+ * Run one analysis step end-to-end.
+ *
+ * Two modes determined by Config.airflow.triggerUrl:
+ *
+ *   Airflow mode  — POST body to Airflow trigger URL → poll server
+ *                   GET /jobs/{id} until task completes → download results.
+ *   Direct mode   — POST /api/v1/scripts synchronously → download results.
+ *
+ * In both modes the frontend generates the job_id and passes it in the body
+ * so the server uses it (no ID mismatch between local record & server).
  *
  * @param {object}   opts
  * @param {string}   opts.jobName
@@ -186,9 +251,10 @@ export async function runJobOnServer(opts) {
     if (!project) throw new Error('No active project. Initialise storage first.');
     const projectFolder = getProjectFolderName(project);
 
-    const stepId    = currentScript.id;
-    const isBirdnet = stepId === 'birdnet';
-    const localJobId = crypto.randomUUID();
+    const stepId     = currentScript.id;
+    const isBirdnet  = stepId === 'birdnet';
+    const useAirflow = Boolean(_airflowUrl());
+    const jobId      = _generateJobId();
 
     const jobData = buildJobData(
         jobName, currentScript, spotIds, startDate, endDate,
@@ -198,21 +264,21 @@ export async function runJobOnServer(opts) {
 
     const record = {
         ...jobData,
-        job_id:     localJobId,
-        job_name:   jobName || `Job ${localJobId.substring(0, 8)}`,
+        job_id:     jobId,
+        job_name:   jobName || `Job ${jobId}`,
         project_id: project.id,
-        mode:       'server',
+        mode:       useAirflow ? 'airflow' : 'server',
         status:     'processing',
         created_at: new Date().toISOString(),
-        server: { base_url: _base(), job_id: null, task_id: null },
+        server: { base_url: _base(), job_id: jobId, task_id: null },
     };
 
-    await _writeJobRecord(projectFolder, localJobId, record, 'processing');
+    await _writeJobRecord(projectFolder, jobId, record, 'processing');
     EventBus.emit(EVENTS.DATA_UPDATED, null);
 
     try {
-        // ── 1. Build request body for POST /scripts (script name in body) ──
-        onProgress('Running analysis on server…');
+        // ── 1. Build request body ──────────────────────────────────────
+        onProgress('Preparing analysis…');
 
         const _spotNames = spotIds.map(id => {
             const s = spots.find(sp => sp.spotId === id);
@@ -230,85 +296,105 @@ export async function runJobOnServer(opts) {
             start_date: jobData.parameters?.start_date || startDate,
             end_date:   jobData.parameters?.end_date   || endDate,
             spots_geo:  _spotsGeo,
+            job_id:     jobId,
+            script:     stepId,
         };
-
-        // Forward dynamic params from UI
         for (const [key, val] of Object.entries(dynamicParams)) {
-            if (val != null && val !== '') {
-                runBody[key] = val;
-            }
+            if (val != null && val !== '') runBody[key] = val;
         }
 
-        // ── 2. POST /scripts (single endpoint, script name in body) ────
-        //    Use raw fetch (not _fetch) so we can parse the body on 4xx/5xx
-        //    and extract job_id + task_id for log retrieval.
-        runBody.script = stepId;
-        const scriptCtrl  = new AbortController();
-        const scriptTimer = setTimeout(() => scriptCtrl.abort(), 60 * 60 * 1000);
-        let scriptResp;
-        try {
-            scriptResp = await fetch(_url('/api/v1/scripts'), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
-                body: JSON.stringify(runBody),
-                signal: scriptCtrl.signal,
-            });
-        } catch (e) {
-            if (e.name === 'AbortError') throw new Error('Script request timed out (1 h).');
-            throw new Error(`Network error reaching server: ${e.message}`);
-        } finally {
-            clearTimeout(scriptTimer);
-        }
-        const result = await scriptResp.json();
+        // ── 2. Trigger + await completion ──────────────────────────────
+        let taskId = null;
 
-        const serverJobId = result.job_id;
-        const taskId = result.task_id;
-        record.server.job_id = serverJobId;
-        record.server.task_id = taskId;
-        await _writeJobRecord(projectFolder, localJobId, record, 'processing');
+        if (useAirflow) {
+            // ── Airflow mode: trigger DAG, then poll server ────────────
+            onProgress('Triggering Airflow pipeline…');
+            await _triggerAirflow(runBody);
 
-        // ── 3. Check result status ──────────────────────────────────────
-        if (!scriptResp.ok || result.status === 'skipped' || result.status === 'failed') {
-            // Try to fetch the run log for diagnostics
-            let logText = '';
-            if (serverJobId && taskId) {
+            onProgress('Pipeline triggered — polling for results…');
+            const { task } = await _pollJobCompletion(jobId, onProgress);
+            taskId = task.task_id;
+            record.server.task_id = taskId;
+
+            if (task.status === 'failed') {
+                let logText = '';
                 try {
                     const logResp = await _fetch(
-                        _url(`/api/v1/jobs/${serverJobId}/tasks/${taskId}/log`), {}, 10000);
+                        _url(`/api/v1/jobs/${jobId}/tasks/${taskId}/log`), {}, 10000);
                     logText = await logResp.text();
-                } catch { /* log fetch failed — not critical */ }
+                } catch { /* not critical */ }
+                record.status = 'failed';
+                record.error  = task.error || 'Pipeline failed on server.';
+                if (logText) record.run_log = logText;
+                record.finished_at = new Date().toISOString();
+                await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
+                EventBus.emit(EVENTS.DATA_UPDATED, null);
+                throw new Error(record.error);
             }
-            record.status = 'failed';
-            record.error  = result.message || result.detail || `Server returned ${scriptResp.status}`;
-            if (logText) record.run_log = logText;
-            record.finished_at = new Date().toISOString();
-            await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'failed');
-            EventBus.emit(EVENTS.DATA_UPDATED, null);
-            throw new Error(record.error);
+        } else {
+            // ── Direct mode: POST /scripts synchronously ───────────────
+            onProgress('Running analysis on server…');
+            const scriptCtrl  = new AbortController();
+            const scriptTimer = setTimeout(() => scriptCtrl.abort(), 60 * 60 * 1000);
+            let scriptResp;
+            try {
+                scriptResp = await fetch(_url('/api/v1/scripts'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                    body: JSON.stringify(runBody),
+                    signal: scriptCtrl.signal,
+                });
+            } catch (e) {
+                if (e.name === 'AbortError') throw new Error('Script request timed out (1 h).');
+                throw new Error(`Network error reaching server: ${e.message}`);
+            } finally {
+                clearTimeout(scriptTimer);
+            }
+            const result = await scriptResp.json();
+            taskId = result.task_id;
+            record.server.task_id = taskId;
+            await _writeJobRecord(projectFolder, jobId, record, 'processing');
+
+            if (!scriptResp.ok || result.status === 'skipped' || result.status === 'failed') {
+                let logText = '';
+                if (taskId) {
+                    try {
+                        const logResp = await _fetch(
+                            _url(`/api/v1/jobs/${jobId}/tasks/${taskId}/log`), {}, 10000);
+                        logText = await logResp.text();
+                    } catch { /* not critical */ }
+                }
+                record.status = 'failed';
+                record.error  = result.message || result.detail || `Server returned ${scriptResp.status}`;
+                if (logText) record.run_log = logText;
+                record.finished_at = new Date().toISOString();
+                await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
+                EventBus.emit(EVENTS.DATA_UPDATED, null);
+                throw new Error(record.error);
+            }
         }
 
-        // ── 4. Download results ─────────────────────────────────────────
+        // ── 3. Download results ────────────────────────────────────────
         onProgress('Downloading results…');
         const { results = [] } = await _json(
-            _url(`/api/v1/jobs/${serverJobId}/results`),
-            {}, 30000);
+            _url(`/api/v1/jobs/${jobId}/results`), {}, 30000);
 
         let saved = 0;
         let aggregateBlob = null;
         let processedBlob = null;
         for (const rel of results) {
             const resp = await _fetch(
-                _url(`/api/v1/jobs/${serverJobId}/file?path=${encodeURIComponent(rel)}`),
+                _url(`/api/v1/jobs/${jobId}/file?path=${encodeURIComponent(rel)}`),
                 {}, 5 * 60 * 1000);
             const blob = await resp.blob();
             const base = rel.split('/').pop();
-            await StorageAdapter.saveFile(blob, base, [projectFolder, 'jobs', 'results', localJobId]);
+            await StorageAdapter.saveFile(blob, base, [projectFolder, 'jobs', 'results', jobId]);
             saved++;
             if (isBirdnet && /aggregate\.csv$/i.test(rel)) aggregateBlob = blob;
             if (isBirdnet && /processed_files\.txt$/i.test(rel)) processedBlob = blob;
         }
 
-        // ── 5. For BirdNET: persist server aggregate + processed cache ──
+        // ── 4. BirdNET: persist aggregate + processed cache ────────────
         if (isBirdnet) {
             if (aggregateBlob) {
                 await StorageAdapter.saveFile(
@@ -322,13 +408,12 @@ export async function runJobOnServer(opts) {
             }
         }
 
-        // ── 6. Mark completed ───────────────────────────────────────────
+        // ── 5. Mark completed ──────────────────────────────────────────
         record.status      = 'completed';
         record.finished_at = new Date().toISOString();
         record.result_count = saved;
-        await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'completed');
+        await _moveJobRecord(projectFolder, jobId, record, 'processing', 'completed');
 
-        // Fold into project.jobs[] so shared projects sync job records
         try {
             const { recordCompletedJobs } = await import('./ProjectFilesSync.js');
             await recordCompletedJobs(project);
@@ -337,14 +422,14 @@ export async function runJobOnServer(opts) {
         EventBus.emit(EVENTS.DATA_UPDATED, null);
 
         onProgress(`Done — ${saved} file(s) downloaded.`);
-        return { jobId: localJobId, status: 'completed', files: saved };
+        return { jobId, status: 'completed', files: saved };
 
     } catch (e) {
         try {
             record.status = 'failed';
             record.error  = record.error || e.message;
             record.finished_at = record.finished_at || new Date().toISOString();
-            await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'failed');
+            await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
             EventBus.emit(EVENTS.DATA_UPDATED, null);
         } catch { /* record may already be moved */ }
         throw e;

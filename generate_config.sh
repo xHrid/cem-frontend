@@ -26,6 +26,13 @@
 #                      value ships in plaintext to every visitor — only use a
 #                      key you are comfortable exposing.
 #
+# Optional (Airflow DAG trigger — when set, the frontend triggers scripts via
+#   Airflow instead of calling the server directly):
+#   AIRFLOW_TRIGGER_URL  Full URL to POST a DAG run, e.g.
+#                        https://airflow.example.com/api/v1/dags/cem_pipeline/dagRuns
+#                        The body is the same JSON the server expects for
+#                        POST /api/v1/scripts, plus a client-generated job_id.
+#
 # Optional (override the analysis script repo; defaults to the main repo):
 #   ANALYSIS_REPO_URL  Raw GitHub content URL, no trailing slash.
 #
@@ -47,6 +54,9 @@ CORS_PROXY_URL="${CORS_PROXY_URL:-https://cem-proxy.cem-cors.workers.dev}"
 
 # Strip any trailing slash the user may have added to the server URL.
 SERVER_BASE_URL="${SERVER_BASE_URL%/}"
+
+# Strip trailing slash from Airflow trigger URL if provided.
+AIRFLOW_TRIGGER_URL="${AIRFLOW_TRIGGER_URL%/}"
 
 # Write to the path the code actually imports: js/core/Config.js
 cat <<EOF > js/core/Config.js
@@ -86,6 +96,9 @@ const Config = deepFreeze({
     server: {
         baseUrl: '${SERVER_BASE_URL}',
     },
+    airflow: {
+        triggerUrl: '${AIRFLOW_TRIGGER_URL}',
+    },
     proxy: {
         workerUrl: '${CORS_PROXY_URL}',
     },
@@ -107,4 +120,5 @@ echo "Configuration file generated successfully at js/core/Config.js"
 echo "  google.clientId    : ${GOOGLE_CLIENT_ID:-(unset!)}"
 echo "  google.pickerApiKey: ${PICKER_API_KEY:+set}"
 echo "  server.baseUrl     : ${SERVER_BASE_URL:-(unset — server mode disabled)}"
+echo "  airflow.triggerUrl : ${AIRFLOW_TRIGGER_URL:-(unset — direct server mode)}"
 echo "  proxy.workerUrl    : ${CORS_PROXY_URL}"
