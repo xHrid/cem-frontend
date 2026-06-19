@@ -3,7 +3,7 @@
  *
  * Talks to the CEM FastAPI server:
  *
- *      1. POST /api/v1/scripts/{name}            -> create job + run script (synchronous)
+ *      1. POST /api/v1/scripts                    -> create job + run script (script name in body)
  *      2. GET  /api/v1/jobs/{id}/results          -> list produced files
  *         GET  /api/v1/jobs/{id}/file?path=...    -> download each one
  *
@@ -70,7 +70,8 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
         let detail = `${resp.status} ${resp.statusText}`;
         try {
             const body = await resp.clone().json();
-            if (body?.detail) detail += ` — ${typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)}`;
+            const msg = body?.detail || body?.message;
+            if (msg) detail += ` — ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`;
         } catch { /* non-JSON body */ }
         throw new Error(detail);
     }
@@ -95,6 +96,7 @@ export async function checkServerHealth() {
 
 const _SCRIPT_FILE = {
     birdnet:                  'birdnet_predictions.py',
+    acoustic_indices:         'acoustic_indices.py',
     heatmaps:                 'activity_heatmaps.py',
     temporal_stickiness:      'temporal_stickiness.py',
     spatial_stickiness:       'spatial_stickiness.py',
@@ -209,7 +211,7 @@ export async function runJobOnServer(opts) {
     EventBus.emit(EVENTS.DATA_UPDATED, null);
 
     try {
-        // ── 1. Build request body for POST /scripts/{stepId} ────────────
+        // ── 1. Build request body for POST /scripts (script name in body) ──
         onProgress('Running analysis on server…');
 
         const _spotNames = spotIds.map(id => {

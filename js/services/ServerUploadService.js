@@ -51,7 +51,8 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
         let detail = `${resp.status} ${resp.statusText}`;
         try {
             const body = await resp.clone().json();
-            if (body?.detail) detail += ` — ${typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)}`;
+            const msg = body?.detail || body?.message;
+            if (msg) detail += ` — ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`;
         } catch { /* non-JSON body */ }
         throw new Error(detail);
     }
