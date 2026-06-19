@@ -693,9 +693,18 @@ class JobProcessor:
 
             _sys = platform.system()
             if _sys == "Windows":
-                # cmd /k keeps the window open after script finishes so user can read output.
-                # /c would close immediately.
-                terminal_cmd = ["cmd", "/c", "start", "cmd", "/k", _tee_cmd]
+                # cmd.exe lacks Unix 'tee'; write a temp PowerShell script
+                # that uses Tee-Object instead.
+                _ps1 = job_result_dir / "_run.ps1"
+                with open(_ps1, "w", encoding="utf-8") as f:
+                    f.write(f"& {_shell_cmd} 2>&1 | Tee-Object -FilePath '{stdout_log_path}'\n")
+                    f.write('Write-Host "`n[Done - press Enter to close]"\n')
+                    f.write("$null = Read-Host\n")
+                terminal_cmd = [
+                    "cmd", "/c", "start", "powershell",
+                    "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", str(_ps1),
+                ]
                 proc = subprocess.Popen(terminal_cmd, shell=True)
             elif _sys == "Darwin":
                 # macOS: use osascript to open Terminal.app
