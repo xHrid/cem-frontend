@@ -240,15 +240,26 @@ export async function runJobOnServer(opts) {
         }
 
         // ── 2. POST /scripts (single endpoint, script name in body) ────
+        //    Use raw fetch (not _fetch) so we can parse the body on 4xx/5xx
+        //    and extract job_id + task_id for log retrieval.
         runBody.script = stepId;
-        const result = await _json(
-            _url('/api/v1/scripts'),
-            {
+        const scriptCtrl  = new AbortController();
+        const scriptTimer = setTimeout(() => scriptCtrl.abort(), 60 * 60 * 1000);
+        let scriptResp;
+        try {
+            scriptResp = await fetch(_url('/api/v1/scripts'), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
                 body: JSON.stringify(runBody),
-            },
-            60 * 60 * 1000);  // 1h timeout
+                signal: scriptCtrl.signal,
+            });
+        } catch (e) {
+            if (e.name === 'AbortError') throw new Error('Script request timed out (1 h).');
+            throw new Error(`Network error reaching server: ${e.message}`);
+        } finally {
+            clearTimeout(scriptTimer);
+        }
+        const result = await scriptResp.json();
 
         const serverJobId = result.job_id;
         const taskId = result.task_id;
@@ -257,9 +268,19 @@ export async function runJobOnServer(opts) {
         await _writeJobRecord(projectFolder, localJobId, record, 'processing');
 
         // ── 3. Check result status ──────────────────────────────────────
-        if (result.status === 'skipped' || result.status === 'failed') {
+        if (!scriptResp.ok || result.status === 'skipped' || result.status === 'failed') {
+            // Try to fetch the run log for diagnostics
+            let logText = '';
+            if (serverJobId && taskId) {
+                try {
+                    const logResp = await _fetch(
+                        _url(`/api/v1/jobs/${serverJobId}/tasks/${taskId}/log`), {}, 10000);
+                    logText = await logResp.text();
+                } catch { /* log fetch failed — not critical */ }
+            }
             record.status = 'failed';
-            record.error  = result.message || 'Server task failed.';
+            record.error  = result.message || result.detail || `Server returned ${scriptResp.status}`;
+            if (logText) record.run_log = logText;
             record.finished_at = new Date().toISOString();
             await _moveJobRecord(projectFolder, localJobId, record, 'processing', 'failed');
             EventBus.emit(EVENTS.DATA_UPDATED, null);

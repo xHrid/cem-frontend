@@ -240,13 +240,14 @@ export function initAnalysis() {
 // ---------------------------------------------------------------------------
 
 /**
- * Start polling the watcher status every 3 s.
- * Clears any previous interval first to avoid stacked polls.
+ * Start polling status. Server mode polls slower (10 s) since /health
+ * is just a reachability check; watcher mode polls at 5 s.
  * @private
  */
 function _startHeartbeat() {
     _stopHeartbeat();
-    _heartbeatInterval = setInterval(_checkStatus, 3000);
+    const interval = _serverMode ? 10000 : 5000;
+    _heartbeatInterval = setInterval(_checkStatus, interval);
 }
 
 /**
@@ -284,6 +285,7 @@ function _setMode(mode) {
     if (els.runBtn) { els.runBtn.dataset.formReady = 'false'; els.runBtn.disabled = true; }
     _checkStatus();
     _loadScripts();
+    _startHeartbeat();   // restart with mode-appropriate interval
 }
 
 /**
@@ -1259,6 +1261,32 @@ async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParam
         showToast(`Server job failed: ${e.message}`, 'failed');
         setStatus(`Failed: ${e.message}`);
         if (els.statusIndicator) els.statusIndicator.style.color = '#dc3545';
+
+        // Show run log in the acknowledgement area if available
+        const ackEl = document.getElementById('analysis-file-acknowledgement');
+        if (ackEl) {
+            try {
+                const project = getActiveProject();
+                const pf = project ? getProjectFolderName(project) : '';
+                if (pf) {
+                    const files = await StorageAdapter.listDirectoryFiles([pf, 'jobs', 'failed']);
+                    const latest = files.filter(f => f.endsWith('.json')).sort().pop();
+                    if (latest) {
+                        const blob = await StorageAdapter.getFileBlob(`${pf}/jobs/failed/${latest}`);
+                        if (blob) {
+                            const rec = JSON.parse(await blob.text());
+                            if (rec.run_log) {
+                                const tail = rec.run_log.split('\n').slice(-30).join('\n');
+                                ackEl.innerHTML = `<details open style="margin-top:6px;">
+                                    <summary style="font-weight:700; color:#dc3545; cursor:pointer;">Run Log (last 30 lines)</summary>
+                                    <pre style="max-height:200px; overflow:auto; font-size:0.75rem; white-space:pre-wrap; background:#1a1a1a; color:#e0e0e0; padding:8px; border-radius:4px; margin-top:4px;">${tail.replace(/</g, '&lt;')}</pre>
+                                </details>`;
+                            }
+                        }
+                    }
+                }
+            } catch { /* best-effort log display */ }
+        }
     } finally {
         _runningServerJob = false;
         if (els.runBtn) { els.runBtn.textContent = 'Run on Server'; els.runBtn.disabled = false; }
