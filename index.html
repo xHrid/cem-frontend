@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- color-scheme managed via data-theme attribute + CSS -->
+
     <title>Continuous Ecological Monitoring Toolkit</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,9 +15,9 @@
     <link rel="stylesheet" href="./styles/style.css" />
 
     <script src="https://accounts.google.com/gsi/client" async defer></script>
-    <!-- Google API loader — provides gapi.load('picker') for shared-folder import -->
+
     <script src="https://apis.google.com/js/api.js" async defer></script>
-    <!-- Inline theme init — runs before paint to prevent flash of wrong theme -->
+
     <script>
         (function() {
             var saved = localStorage.getItem('cem-theme');
@@ -32,7 +32,7 @@
         <button id="menu-toggle" aria-label="Toggle sidebar menu">☰</button>
         <button id="theme-toggle" aria-label="Toggle dark mode">🌙</button>
         <nav id="controls" class="open" aria-label="Control panel">
-            <!-- Storage init — must be completed before anything else -->
+
             <div id="auth-section"></div>
 
             <div id="app-controls" class="app-controls-disabled">
@@ -69,7 +69,11 @@
                     <input type="checkbox" id="show-routes-toggle" disabled /> Show
                 </label>
             </div>
-            <div id="stratification-controls"></div>
+
+            <div id="site-list-panel" style="display:none; margin-top:10px; border-top:1px solid var(--border-color,#ccc); padding-top:8px;">
+                <div class="div-label" style="margin-bottom:5px;">Sites</div>
+                <div id="site-list"></div>
+            </div>
             </div>
         </nav>
         <div id="map"></div>
@@ -77,7 +81,6 @@
         <div id="toast-notification" role="alert" aria-live="assertive"></div>
     </main>
 
-    <!-- ── Spot Form ─────────────────────────────────────────────────────── -->
     <dialog id="popup-form" class="modal-dialog">
         <div class="popup-content">
             <form id="spot-form">
@@ -85,7 +88,6 @@
                 <input type="text" name="name" placeholder="Spot name" autocomplete="off" />
                 <textarea name="description" placeholder="Description / field notes"></textarea>
 
-                <!-- Location fields -->
                 <label class="field-toggle">
                     <input type="checkbox" id="use-current-location" checked />
                     Use current location
@@ -95,7 +97,6 @@
                     <input type="number" id="custom-lon" placeholder="Longitude" step="any" />
                 </div>
 
-                <!-- Date/Time fields -->
                 <label class="field-toggle">
                     <input type="checkbox" id="use-current-time" checked />
                     Use current date &amp; time
@@ -131,7 +132,6 @@
         </div>
     </dialog>
 
-    <!-- ── Add Site ──────────────────────────────────────────────────────── -->
     <dialog id="add-site-popup-form" class="modal-dialog">
         <div class="popup-content">
             <form id="add-site-form">
@@ -141,14 +141,7 @@
                     <span id="kml-file-name">Choose KML file...</span>
                 </label>
                 <input type="file" id="kml-upload" name="kml" accept=".kml" required />
-                <select name="clusters" required>
-                    <option value="" disabled selected>Select number of clusters</option>
-                    <option value="2">2 Clusters</option>
-                    <option value="3">3 Clusters</option>
-                    <option value="4">4 Clusters</option>
-                    <option value="5">5 Clusters</option>
-                    <option value="6">6 Clusters</option>
-                </select>
+
                 <div class="button-group">
                     <button type="submit" class="popup-btn">Submit</button>
                     <button type="button" id="close-add-site-form" class="popup-btn cancel-btn">Cancel</button>
@@ -158,7 +151,6 @@
         </div>
     </dialog>
 
-    <!-- ── Save Route ────────────────────────────────────────────────────── -->
     <dialog id="save-route-dialog" class="modal-dialog">
         <div class="popup-content">
             <h3>Save Route</h3>
@@ -172,7 +164,6 @@
         </div>
     </dialog>
 
-    <!-- ── Import Media ──────────────────────────────────────────────────── -->
     <dialog id="import-media-popup" class="modal-dialog">
         <div class="popup-content import-popup-content">
             <form id="import-media-form" novalidate>
@@ -207,7 +198,6 @@
         </div>
     </dialog>
 
-    <!-- ── Analysis Hub ──────────────────────────────────────────────────── -->
     <dialog id="analysis-popup" class="modal-dialog" style="max-width: min(94vw, 780px);">
         <div class="popup-content import-popup-content" style="max-width: 780px; max-height: 90vh; display: flex; flex-direction: column;">
 
@@ -224,7 +214,6 @@
                 </div>
             </div>
 
-            <!-- Compute backend: local watcher vs the Dockerised lab server. -->
             <div id="analysis-mode-toggle" style="display:flex; gap:6px; margin-bottom:12px;">
                 <button type="button" class="analysis-mode-btn" data-mode="watcher"
                     style="flex:1; padding:8px; border:1px solid var(--border-color); border-radius:6px; cursor:pointer; font-weight:600;">
@@ -244,7 +233,6 @@
                 <span id="server-help-detail"></span>
             </div>
 
-            <!-- ── Server Upload Panel (visible only in server mode) ────────── -->
             <details id="server-upload-panel" style="display:none; margin-bottom:12px;" open>
                 <summary class="div-label" style="margin-bottom:8px; cursor:pointer; user-select:none;">
                     0. Project Files on Server <span style="font-weight:normal; font-size:0.8rem; color:var(--text-muted);">(click to collapse)</span>
@@ -253,7 +241,6 @@
                     Checking server…
                 </div>
 
-                <!-- Audio slot -->
                 <div class="server-file-slot" id="slot-audio"
                      style="padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
                             border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
@@ -263,7 +250,7 @@
                             <span id="slot-audio-info" style="color:var(--text-muted); margin-left:6px;">—</span>
                         </div>
                     </div>
-                    <!-- Upload controls: spot dropdown + file picker -->
+
                     <div id="audio-upload-controls" style="display:flex; gap:8px; align-items:center;">
                         <select id="audio-spot-select" style="flex:1; padding:6px 8px; font-size:0.85rem; border:1px solid var(--border-color); border-radius:4px;">
                             <option value="">Select spot…</option>
@@ -272,7 +259,7 @@
                         <button type="button" class="small-btn" id="audio-upload-trigger" disabled
                                 style="white-space:nowrap;">Upload Files</button>
                     </div>
-                    <!-- Progress bar (replaces controls during upload) -->
+
                     <div id="audio-upload-progress" style="display:none;">
                         <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-size:0.8rem;">
                             <span id="audio-progress-label">Uploading…</span>
@@ -284,7 +271,6 @@
                     </div>
                 </div>
 
-                <!-- Aggregate slot -->
                 <div class="server-file-slot" id="slot-aggregate"
                      style="display:flex; align-items:center; justify-content:space-between; gap:8px;
                             padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
@@ -302,7 +288,6 @@
                     </div>
                 </div>
 
-                <!-- Processed slot -->
                 <div class="server-file-slot" id="slot-processed"
                      style="display:flex; align-items:center; justify-content:space-between; gap:8px;
                             padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
@@ -363,7 +348,6 @@
         </div>
     </dialog>
 
-    <!-- ── Jobs Dashboard ────────────────────────────────────────────────── -->
     <dialog id="jobs-popup" class="modal-dialog modal-dialog--wide">
         <div class="popup-content import-popup-content">
             <div class="external-data-header" style="padding: 16px 20px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center;">
@@ -398,13 +382,11 @@
         </div>
     </dialog>
 
-    <!-- ── Spot Details Slide Panel (not a dialog — side panel) ───────── -->
     <aside id="spot-details-menu" aria-label="Spot details">
         <button id="close-spot-details" aria-label="Close spot details">x</button>
         <div id="spot-details-content"></div>
     </aside>
 
-    <!-- ── External Data Viewer ──────────────────────────────────────────── -->
     <dialog id="external-data-viewer" class="modal-dialog">
         <div class="popup-content external-data-popup-content">
             <div class="external-data-header">
@@ -415,7 +397,6 @@
         </div>
     </dialog>
 
-    <!-- ── Conflict Resolution ───────────────────────────────────────────── -->
     <dialog id="conflict-modal" class="modal-dialog">
         <div class="popup-content" style="text-align: center;">
             <h3>⚠️ Data Conflict</h3>
@@ -440,7 +421,6 @@
         </div>
     </dialog>
 
-    <!-- ── Project Name Input Dialog ─────────────────────────────────────── -->
     <dialog id="project-name-dialog" class="modal-dialog">
         <div class="popup-content">
             <h3 id="project-name-dialog-title">New Project</h3>
@@ -454,7 +434,6 @@
         </div>
     </dialog>
 
-    <!-- ── Share Project Dialog ────────────────────────────────────────── -->
     <dialog id="share-project-dialog" class="modal-dialog">
         <div class="popup-content">
             <h3>Share Project</h3>
@@ -489,7 +468,6 @@
         </div>
     </dialog>
 
-    <!-- ── Import Project Dialog ───────────────────────────────────────── -->
     <dialog id="import-project-dialog" class="modal-dialog">
         <div class="popup-content">
             <h3>Import Shared Project</h3>
@@ -517,9 +495,6 @@
             </form>
         </div>
     </dialog>
-
-    <!-- ── Sync Dashboard (built at runtime by SyncDashboard.js) ─────── -->
-    <!-- SyncDashboard creates its own dialog dynamically -->
 
     <script src="./leaflet/leaflet.js"></script>
     <script type="module" src="./js/main.js"></script>

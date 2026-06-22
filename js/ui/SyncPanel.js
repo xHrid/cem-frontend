@@ -1,20 +1,3 @@
-/**
- * SyncPanel.js — Minimal sync UI: a status pill + a small control panel
- *
- * Replaces the three old buttons ("Check Remote Updates", "Media Sync",
- * per-project "Sync") and the heavy SyncDashboard. Everything syncs
- * automatically via SyncEngine; this UI only:
- *
- *   1. Shows a live status pill (Synced / Syncing / Offline / Error).
- *   2. Offers a "Sync now" button to force an immediate flush.
- *
- * External/imported media is never uploaded or shared, so there is no media
- * toggle or manual push control here anymore.
- *
- * The pill button (#btn-sync-pill) is rendered by App.js into the auth panel;
- * we wire it via event delegation so initialisation order does not matter.
- */
-
 import EventBus, { EVENTS } from '../core/EventBus.js';
 import {
     getSyncState,
@@ -22,10 +5,6 @@ import {
 } from '../services/SyncEngine.js';
 import { getMediaSyncStatus } from '../services/SharedMediaSync.js';
 import { showToast } from './Toast.js';
-
-// ---------------------------------------------------------------------------
-// Status presentation
-// ---------------------------------------------------------------------------
 
 const STATUS_META = {
     idle:    { icon: '✅', text: 'Synced',      color: '#0F9D58' },
@@ -35,18 +14,11 @@ const STATUS_META = {
     paused:  { icon: '⏸️', text: 'Sync paused', color: '#c8662a' },
 };
 
-/** @type {HTMLElement|null} */
 let _dialog = null;
 
-// ---------------------------------------------------------------------------
-// Public init
-// ---------------------------------------------------------------------------
-
 export function initSyncPanel() {
-    // Keep the pill in sync with engine status.
     EventBus.on(EVENTS.SYNC_STATUS, ({ data }) => _renderPill(data.status, data.lastSyncAt));
 
-    // Refresh pill when media uploads start/finish (debounced for bulk imports)
     let _mediaPillTimer = null;
     EventBus.on(EVENTS.MEDIA_SAVED, () => {
         clearTimeout(_mediaPillTimer);
@@ -60,12 +32,10 @@ export function initSyncPanel() {
         _renderPill(st.status, st.lastSyncAt);
     });
 
-    // Delegated click — works regardless of when the pill is injected.
     document.addEventListener('click', (e) => {
         if (e.target.closest?.('#btn-sync-pill')) _openPanel();
     });
 
-    // Refresh pill periodically — catches media queue draining + relative time label.
     setInterval(() => {
         const st = getSyncState();
         _renderPill(st.status, st.lastSyncAt);
@@ -75,16 +45,6 @@ export function initSyncPanel() {
     _renderPill(st.status, st.lastSyncAt);
 }
 
-// ---------------------------------------------------------------------------
-// Pill
-// ---------------------------------------------------------------------------
-
-/**
- * Coarse relative time, e.g. "just now", "3m ago", "2h ago". Avoids a ticking
- * clock — granularity is minutes/hours.
- * @param {number|null} ts  epoch ms
- * @returns {string}
- */
 function _relTime(ts) {
     if (!ts) return '';
     const s = Math.floor((Date.now() - ts) / 1000);
@@ -98,7 +58,6 @@ function _renderPill(status, lastSyncAt) {
     const pill = document.getElementById('btn-sync-pill');
     if (!pill) return;
 
-    // Check if media is still uploading — override "Synced" label
     const media = getMediaSyncStatus();
     const mediaBusy = media.pending > 0 || media.active > 0;
 
@@ -108,7 +67,6 @@ function _renderPill(status, lastSyncAt) {
     let icon  = m.icon;
 
     if (status === 'idle' && mediaBusy) {
-        // JSON is synced but media files still uploading
         icon  = '☁️';
         label = `Uploading ${media.pending + media.active} file${(media.pending + media.active) > 1 ? 's' : ''}…`;
         color = '#4285F4';
@@ -119,10 +77,6 @@ function _renderPill(status, lastSyncAt) {
     pill.textContent = `${icon} ${label}`;
     pill.style.color = color;
 }
-
-// ---------------------------------------------------------------------------
-// Panel dialog
-// ---------------------------------------------------------------------------
 
 function _buildDialog() {
     const dlg = document.createElement('div');
@@ -158,13 +112,11 @@ function _buildDialog() {
     dlg.querySelector('#sync-panel-close').addEventListener('click', () => { dlg.style.display = 'none'; });
     dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.style.display = 'none'; });
 
-    // Force an immediate JSON/contribution flush
     dlg.querySelector('#sync-now-btn').addEventListener('click', async () => {
         await flush('manual');
         showToast('Sync triggered.', 'success');
     });
 
-    // Reclaim dead local files (orphaned media / discarded projects).
     dlg.querySelector('#gc-now-btn').addEventListener('click', async (e) => {
         const btn = e.currentTarget;
         btn.disabled = true; btn.textContent = 'Cleaning…';
@@ -186,7 +138,6 @@ async function _openPanel() {
     if (!_dialog) _dialog = _buildDialog();
     _dialog.style.display = 'flex';
 
-    // Reflect current state
     const st = getSyncState();
     const statusEl = _dialog.querySelector('#sync-panel-status');
     const m = STATUS_META[st.status] || STATUS_META.idle;

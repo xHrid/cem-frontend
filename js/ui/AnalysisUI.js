@@ -1,39 +1,3 @@
-/**
- * AnalysisUI.js — Analysis popup UI controller
- *
- * Pattern : Module Pattern
- *           All DOM references and interval handles are private to this module.
- *           AnalysisService provides the pure business logic; this module owns
- *           only the rendering and event wiring.
- *
- * Extracted from analysis.js which mixed DOM manipulation and data logic.
- *
- * Bug fixes over analysis.js
- * --------------------------
- *  1. DOM element cache (`els`) populated LAZILY on first popup open, not at
- *     module parse time — avoids null refs if the popup HTML is not yet in
- *     the DOM when the script loads.
- *  2. `renderSpotDateSelector` previously called
- *     `els.fileSelector.addEventListener('change', ...)` on EVERY script
- *     selection, stacking multiple listeners.  Now a SINGLE delegated listener
- *     is registered once on `els.fileSelector` (in _initFileSelectorListener).
- *  3. `statusIndicator` colour is applied to `style.color` (the ● text
- *     character) instead of `style.backgroundColor` (which coloured the
- *     surrounding box, not the dot itself).
- *  4. `heartbeatInterval` is cleared when the popup closes — previously the
- *     setInterval could keep running in the background after close.
- *
- * Dependencies
- * ------------
- *   EventBus, EVENTS   — ../core/EventBus.js
- *   AnalysisService    — ../services/AnalysisService.js
- *   MasterData         — ../data/MasterData.js  (getSpots, getExternalFiles)
- *   Repository         — ../data/Repository.js  (getProcessedFilesCache,
- *                                                getWatcherStatus,
- *                                                getInstalledScripts)
- *   showToast          — ./Toast.js
- */
-
 import Config                       from '../core/Config.js';
 import EventBus, { EVENTS }        from '../core/EventBus.js';
 import {
@@ -62,15 +26,6 @@ import { getWatcherStatus } from '../data/Repository.js';
 import { showToast }                from './Toast.js';
 import { openModal, closeModal }    from './ModalManager.js';
 
-// ---------------------------------------------------------------------------
-// Module-private state
-// ---------------------------------------------------------------------------
-
-/**
- * Lazily populated DOM element cache.
- * All values are null until _cacheElements() is called on first popup open.
- * @type {object}
- */
 const els = {
     popup          : null,
     statusIndicator: null,
@@ -84,40 +39,18 @@ const els = {
     jobNameInput   : null,
 };
 
-/** True once _cacheElements() has resolved all element refs. */
 let _elsCached = false;
 
-/** The currently selected script descriptor object from installed.json. */
 let _currentScript = null;
 
-/** setInterval handle for the watcher heartbeat poll. Cleared on popup close. */
 let _heartbeatInterval = null;
 
-/**
- * Guard flag: the delegated change listener on els.fileSelector is registered
- * only once, regardless of how many times the popup is opened.
- */
 let _fileSelectorListenerAttached = false;
 
-/** Compute backend: false = local watcher (default), true = lab server. */
 let _serverMode = false;
 
-/**
- * True while a server job is uploading/running/downloading. Suppresses the
- * heartbeat from overwriting the live progress text in the status pill.
- */
 let _runningServerJob = false;
 
-// ---------------------------------------------------------------------------
-// DOM element cache — lazy init
-// ---------------------------------------------------------------------------
-
-/**
- * Populate the `els` cache from the live DOM.
- * Called on the first popup open so all elements are guaranteed to exist.
- *
- * @private
- */
 function _cacheElements() {
     if (_elsCached) return;
 
@@ -135,25 +68,15 @@ function _cacheElements() {
     _elsCached = true;
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
-/**
- * Wire up the analysis popup open/close triggers, run button, and script
- * selector.  Must be called once after DOMContentLoaded.
- */
 export function initAnalysis() {
     const openBtn = document.getElementById('analysis-btn');
 
     if (openBtn) {
         openBtn.addEventListener('click', () => {
-            // Lazily resolve DOM refs on first open
             _cacheElements();
 
             openModal('analysis-popup');
 
-            // Reset form state
             if (els.jobNameInput)    els.jobNameInput.value = '';
             if (els.fileSelector)    els.fileSelector.innerHTML =
                 '<p style="padding:10px; color:var(--text-muted);">Select a script first...</p>';
@@ -162,7 +85,6 @@ export function initAnalysis() {
 
             _currentScript = null;
 
-            // Attach the single delegated file-selector listener (idempotent)
             _initFileSelectorListener();
 
             _applyModeStyles();
@@ -172,13 +94,11 @@ export function initAnalysis() {
         });
     }
 
-    // Compute-mode toggle (Local Watcher vs Lab Server) — delegated.
     document.addEventListener('click', (e) => {
         const btn = e.target && e.target.closest && e.target.closest('.analysis-mode-btn');
         if (btn) _setMode(btn.dataset.mode);
     });
 
-    // Close button — also stops the heartbeat
     document.addEventListener('click', (e) => {
         if (e.target && e.target.id === 'close-analysis-btn') {
             _cacheElements();
@@ -187,21 +107,18 @@ export function initAnalysis() {
         }
     });
 
-    // Run button
     document.addEventListener('click', (e) => {
         if (e.target && e.target.id === 'btn-run-analysis') {
             _handleRunClick();
         }
     });
 
-    // Script selector change
     document.addEventListener('change', (e) => {
         if (e.target && e.target.id === 'analysis-script-select') {
             _loadScriptParams(e.target.value);
         }
     });
 
-    // ── Server Upload Panel — delegated listeners ──────────────────────────
     document.addEventListener('click', (e) => {
         const uploadBtn = e.target && e.target.closest && e.target.closest('.server-upload-btn');
         if (uploadBtn) {
@@ -214,46 +131,30 @@ export function initAnalysis() {
         }
     });
 
-    // Audio spot dropdown → enable/disable upload trigger
     const spotSelect = document.getElementById('audio-spot-select');
     const audioTrigger = document.getElementById('audio-upload-trigger');
     if (spotSelect && audioTrigger) {
         spotSelect.addEventListener('change', () => {
             audioTrigger.disabled = !spotSelect.value;
         });
-        // Click trigger → open file picker
         audioTrigger.addEventListener('click', () => {
             const fileInput = document.getElementById('upload-audio-input');
             if (fileInput) { fileInput.value = ''; fileInput.click(); }
         });
     }
 
-    // Audio file input change (from file picker)
     const audioInput = document.getElementById('upload-audio-input');
     if (audioInput) {
         audioInput.addEventListener('change', _handleAudioFileSelected);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Heartbeat — watcher status polling
-// ---------------------------------------------------------------------------
-
-/**
- * Start polling status. Server mode polls slower (10 s) since /health
- * is just a reachability check; watcher mode polls at 5 s.
- * @private
- */
 function _startHeartbeat() {
     _stopHeartbeat();
     const interval = _serverMode ? 10000 : 5000;
     _heartbeatInterval = setInterval(_checkStatus, interval);
 }
 
-/**
- * Stop the heartbeat poll and clear the interval handle.
- * @private
- */
 function _stopHeartbeat() {
     if (_heartbeatInterval) {
         clearInterval(_heartbeatInterval);
@@ -261,22 +162,12 @@ function _stopHeartbeat() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Compute-mode toggle (Local Watcher vs Lab Server)
-// ---------------------------------------------------------------------------
-
-/**
- * Switch the active compute backend and refresh status + script list.
- * @param {'watcher'|'server'} mode
- * @private
- */
 function _setMode(mode) {
     const next = mode === 'server';
     if (next === _serverMode) return;
     _serverMode = next;
-    if (!next) _serverFileStatus = null;   // clear cached status when leaving server mode
+    if (!next) _serverFileStatus = null;
     _applyModeStyles();
-    // Reset the script dropdown so it reloads from the right source.
     if (els.scriptSelect) els.scriptSelect.innerHTML = '<option value="">Loading scripts...</option>';
     _currentScript = null;
     if (els.fileSelector) els.fileSelector.innerHTML =
@@ -285,13 +176,9 @@ function _setMode(mode) {
     if (els.runBtn) { els.runBtn.dataset.formReady = 'false'; els.runBtn.disabled = true; }
     _checkStatus();
     _loadScripts();
-    _startHeartbeat();   // restart with mode-appropriate interval
+    _startHeartbeat();
 }
 
-/**
- * Reflect the active mode in the toggle buttons + contextual help boxes.
- * @private
- */
 function _applyModeStyles() {
     document.querySelectorAll('.analysis-mode-btn').forEach(btn => {
         const active = (btn.dataset.mode === 'server') === _serverMode;
@@ -304,28 +191,15 @@ function _applyModeStyles() {
     const uploadPanel = document.getElementById('server-upload-panel');
     if (serverHelp)  serverHelp.style.display  = _serverMode ? 'block' : 'none';
     if (uploadPanel) uploadPanel.style.display  = _serverMode ? 'block' : 'none';
-    // The watcher-offline help is only ever relevant in watcher mode; its own
-    // visibility within watcher mode is still driven by _checkStatus.
     if (watcherHelp && _serverMode) watcherHelp.style.display = 'none';
 
-    // Auto-check server file status when entering server mode
     if (_serverMode && serverConfigured()) {
         _refreshServerUploadStatus();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server Upload Panel — status check + upload handlers
-// ---------------------------------------------------------------------------
-
-/** Cached server file status to avoid redundant fetches. */
 let _serverFileStatus = null;
 
-/**
- * Query the server for existing project files, detect local files,
- * and update all 3 upload slots.
- * @private
- */
 async function _refreshServerUploadStatus() {
     const msgEl = document.getElementById('server-upload-status-msg');
     if (msgEl) msgEl.textContent = 'Checking server…';
@@ -340,16 +214,15 @@ async function _refreshServerUploadStatus() {
     }
 }
 
-/**
- * Populate the audio spot dropdown from the project's spots.
- * @private
- */
 function _populateAudioSpotDropdown() {
     const select = document.getElementById('audio-spot-select');
     if (!select) return;
     const spots = getSpots();
     select.innerHTML = '<option value="">Select spot…</option>';
+    const seen = new Set();
     spots.forEach(s => {
+        if (seen.has(s.name)) return;
+        seen.add(s.name);
         const opt = document.createElement('option');
         opt.value = s.name.replace(/\s+/g, '').toUpperCase();
         opt.textContent = s.name;
@@ -358,12 +231,6 @@ function _populateAudioSpotDropdown() {
     });
 }
 
-/**
- * Check if a file exists in local storage (IndexedDB / native FS).
- * @param {string} path  Relative storage path
- * @returns {Promise<boolean>}
- * @private
- */
 async function _localFileExists(path) {
     try {
         const blob = await StorageAdapter.getFileBlob(path);
@@ -373,12 +240,6 @@ async function _localFileExists(path) {
     }
 }
 
-/**
- * Build a clickable link that opens a locally-stored file in a new tab.
- * @param {string} storagePath  Relative path in StorageAdapter
- * @param {string} label        Visible link text
- * @returns {HTMLAnchorElement}
- */
 function _makeLocalFileLink(storagePath, label) {
     const a = document.createElement('a');
     a.textContent = label;
@@ -396,16 +257,9 @@ function _makeLocalFileLink(storagePath, label) {
     return a;
 }
 
-/**
- * Update all 3 file slot UI elements based on server + local status.
- * @param {object} status  Response from checkProjectFiles()
- * @private
- */
 async function _renderUploadSlots(status) {
-    // Populate spot dropdown
     _populateAudioSpotDropdown();
 
-    // ── Audio ──
     const audioInfo = document.getElementById('slot-audio-info');
     const totalAudio = status.total_audio || 0;
     const spotNames = status.spots ? Object.keys(status.spots) : [];
@@ -419,7 +273,6 @@ async function _renderUploadSlots(status) {
         }
     }
 
-    // ── Aggregate: check local + server ──
     const project = getActiveProject();
     const pf = project ? getProjectFolderName(project) : '';
 
@@ -465,7 +318,6 @@ async function _renderUploadSlots(status) {
         }
     }
 
-    // ── Processed: check local + server ──
     const procInfo    = document.getElementById('slot-processed-info');
     const procLocal   = document.getElementById('slot-processed-local');
     const procUpload  = document.querySelector('#slot-processed .server-upload-btn');
@@ -509,19 +361,12 @@ async function _renderUploadSlots(status) {
         }
     }
 
-    // Auto-collapse panel when all files confirmed on server
     const panel = document.getElementById('server-upload-panel');
     if (panel && totalAudio > 0 && status.has_aggregate && status.has_processed) {
         panel.removeAttribute('open');
     }
 }
 
-/**
- * Handle click on upload/override buttons for aggregate or processed.
- * @param {string} category  'aggregate' | 'processed'
- * @param {boolean} force    true = override existing
- * @private
- */
 async function _handleServerUpload(category, force = false) {
     const msgEl = document.getElementById('server-upload-status-msg');
     const setMsg = (msg) => { if (msgEl) msgEl.textContent = msg; };
@@ -547,11 +392,6 @@ async function _handleServerUpload(category, force = false) {
     }
 }
 
-/**
- * Handle audio file selection → upload with progress bar + spot mapping.
- * Replaces controls with progress bar during upload, restores after.
- * @private
- */
 async function _handleAudioFileSelected(e) {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -569,7 +409,6 @@ async function _handleAudioFileSelected(e) {
     const progressLbl  = document.getElementById('audio-progress-label');
     const progressPct  = document.getElementById('audio-progress-pct');
 
-    // Switch to progress view
     if (controls) controls.style.display = 'none';
     if (progress) progress.style.display = 'block';
 
@@ -588,7 +427,6 @@ async function _handleAudioFileSelected(e) {
 
         if (progressLbl) progressLbl.textContent = `Uploading ${files.length} file(s) for ${spotName}…`;
 
-        // Use XMLHttpRequest for progress tracking
         await new Promise((resolve, reject) => {
             const xhr = new XMLHttpRequest();
             xhr.open('POST', `${base}/api/v1/projects/upload/audio`);
@@ -620,31 +458,15 @@ async function _handleAudioFileSelected(e) {
     } catch (err) {
         showToast(`Audio upload failed: ${err.message}`, 'failed');
     } finally {
-        // Restore controls
         if (progress) progress.style.display = 'none';
         if (progressBar) progressBar.style.width = '0%';
         if (controls) controls.style.display = 'flex';
-        // Reset file input
         const fileInput = document.getElementById('upload-audio-input');
         if (fileInput) fileInput.value = '';
     }
 }
 
-// ---------------------------------------------------------------------------
-// Status check — dispatches to watcher or server
-// ---------------------------------------------------------------------------
-
-/**
- * Update the indicator dot + status text for the active backend.
- *
- * Bug fix: colours are now applied to `style.color` on the ● text character
- * (els.statusIndicator), not `style.backgroundColor`, which coloured the box
- * behind the dot and did not affect the dot's fill colour.
- *
- * @private
- */
 async function _checkStatus() {
-    // Never clobber the live progress text while a server job is running.
     if (_runningServerJob) return;
 
     if (_serverMode) return _checkServerStatus();
@@ -653,7 +475,6 @@ async function _checkStatus() {
         const rawStatus  = await getWatcherStatus();
         const descriptor = getWatcherOnlineStatus(rawStatus);
 
-        // Bug fix #3: use style.color (the ● character) not style.backgroundColor
         if (els.statusIndicator) els.statusIndicator.style.color = descriptor.color;
         if (els.statusText)      els.statusText.textContent       = descriptor.text;
 
@@ -663,7 +484,6 @@ async function _checkStatus() {
             els.runBtn.textContent = descriptor.isBusy ? 'Watcher Busy...' : 'Queue Job';
         }
 
-        // Refresh script list if dropdown is empty
         if (els.scriptSelect && els.scriptSelect.options.length <= 1) {
             _loadScripts();
         }
@@ -672,10 +492,6 @@ async function _checkStatus() {
     }
 }
 
-/**
- * Server-mode status: probe /health and reflect reachability in the pill.
- * @private
- */
 async function _checkServerStatus() {
     if (!serverConfigured()) {
         if (els.statusIndicator) els.statusIndicator.style.color = '#dc3545';
@@ -707,21 +523,11 @@ async function _checkServerStatus() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Script loading
-// ---------------------------------------------------------------------------
-
-/**
- * Load the installed-scripts list and populate the script selector dropdown.
- * Preserves any previously selected script (re-selects it after refresh).
- * @private
- */
 async function _loadScripts() {
     if (!els.scriptSelect) return;
 
     const currentSelection  = els.scriptSelect.value;
 
-    // Source the script list from the active backend.
     let installedScripts;
     if (_serverMode) {
         try {
@@ -754,7 +560,6 @@ async function _loadScripts() {
         els.scriptSelect.appendChild(opt);
     });
 
-    // Restore previous selection and trigger param rendering
     if (
         currentSelection &&
         Array.from(els.scriptSelect.options).some(o => o.value === currentSelection)
@@ -764,16 +569,6 @@ async function _loadScripts() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Script parameter rendering
-// ---------------------------------------------------------------------------
-
-/**
- * Render the file-selector panel and dynamic parameter form for a chosen script.
- *
- * @param {string} scriptId  Value of the selected <option> in the script dropdown.
- * @private
- */
 function _loadScriptParams(scriptId) {
     if (els.runBtn) {
         els.runBtn.dataset.formReady = 'false';
@@ -796,7 +591,6 @@ function _loadScriptParams(scriptId) {
 
     let hasSpotDateInput = false;
 
-    // Render spot+date input panel if the script declares it
     if (_currentScript.inputs) {
         _currentScript.inputs.forEach(input => {
             if (input.type === 'spot_date_range') {
@@ -806,7 +600,6 @@ function _loadScriptParams(scriptId) {
         });
     }
 
-    // Render dynamic parameter fields (select / text)
     if (_currentScript.parameters) {
         _currentScript.parameters.forEach(param => {
             const row = document.createElement('div');
@@ -843,31 +636,18 @@ function _loadScriptParams(scriptId) {
         });
     }
 
-    // Scripts with no spot/date selector are instantly ready to run
     if (!hasSpotDateInput && els.runBtn) {
         els.runBtn.dataset.formReady = 'true';
-        _checkStatus(); // let the heartbeat re-evaluate the disabled state immediately
+        _checkStatus();
     }
 
     if (els.paramsContainer) els.paramsContainer.style.display = 'block';
 }
 
-// ---------------------------------------------------------------------------
-// File selector — spot + date range panel
-// ---------------------------------------------------------------------------
-
-/** Set of "YYYYMMDD" strings with audio for currently selected spots. */
 let _availableDates = new Set();
 
-/** Currently viewed month for each calendar { start: {year,month}, end: {year,month} } */
 let _calendarState = { start: null, end: null };
 
-/**
- * Scan external files linked to given spotIds, extract YYYYMMDD dates from
- * filenames. Returns a Set of "YYYYMMDD" strings.
- * @param {string[]} spotIds
- * @returns {Set<string>}
- */
 function _getAvailableDates(spotIds) {
     const idSet = new Set(spotIds);
     const dates = new Set();
@@ -883,9 +663,6 @@ function _getAvailableDates(spotIds) {
     return dates;
 }
 
-/**
- * Recalculate available dates from checked spots and re-render both calendars.
- */
 function _refreshAvailableDates() {
     const checked = document.querySelectorAll('.analysis-spot-checkbox:checked');
     const spotIds = Array.from(checked).map(cb => cb.value);
@@ -894,11 +671,6 @@ function _refreshAvailableDates() {
     _renderCalendar('end');
 }
 
-/**
- * Render an inline month-grid calendar into #cal-{which} container.
- * Dates with audio files get a coloured highlight.
- * @param {'start'|'end'} which
- */
 function _renderCalendar(which) {
     const container = document.getElementById(`cal-${which}`);
     if (!container) return;
@@ -906,15 +678,14 @@ function _renderCalendar(which) {
     const st = _calendarState[which];
     if (!st) return;
 
-    const { year, month } = st;                 // month 0-based
+    const { year, month } = st;
     const today     = new Date();
     const firstDay  = new Date(year, month, 1);
     const daysInMon = new Date(year, month + 1, 0).getDate();
-    const startDow  = firstDay.getDay();         // 0=Sun
+    const startDow  = firstDay.getDay();
 
     const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-    // Selected value (YYYY-MM-DD)
     const inputEl   = document.getElementById(`analysis-${which}-date`);
     const selVal    = inputEl ? inputEl.value : '';
     const selParts  = selVal ? selVal.split('-') : null;
@@ -931,17 +702,14 @@ function _renderCalendar(which) {
         <div style="display:grid; grid-template-columns:repeat(7,1fr); text-align:center; font-size:0.75rem; gap:1px;">
     `;
 
-    // Day-of-week header
     ['Su','Mo','Tu','We','Th','Fr','Sa'].forEach(d => {
         html += `<div style="font-weight:bold; color:var(--text-muted); padding:2px;">${d}</div>`;
     });
 
-    // Empty cells before day 1
     for (let i = 0; i < startDow; i++) {
         html += `<div></div>`;
     }
 
-    // Day cells
     for (let d = 1; d <= daysInMon; d++) {
         const yyyymmdd = `${year}${String(month + 1).padStart(2, '0')}${String(d).padStart(2, '0')}`;
         const isoDate  = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
@@ -977,7 +745,6 @@ function _renderCalendar(which) {
 
     html += `</div>`;
 
-    // Legend
     html += `<div style="display:flex; align-items:center; gap:6px; margin-top:6px; font-size:0.7rem; color:var(--text-muted);">
         <span style="display:inline-block; width:10px; height:10px; background:rgba(220,53,69,0.3); border-radius:2px;"></span> Has audio
     </div>`;
@@ -985,24 +752,23 @@ function _renderCalendar(which) {
     container.innerHTML = html;
 }
 
-/**
- * Inject the spot-checkbox list and date-range inputs into els.fileSelector.
- *
- * A single delegated listener on els.fileSelector (registered once in
- * _initFileSelectorListener) handles all change events from these controls.
- *
- * @param {string} label  Human-readable label from the script descriptor.
- * @private
- */
 function _renderSpotDateSelector(label) {
     const spots = getSpots();
 
+    const uniqueSpots = [];
+    const seenNames = new Set();
+    spots.forEach(s => {
+        if (seenNames.has(s.name)) return;
+        seenNames.add(s.name);
+        uniqueSpots.push(s);
+    });
+
     let spotsHtml = `
         <label class="analysis-selectall">
-            <input type="checkbox" id="analysis-select-all-spots"> Select all spots (${spots.length})
+            <input type="checkbox" id="analysis-select-all-spots"> Select all spots (${uniqueSpots.length})
         </label>
         <div class="analysis-spot-grid">`;
-    spots.forEach(s => {
+    uniqueSpots.forEach(s => {
         spotsHtml += `
             <label class="analysis-spot-card">
                 <input type="checkbox" class="analysis-spot-checkbox" value="${s.spotId}">
@@ -1014,8 +780,6 @@ function _renderSpotDateSelector(label) {
 
     _availableDates = new Set();
 
-    // Compact native date range (the old data-aware calendar is no longer needed
-    // — the UI doesn't track which dates have data anymore).
     els.fileSelector.innerHTML += `
         <div style="margin-bottom:14px;">
             <label style="display:block; margin-bottom:6px; font-weight:700;">${label}</label>
@@ -1037,20 +801,9 @@ function _renderSpotDateSelector(label) {
     `;
 }
 
-/**
- * Register a SINGLE delegated 'change' + 'click' listener on els.fileSelector.
- *
- * Handles:
- *  - spot checkbox change → refresh available dates + recalculate overlap
- *  - calendar day click   → set hidden date input + re-render + recalculate
- *  - calendar nav (◀▶)    → shift month + re-render
- *
- * @private
- */
 function _initFileSelectorListener() {
     if (_fileSelectorListenerAttached || !els.fileSelector) return;
 
-    // Change listener — spot checkboxes + select-all
     els.fileSelector.addEventListener('change', (e) => {
         if (e.target.id === 'analysis-select-all-spots') {
             els.fileSelector
@@ -1070,14 +823,13 @@ function _initFileSelectorListener() {
         }
     });
 
-    // Click listener — calendar day selection + nav arrows
     els.fileSelector.addEventListener('click', (e) => {
         const dayEl = e.target.closest('.cal-day');
         const navEl = e.target.closest('.cal-nav');
 
         if (dayEl) {
-            const which = dayEl.dataset.which;  // 'start' or 'end'
-            const date  = dayEl.dataset.date;   // 'YYYY-MM-DD'
+            const which = dayEl.dataset.which;
+            const date  = dayEl.dataset.date;
             const input = document.getElementById(`analysis-${which}-date`);
             if (input) {
                 input.value = date;
@@ -1104,16 +856,6 @@ function _initFileSelectorListener() {
     _fileSelectorListenerAttached = true;
 }
 
-// ---------------------------------------------------------------------------
-// Form readiness — simple spots + dates check
-// ---------------------------------------------------------------------------
-
-/**
- * Check if spots and date range are selected. If so, mark form ready.
- * No file counting, no dependency checks — just spots + dates.
- *
- * @private
- */
 function _updateFormReadiness() {
     const checkedSpots = document.querySelectorAll('.analysis-spot-checkbox:checked');
     const start        = document.getElementById('analysis-start-date')?.value;
@@ -1126,32 +868,15 @@ function _updateFormReadiness() {
     }
 }
 
-/**
- * Toggle the run button's `formReady` data attribute and re-evaluate enabled state.
- *
- * @param {boolean} ready
- * @private
- */
 function _setFormReady(ready) {
     if (!els.runBtn) return;
     els.runBtn.dataset.formReady = ready ? 'true' : 'false';
-    _checkStatus(); // let heartbeat decide if watcher is also ready
+    _checkStatus();
 }
 
-// ---------------------------------------------------------------------------
-// Run handler
-// ---------------------------------------------------------------------------
-
-/**
- * Gather form state, build job data via AnalysisService, and queue the job.
- * Replaces the inline alert() calls with showToast().
- *
- * @private
- */
 async function _handleRunClick() {
     if (!_currentScript) return;
 
-    // Auto-generate job name if blank
     let jobName = els.jobNameInput ? els.jobNameInput.value.trim() : '';
     if (!jobName) {
         const d  = new Date();
@@ -1180,7 +905,6 @@ async function _handleRunClick() {
         spotIds = Array.from(checkedSpots).map(cb => cb.value);
     }
 
-    // Collect dynamic parameter values from the rendered form
     const dynamicParams = {};
     els.dynamicForm.querySelectorAll('[data-param-id]').forEach(input => {
         dynamicParams[input.dataset.paramId] = input.value;
@@ -1189,13 +913,11 @@ async function _handleRunClick() {
     const spots         = getSpots();
     const externalFiles = getExternalFiles();
 
-    // ── Server mode: upload → run → poll → download (see ServerService) ──────
     if (_serverMode) {
         await _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParams, spots, externalFiles });
         return;
     }
 
-    // ── Watcher mode: write a job descriptor into jobs/queue ─────────────────
     const jobData = buildJobData(
         jobName,
         _currentScript,
@@ -1230,13 +952,6 @@ async function _handleRunClick() {
     }
 }
 
-/**
- * Run the selected step on the lab server, streaming progress into the status
- * pill. The popup stays open so the user can watch upload/run/download; on
- * success it closes and the Jobs dashboard will show the downloaded results.
- *
- * @private
- */
 async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParams, spots, externalFiles }) {
     _runningServerJob = true;
     const setStatus = (msg) => { if (els.statusText) els.statusText.textContent = msg; };
@@ -1262,7 +977,6 @@ async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParam
         setStatus(`Failed: ${e.message}`);
         if (els.statusIndicator) els.statusIndicator.style.color = '#dc3545';
 
-        // Show run log in the acknowledgement area if available
         const ackEl = document.getElementById('analysis-file-acknowledgement');
         if (ackEl) {
             try {
@@ -1285,11 +999,10 @@ async function _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParam
                         }
                     }
                 }
-            } catch { /* best-effort log display */ }
+            } catch { }
         }
     } finally {
         _runningServerJob = false;
         if (els.runBtn) { els.runBtn.textContent = 'Run on Server'; els.runBtn.disabled = false; }
     }
 }
-// EOF — AnalysisUI (watcher + server compute modes)

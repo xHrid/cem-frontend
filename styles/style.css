@@ -1,41 +1,26 @@
-/* ============================================================================
-   CEM Toolkit — "Field Naturalist's Journal" theme
-   ----------------------------------------------------------------------------
-   Aesthetic: a working field journal. Warm parchment + deep moss-forest, ink
-   text, amber/terracotta accents, faint topographic contour atmosphere. Serif
-   display (Fraunces), humanist UI sans (Hanken Grotesk), monospace for the
-   "instrument readout" bits — coordinates, IDs, logs (JetBrains Mono).
-   Light + dark are both first-class.
-   ============================================================================ */
-
-/* =========================================
-   1. TOKENS
-   ========================================= */
 :root {
-    /* Type */
+
     --font-display: 'Fraunces', 'Iowan Old Style', Georgia, serif;
     --font-ui: 'Hanken Grotesk', system-ui, sans-serif;
     --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
 
-    /* Parchment light palette */
-    --paper:            #f4ecd8;   /* page */
-    --paper-2:          #efe5cc;   /* slightly deeper page */
-    --bg-surface:       #fbf6e9;   /* cards / modals */
-    --bg-surface-alt:   #f1e7cf;   /* inset wells */
+    --paper:            #f4ecd8;
+    --paper-2:          #efe5cc;
+    --bg-surface:       #fbf6e9;
+    --bg-surface-alt:   #f1e7cf;
     --bg-surface-hover: #e8dcbe;
 
-    --ink:              #2c2a23;   /* primary text */
-    --ink-soft:         #6c6354;   /* muted text */
+    --ink:              #2c2a23;
+    --ink-soft:         #6c6354;
 
-    --forest:           #2f5d3b;   /* dominant green */
+    --forest:           #2f5d3b;
     --forest-deep:      #244a2f;
-    --lichen:           #6f8f4e;   /* secondary green */
-    --amber:            #c8662a;   /* sharp accent */
+    --lichen:           #6f8f4e;
+    --amber:            #c8662a;
     --amber-deep:       #a8501d;
     --rust:            #9c3b1b;
-    --sky:              #2f6f8f;   /* info accent (links) */
+    --sky:              #2f6f8f;
 
-    /* Semantic aliases (kept for existing selectors) */
     --primary-color:  var(--forest);
     --primary-hover:  var(--forest-deep);
     --accent-blue:    var(--sky);
@@ -43,8 +28,6 @@
     --text-dark:      var(--ink);
     --text-muted:     var(--ink-soft);
 
-    /* Text color that sits ON an accent-colored fill (buttons, pills). Light
-       theme accents are dark green/orange → cream reads well. */
     --on-accent:       #fbf6e9;
 
     --bg-glass:        rgba(250, 245, 232, 0.82);
@@ -65,26 +48,24 @@
     color-scheme: light;
 }
 
-/* ── Dark: deep forest night — richer, higher contrast ───────────────────── */
 [data-theme="dark"] {
-    --paper:            #0c100b;   /* near-black, faint green cast */
+    --paper:            #0c100b;
     --paper-2:          #090c08;
-    --bg-surface:       #161d14;   /* cards lift clearly off the page */
+    --bg-surface:       #161d14;
     --bg-surface-alt:   #1f291b;
     --bg-surface-hover: #2a3724;
 
-    --ink:              #f1ecda;   /* bright parchment text */
+    --ink:              #f1ecda;
     --ink-soft:         #9fa98c;
 
-    --forest:           #8fcf6c;   /* vivid lichen green — pops on dark */
+    --forest:           #8fcf6c;
     --forest-deep:      #79bb57;
     --lichen:           #abdc7e;
-    --amber:            #f2a44e;   /* warm, saturated accent */
+    --amber:            #f2a44e;
     --amber-deep:       #db8c38;
     --rust:             #e5703f;
     --sky:              #74c4e6;
 
-    /* Dark accents are BRIGHT (lichen/amber) → near-black text makes them pop. */
     --on-accent:       #0e130b;
 
     --bg-glass:        rgba(14, 19, 12, 0.90);
@@ -97,7 +78,6 @@
     color-scheme: dark;
 }
 
-/* Dark page gets a faint forest vignette for depth (atmosphere, not noise). */
 [data-theme="dark"] body {
     background:
         radial-gradient(120% 80% at 50% -10%, #16221340 0%, transparent 60%),
@@ -136,15 +116,11 @@ h1, h2, h3, h4 {
 
 #map { height: 100vh; width: 100vw; z-index: 1; }
 
-/* Scrollbars */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 10px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--lichen); }
 
-/* =========================================
-   2. SHARED CONTROLS
-   ========================================= */
 :is(button, .popup-btn, .save-btn, .import-action-btn,
 .import-secondary-action-btn, .show-external-data-btn) {
     border: none;
@@ -211,9 +187,6 @@ input[type="checkbox"], input[type="radio"] {
     width: 17px; height: 17px; accent-color: var(--forest); margin: 0; cursor: pointer;
 }
 
-/* =========================================
-   3. SIDEBAR
-   ========================================= */
 #menu-toggle {
     position: fixed; top: 16px; left: 16px; z-index: 1100;
     background: var(--forest); color: var(--on-accent);
@@ -238,7 +211,6 @@ input[type="checkbox"], input[type="radio"] {
 }
 #controls.open { transform: translateX(0); }
 
-/* Staggered reveal of sidebar sections on open */
 #controls.open > * {
     animation: rise 0.5s var(--transition-slide) both;
 }
@@ -260,7 +232,6 @@ input[type="checkbox"], input[type="radio"] {
     color: var(--ink-soft);
 }
 
-/* Disabled overlay for all controls until storage is initialized */
 .app-controls-disabled {
     opacity: 0.45;
     pointer-events: none;
@@ -289,7 +260,6 @@ input[type="checkbox"], input[type="radio"] {
 #btn-select-storage { background-color: var(--amber) !important; color: var(--on-accent); }
 #btn-select-storage:hover { background-color: var(--amber-deep) !important; }
 
-/* Control rows — Spots / Routes */
 .control {
     display: grid;
     grid-template-columns: 1fr auto auto;
@@ -299,7 +269,7 @@ input[type="checkbox"], input[type="radio"] {
     border-radius: var(--radius-md);
     border: 1px solid var(--border-light);
 }
-/* #1 FIX: Add / Record buttons identical width */
+
 .control > button {
     min-width: 92px;
     background: var(--amber);
@@ -308,7 +278,7 @@ input[type="checkbox"], input[type="radio"] {
     padding: 8px 10px;
 }
 .control > button:hover { background: var(--amber-deep); }
-#toggle-tracking { /* width matches #open-form via min-width above */ }
+#toggle-tracking {  }
 
 :is(.spot-toggle, label[for="show-routes-toggle"]) {
     display: flex; align-items: center; gap: 7px; font-size: 0.85rem; cursor: pointer; color: var(--ink);
@@ -324,9 +294,6 @@ input[type="checkbox"], input[type="radio"] {
 }
 #latlon label { font-family: var(--font-mono); white-space: nowrap; }
 
-/* =========================================
-   4. MODALS
-   ========================================= */
 .modal-dialog {
     border: none; padding: 0; margin: auto;
     background: transparent;
@@ -374,12 +341,8 @@ input[type="checkbox"], input[type="radio"] {
 .modal-dialog :is(h2,h3,h4,label,strong),
 .popup-content :is(h2,h3,h4,label,strong) { color: var(--ink); }
 
-/* =========================================
-   5. FORM PIECES
-   ========================================= */
 .media-controls { display: flex; align-items: center; gap: 12px; margin: 16px 0; flex-wrap: wrap; }
-/* Audio players: always full width — the native control otherwise renders tiny
-   until playback starts, then jumps wider. Force a stable full-width box. */
+
 audio { width: 100%; display: block; }
 .media-controls audio { flex: 1 1 100%; min-width: 0; }
 
@@ -392,14 +355,13 @@ audio { width: 100%; display: block; }
     font-size: 0.85rem; font-weight: 600; white-space: nowrap;
     transition: transform var(--transition-fast), background var(--transition-fast);
 }
-/* Icon-only buttons (mic toggle) — keep square */
+
 #audio-toggle.custom-upload { width: 48px; padding: 0; font-size: 1.25rem; }
 .custom-upload:hover { transform: translateY(-2px); }
 .custom-upload.selected { background-color: var(--sky); color: var(--on-accent); }
 .custom-upload.recording { background-color: var(--rust); color: var(--on-accent); animation: pulse 1.4s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
 
-/* Image preview grid for multi-image spot form */
 .image-preview-grid {
     display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px;
 }
@@ -423,7 +385,6 @@ audio { width: 100%; display: block; }
     background: var(--rust);
 }
 
-/* #4 FIX: tidy "use current location / time" groups + custom fields */
 .field-toggle {
     display: flex; align-items: center; gap: 8px;
     font-size: 0.9rem; cursor: pointer; color: var(--ink);
@@ -442,7 +403,6 @@ audio { width: 100%; display: block; }
 }
 .inline-fields input { margin: 0; background: var(--bg-surface); }
 
-/* Import multi-select */
 .import-multi-select-box {
     border: 1px solid var(--border-color); padding: 8px; max-height: 170px; overflow-y: auto;
     background-color: var(--bg-surface-alt); border-radius: var(--radius-md); margin-bottom: 14px;
@@ -450,16 +410,12 @@ audio { width: 100%; display: block; }
 .import-multi-select-box label { display: flex; align-items: center; gap: 8px; padding: 7px; border-radius: var(--radius-sm); cursor: pointer; }
 .import-multi-select-box label:hover { background: var(--bg-surface-hover); }
 
-/* #8 FIX: "Import as reference" toggle on one line + hint underneath */
 .ref-toggle {
     display: flex; align-items: center; gap: 8px; white-space: nowrap;
     font-size: 0.92rem; font-weight: 600; cursor: pointer; color: var(--ink);
 }
 .ref-hint { display: block; font-size: 0.74rem; color: var(--ink-soft); margin: 2px 0 0 25px; }
 
-/* =========================================
-   6. SPOT DETAILS — redesigned, horizontal entries (#5, #6)
-   ========================================= */
 #spot-details-menu {
     position: fixed; top: 0; right: 0; width: 100%; max-width: 620px; height: 100%;
     background: var(--bg-surface);
@@ -478,7 +434,6 @@ audio { width: 100%; display: block; }
 }
 #close-spot-details:hover, #route-panel-close:hover { background: var(--rust); color: var(--on-accent); }
 
-/* Header block */
 .spot-detail-head h2 { font-size: 1.7rem; line-height: 1.1; }
 .spot-detail-coords {
     font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-soft);
@@ -490,9 +445,6 @@ audio { width: 100%; display: block; }
 .spot-detail-actions .btn-addmore { background: var(--forest); color: var(--on-accent); }
 .spot-detail-actions .btn-addmore:hover { background: var(--forest-deep); }
 
-/* Gallery: arrows are real flex boxes BESIDE the rail (fully clickable). The
-   rail shows one full-width card, swiped (touch) or stepped (buttons). Mouse-
-   wheel scrolling is blocked in JS — see SpotManager. */
 .spot-rail-wrap { position: relative; }
 .spot-entry-rail {
     display: flex; gap: 16px; overflow-x: auto; padding: 6px 2px 18px;
@@ -503,7 +455,7 @@ audio { width: 100%; display: block; }
 .spot-entry-rail::-webkit-scrollbar { display: none; }
 .spot-entry {
     scroll-snap-align: center;
-    flex: 0 0 100%; min-width: 100%;          /* one full-width card at a time */
+    flex: 0 0 100%; min-width: 100%;
     background: var(--bg-surface-alt);
     border: 1px solid var(--border-color);
     border-radius: var(--radius-md);
@@ -513,8 +465,6 @@ audio { width: 100%; display: block; }
 }
 .spot-entry img { max-height: 440px; object-fit: contain; background: var(--paper-2); }
 
-/* Gallery arrows — float OVER the card edges so cards use the full width.
-   Absolute + inside the wrap bounds = reliable full-button click target. */
 .rail-nav {
     position: absolute; top: 50%; transform: translateY(-50%); z-index: 5;
     width: 42px; height: 42px; border-radius: 50%;
@@ -526,7 +476,7 @@ audio { width: 100%; display: block; }
 .rail-nav:hover { opacity: 1; }
 .rail-nav.prev { left: 8px; }
 .rail-nav.next { right: 8px; }
-/* Keep the vertical centring while adding a subtle horizontal nudge on press */
+
 .rail-nav:active { transform: translateY(-50%); }
 .rail-nav.prev:active { transform: translate(-3px, -50%); }
 .rail-nav.next:active { transform: translate(3px, -50%); }
@@ -560,17 +510,14 @@ audio { width: 100%; display: block; }
     border-bottom: 1px solid var(--border-color); font-size: 0.9rem;
 }
 
-/* =========================================
-   7. JOBS DASHBOARD — stable size (#7)
-   ========================================= */
 #jobs-popup .popup-content {
     width: 88vw; max-width: 1080px;
-    height: 84vh;             /* fixed — never resizes when switching jobs */
+    height: 84vh;
     max-height: 84vh;
     padding: 0; overflow: hidden;
     display: flex; flex-direction: column;
 }
-.jobs-layout { display: flex; flex: 1; min-height: 0; }   /* min-height:0 lets children scroll, not grow */
+.jobs-layout { display: flex; flex: 1; min-height: 0; }
 #jobs-list-sidebar {
     width: 290px; flex: none; border-right: 1px solid var(--border-color);
     overflow-y: auto; background: var(--bg-surface-alt);
@@ -590,7 +537,7 @@ audio { width: 100%; display: block; }
 #viewer-preview-area {
     border: 1px solid var(--border-color); border-radius: var(--radius-md);
     background: var(--bg-surface-alt); padding: 14px;
-    flex: 1; min-height: 0; overflow: auto;   /* preview scrolls inside; dialog stays put */
+    flex: 1; min-height: 0; overflow: auto;
 }
 #viewer-preview-area pre {
     background: #161b10; color: #d7e4c2; padding: 15px; border-radius: var(--radius-sm);
@@ -602,9 +549,6 @@ audio { width: 100%; display: block; }
 #viewer-job-name { font-family: var(--font-display); }
 #viewer-job-id { font-family: var(--font-mono); font-size: 0.78rem; }
 
-/* =========================================
-   8. SYNC DASHBOARD / TOAST
-   ========================================= */
 .sync-group-header {
     background: var(--bg-surface-hover); padding: 10px 15px; font-weight: 700;
     margin-top: 20px; border-radius: var(--radius-md); font-size: 0.78rem; color: var(--ink-soft);
@@ -620,8 +564,7 @@ audio { width: 100%; display: block; }
     background-color: var(--forest-deep); color: var(--on-accent); border-radius: var(--radius-md);
     z-index: 99999; box-shadow: var(--shadow-modal);
     font-size: 0.92rem; border-left: 5px solid var(--lichen);
-    /* Hidden via transform (NOT via right:-360) so it never leaves a sliver of
-       bar on screen, and so left/right can both be set on mobile. */
+
     transform: translateY(170%); opacity: 0; pointer-events: auto;
     transition: transform var(--transition-slide), opacity var(--transition-slide);
 }
@@ -629,9 +572,6 @@ audio { width: 100%; display: block; }
 #toast-notification.success { border-left-color: var(--lichen); }
 #toast-notification.failed  { border-left-color: var(--rust); }
 
-/* =========================================
-   9. PROJECT / ANALYSIS
-   ========================================= */
 .project-dropdown {
     width: 100%; padding: 9px 10px; border-radius: var(--radius-md);
     border: 1px solid var(--border-color); background: var(--bg-surface);
@@ -656,7 +596,6 @@ input[type=range] { width: 100%; margin: 5px 0; accent-color: var(--forest); }
 .form-file-picker:hover { border-color: var(--forest); background: var(--bg-surface-alt); }
 .file-picked-name { font-size: 0.85rem; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* #9 — Analysis "Select Input Data" roomier + clearer */
 #analysis-popup .popup-content { max-width: min(94vw, 780px); }
 #analysis-file-selector {
     height: auto; max-height: 46vh; min-height: 160px; resize: none;
@@ -678,9 +617,6 @@ input[type=range] { width: 100%; margin: 5px 0; accent-color: var(--forest); }
 .analysis-mode-btn { background: var(--bg-surface-alt); color: var(--ink); }
 .analysis-mode-btn.active, .analysis-mode-btn:hover { background: var(--forest); color: var(--on-accent); border-color: var(--forest) !important; }
 
-/* =========================================
-   10. THEME TOGGLE — hide when a right panel is open (#3 overlap)
-   ========================================= */
 #theme-toggle {
     position: fixed; top: 16px; right: 16px; z-index: 1100;
     background: var(--bg-glass); color: var(--ink);
@@ -693,9 +629,6 @@ input[type=range] { width: 100%; margin: 5px 0; accent-color: var(--forest); }
 #theme-toggle:hover { background: var(--bg-surface-alt); }
 body.panel-open #theme-toggle { opacity: 0; pointer-events: none; transform: translateY(-8px); }
 
-/* =========================================
-   11. SHARING
-   ========================================= */
 .share-project-item { display: flex; align-items: center; gap: 7px; padding: 5px 0; font-size: 0.9rem; cursor: pointer; }
 .share-project-item input { flex: none; }
 .share-project-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -709,9 +642,6 @@ body.panel-open #theme-toggle { opacity: 0; pointer-events: none; transform: tra
 #btn-sync-shared:hover { background: var(--forest-deep); }
 #project-select option { font-size: 0.9rem; }
 
-/* =========================================
-   12. RESPONSIVE
-   ========================================= */
 @media (max-width: 768px) {
     #controls {
         width: 100%; height: auto; max-height: 74vh; bottom: 0; top: auto;
@@ -749,7 +679,6 @@ body.panel-open #theme-toggle { opacity: 0; pointer-events: none; transform: tra
 
     #toast-notification { left: 16px; right: 16px; max-width: none; width: auto; }
 
-    /* Hide the hamburger while a full-screen side panel is open (it overlapped the title). */
     body.panel-open #menu-toggle { display: none; }
 
     .control { gap: 8px; }
@@ -760,17 +689,10 @@ body.panel-open #theme-toggle { opacity: 0; pointer-events: none; transform: tra
     .analysis-spot-grid { grid-template-columns: 1fr; }
 }
 
-
-/* =========================================
-   13. INTERACTION POLISH
-   ========================================= */
-
-/* Lat/Lon pill is a "center on me" button — give it press affordance */
 #latlon { transition: background var(--transition-fast), transform var(--transition-fast), box-shadow var(--transition-fast); }
 #latlon:hover { background-color: var(--forest); box-shadow: 0 6px 18px rgba(0,0,0,0.28); }
 #latlon:active { transform: translateX(-50%) scale(0.96); }
 
-/* Kill the blue tap-flash everywhere; default to non-selectable UI chrome */
 * { -webkit-tap-highlight-color: transparent; }
 button, .small-btn, .control, .control-button, .div-label, label,
 .custom-upload, .rail-nav, #menu-toggle, #theme-toggle, #latlon,
@@ -779,7 +701,7 @@ button, .small-btn, .control, .control-button, .div-label, label,
 .diff-project, nav, .sync-group-header, .modal-dialog h3, .popup-content h3 {
     -webkit-user-select: none; -moz-user-select: none; user-select: none;
 }
-/* …but KEEP selectable the things a user may want to copy */
+
 input, textarea, code, pre,
 .entry-desc, .entry-coords, .spot-detail-coords,
 #share-link-display, #viewer-preview-area, .external-data-list,
@@ -787,8 +709,6 @@ input, textarea, code, pre,
     -webkit-user-select: text; -moz-user-select: text; user-select: text;
 }
 
-/* Item 3: dark-theme readability for the analysis help/info boxes
-   (these use hardcoded light backgrounds inline; override on dark) */
 [data-theme="dark"] #server-help {
     background: #14323f !important; color: #cfe8f5 !important; border-color: #2c5a6c !important;
 }
@@ -799,8 +719,6 @@ input, textarea, code, pre,
 }
 [data-theme="dark"] #watcher-offline-help code { color: #ffe9a8; }
 
-
-/* Creator pill — truncated email, tap to expand. Used in sync diff + spot detail */
 .creator-pill {
     display: inline-flex; align-items: center; max-width: 170px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

@@ -1,33 +1,3 @@
-/**
- * RouteManager.js — GPS route tracking, display, and point annotations
- *
- * Pattern : Module Pattern (private state + narrow exported API)
- *
- * Model
- * -----
- * A route is a transect walk: an ordered, de-duplicated array of {lat,lng}
- * points. Routes are first-class LOCATION OBJECTS, treated like spots — you can
- * pin observations (photo / audio / description) to any point along the line.
- *
- *   route = {
- *     id, projectId, name, timestamp,
- *     points:      [{lat,lng}, ...],          // the walked line (stored efficiently)
- *     annotations: [{ id, latitude, longitude, description,
- *                     image_local_filename, audio_local_filename, timestamp }, ...]
- *   }
- *
- * Features
- * --------
- *  - Record a walk (live polyline) → save with a name.
- *  - "Show" toggle renders every saved route + its annotation markers.
- *  - Tap a point on a route → a highlighted circle marks the spot and a side
- *    form opens to add photo/audio/description (with "Add another").
- *  - Tap an annotation marker → view its media, add more, or delete.
- *
- * Bug history (kept): see git log. Routes previously recorded but never
- * displayed because no render path existed; annotations were not supported.
- */
-
 import Config                   from '../core/Config.js';
 import EventBus, { EVENTS }     from '../core/EventBus.js';
 import {
@@ -43,56 +13,28 @@ import { openModal, closeModal } from '../ui/ModalManager.js';
 import { downscaleImage }       from '../data/imageUtils.js';
 import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 
-// ---------------------------------------------------------------------------
-// Module-private state — recording
-// ---------------------------------------------------------------------------
-
-/** @type {Array<{lat:number,lng:number}>} live waypoints for the current session */
 let _routePoints = [];
-/** @type {L.Polyline|null} live polyline drawn while recording */
 let _routePolyline = null;
-/** @type {boolean} */
 let _isTracking = false;
 
-/**
- * Annotations the user pins WHILE recording, before the route has an id. Each is
- * { latitude, longitude, description, imageFile, audioBlob }. Flushed onto the
- * real route (via saveRouteAnnotation) the moment the route is saved.
- * @type {Array<object>}
- */
 let _pendingAnnotations = [];
-/** @type {L.LayerGroup|null} shows the pending pins on the map during recording. */
 let _liveAnnoLayer = null;
 
-/** Sentinel routeId used by the annotation form while a route is still recording. */
 const LIVE_ROUTE_ID = '__live__';
 
-// ---------------------------------------------------------------------------
-// Module-private state — display + annotation
-// ---------------------------------------------------------------------------
-
-/** @type {L.LayerGroup|null} holds all saved-route polylines + annotation markers */
 let _routesLayer = null;
-/** @type {L.CircleMarker|null} the temporary "you are adding here" highlight */
 let _draftMarker = null;
-/** Route + coords currently targeted by the annotation form. */
-let _annotationTarget = null; // { routeId, lat, lng }
+let _annotationTarget = null;
 
-/** Last active project id — distinguishes a real switch from a sync refresh. */
 let _lastProjectId = null;
 
-// Annotation audio recording state (self-contained — independent of SpotManager)
 let _mediaRecorder = null;
 let _audioChunks = [];
 let _recordedAudioBlob = null;
 
-const HIGHLIGHT_COLOR = '#e91e63';   // draft point being added
-const ANNOTATION_COLOR = '#ff5722';  // saved annotation markers
-const ROUTE_COLOR = '#1565c0';       // saved route line
-
-// ---------------------------------------------------------------------------
-// Recording
-// ---------------------------------------------------------------------------
+const HIGHLIGHT_COLOR = '#e91e63';
+const ANNOTATION_COLOR = '#ff5722';
+const ROUTE_COLOR = '#1565c0';
 
 function _onLocationFound(e) {
     if (!_isTracking) return;
@@ -109,15 +51,12 @@ function _handleTrackingToggle(btn) {
         if (_routePolyline) map.removeLayer(_routePolyline);
         _routePolyline = L.polyline([], { color: 'blue', weight: 4 }).addTo(map);
 
-        // Let the user pin observations onto the route AS THEY WALK — same form
-        // as a saved route, just buffered until the route gets an id on save.
         _routePolyline.on('click', (e) => {
             if (!_isTracking) return;
             L.DomEvent.stopPropagation(e);
             _beginAnnotation(LIVE_ROUTE_ID, e.latlng.lat, e.latlng.lng);
         });
 
-        // Fresh recording session — drop any pins left over from an abandoned one.
         _pendingAnnotations = [];
         if (_liveAnnoLayer) map.removeLayer(_liveAnnoLayer);
         _liveAnnoLayer = L.layerGroup().addTo(map);
@@ -131,6 +70,19 @@ function _handleTrackingToggle(btn) {
         btn.style.background  = '';
         openModal('save-route-dialog');
     }
+}
+
+function _cancelTracking() {
+    if (!_isTracking && _routePoints.length === 0) return;
+    _isTracking = false;
+    _routePoints = [];
+    _pendingAnnotations = [];
+    const map = getMap();
+    if (_routePolyline) { map.removeLayer(_routePolyline); _routePolyline = null; }
+    if (_liveAnnoLayer) { map.removeLayer(_liveAnnoLayer); _liveAnnoLayer = null; }
+    closeModal('save-route-dialog');
+    const btn = document.getElementById('toggle-tracking');
+    if (btn) { btn.textContent = 'Record'; btn.style.background = ''; }
 }
 
 async function _handleRouteFormSubmit(e) {
@@ -150,7 +102,6 @@ async function _handleRouteFormSubmit(e) {
         const newRoute = await saveRoute({ name, points: _dedupePoints(_routePoints) });
         showToast('Route saved locally.', 'success');
 
-        // Flush any observations the user pinned while walking onto the new route.
         if (_pendingAnnotations.length) {
             let failed = 0;
             for (const a of _pendingAnnotations) {
@@ -184,7 +135,6 @@ async function _handleRouteFormSubmit(e) {
         const routeNameInput = document.getElementById('route-name');
         if (routeNameInput) routeNameInput.value = '';
 
-        // Show the freshly saved route immediately if the toggle is on.
         if (_isRoutesCheckboxChecked()) displayRoutes();
     } catch (err) {
         console.error('[RouteManager] saveRoute failed:', err);
@@ -192,14 +142,6 @@ async function _handleRouteFormSubmit(e) {
     }
 }
 
-/**
- * Drop redundant points: skip consecutive samples closer than ~3 m so the
- * stored line stays compact (a route is "an arrow of lat/lons stored
- * efficiently — no redundant info, not very close points").
- *
- * @param {Array<{lat:number,lng:number}>} pts
- * @returns {Array<{lat:number,lng:number}>}
- */
 function _dedupePoints(pts) {
     if (pts.length < 2) return pts;
     const MIN_M = 3;
@@ -209,13 +151,11 @@ function _dedupePoints(pts) {
         const b = pts[i];
         if (_haversine(a.lat, a.lng, b.lat, b.lng) >= MIN_M) out.push(b);
     }
-    // Always keep the final point so the line ends where the walk ended.
     const last = pts[pts.length - 1];
     if (out[out.length - 1] !== last) out.push(last);
     return out;
 }
 
-/** Great-circle distance in metres. */
 function _haversine(lat1, lon1, lat2, lon2) {
     const R = 6371000;
     const toRad = (d) => (d * Math.PI) / 180;
@@ -226,20 +166,11 @@ function _haversine(lat1, lon1, lat2, lon2) {
     return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// ---------------------------------------------------------------------------
-// Display
-// ---------------------------------------------------------------------------
-
-/** Read the show-routes toggle state. */
 function _isRoutesCheckboxChecked() {
     const cb = document.getElementById('show-routes-toggle');
     return cb ? cb.checked : false;
 }
 
-/**
- * Render every saved route for the active project as a polyline, plus a marker
- * for each annotation. Rebuilds the layer from scratch on every call.
- */
 export function displayRoutes() {
     const map = getMap();
     if (_routesLayer) map.removeLayer(_routesLayer);
@@ -262,13 +193,11 @@ export function displayRoutes() {
 
         line.bindTooltip(route.name || 'Route', { sticky: true });
 
-        // Tap the line → start adding an annotation at the tapped point.
         line.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
             _beginAnnotation(route.id, e.latlng.lat, e.latlng.lng);
         });
 
-        // Render existing annotation markers.
         for (const a of (route.annotations || [])) {
             if (a.latitude == null || a.longitude == null) continue;
             const marker = L.circleMarker([a.latitude, a.longitude], {
@@ -287,7 +216,6 @@ export function displayRoutes() {
     }
 }
 
-/** Remove the routes layer from the map entirely. */
 export function clearRoutesLayer() {
     if (_routesLayer) {
         getMap().removeLayer(_routesLayer);
@@ -303,14 +231,6 @@ function _clearDraftMarker() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Annotation — side panel form
-// ---------------------------------------------------------------------------
-
-/**
- * Begin annotating a point: drop a highlighted circle at the tapped location
- * and open the side form. Mirrors the spot "add" experience.
- */
 function _beginAnnotation(routeId, lat, lng) {
     _annotationTarget = { routeId, lat, lng };
 
@@ -328,7 +248,6 @@ function _beginAnnotation(routeId, lat, lng) {
     _openRoutePanel();
 }
 
-/** Build the form markup inside the route side panel. */
 function _renderAnnotationForm(lat, lng) {
     const content = document.getElementById('route-panel-content');
     if (!content) return;
@@ -385,8 +304,6 @@ async function _handleAnnotationSubmit(e) {
         const { routeId, lat, lng } = _annotationTarget;
 
         if (routeId === LIVE_ROUTE_ID) {
-            // Route not saved yet — buffer the observation and pin it on the map.
-            // It gets persisted onto the real route in _handleRouteFormSubmit.
             _pendingAnnotations.push({
                 latitude: lat, longitude: lng, description: desc,
                 imageFile, audioBlob: _recordedAudioBlob,
@@ -421,10 +338,6 @@ async function _handleAnnotationSubmit(e) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Annotation — details view
-// ---------------------------------------------------------------------------
-
 async function _showAnnotationDetails(route, ann) {
     const content = document.getElementById('route-panel-content');
     if (!content) return;
@@ -446,7 +359,6 @@ async function _showAnnotationDetails(route, ann) {
     `;
     content.querySelector('#route-ann-desc-view').textContent = ann.description || 'No notes';
 
-    // ── Image (local first, public URL for Drive-only — no CORS issue with <img>) ──
     const imgBox = content.querySelector('#route-ann-img');
     if (ann.image_local_filename || ann.image_drive_id) {
         const url = ann.image_local_filename ? await getLocalFileUrl(ann.image_local_filename) : null;
@@ -460,7 +372,6 @@ async function _showAnnotationDetails(route, ann) {
         }
     }
 
-    // ── Audio (on-demand: CORS blocks public URL playback) ──
     const audBox = content.querySelector('#route-ann-aud');
     if (ann.audio_local_filename || ann.audio_drive_id) {
         const url = ann.audio_local_filename ? await getLocalFileUrl(ann.audio_local_filename) : null;
@@ -469,7 +380,6 @@ async function _showAnnotationDetails(route, ann) {
         } else if (ann.audio_drive_id) {
             const dl = getPublicUrl(ann.audio_drive_id, 'audio');
             if (Config.proxy?.workerUrl) {
-                // Proxy adds CORS headers → inline <audio> works
                 audBox.innerHTML =
                     `<audio controls src="${dl}" style="width:100%;"></audio>` +
                     `<button class="on-demand-dl" data-drive-id="${ann.audio_drive_id}" data-rel-path="${ann.audio_local_filename || ''}" data-kind="audio" style="font-size:0.78rem; background:none; border:1px solid var(--border-color); border-radius:6px; padding:4px 10px; margin-top:4px; cursor:pointer; color:var(--text-muted);">⬇ Save locally</button>`;
@@ -485,7 +395,6 @@ async function _showAnnotationDetails(route, ann) {
         }
     }
 
-    // Wire up on-demand download buttons
     content.querySelectorAll('.on-demand-dl').forEach(btn => {
         btn.addEventListener('click', async () => {
             const { driveId, relPath, kind } = btn.dataset;
@@ -496,7 +405,7 @@ async function _showAnnotationDetails(route, ann) {
                 const result = await downloadMediaFile(driveId, relPath, kind);
                 if (result) {
                     showToast('Downloaded — rendering.', 'success');
-                    _showAnnotationDetails(route, ann); // re-render
+                    _showAnnotationDetails(route, ann);
                 } else {
                     const dl = getPublicUrl(driveId, kind);
                     window.open(dl, '_blank');
@@ -514,7 +423,6 @@ async function _showAnnotationDetails(route, ann) {
 
     content.querySelector('#route-ann-close')?.addEventListener('click', _closeRoutePanel);
     content.querySelector('#route-ann-addmore')?.addEventListener('click', () => {
-        // Add another observation at the same point — same flow as spots' "Add More".
         _beginAnnotation(route.id, ann.latitude, ann.longitude);
     });
     content.querySelector('#route-ann-delete')?.addEventListener('click', async () => {
@@ -531,10 +439,6 @@ async function _showAnnotationDetails(route, ann) {
 
     _openRoutePanel();
 }
-
-// ---------------------------------------------------------------------------
-// Annotation — audio capture (independent of SpotManager)
-// ---------------------------------------------------------------------------
 
 function _bindAnnotationAudioToggle() {
     const toggle = document.getElementById('route-ann-audio-toggle');
@@ -576,10 +480,6 @@ function _resetAnnotationAudio() {
     _audioChunks = [];
 }
 
-// ---------------------------------------------------------------------------
-// Side panel show/hide + injection
-// ---------------------------------------------------------------------------
-
 function _openRoutePanel() {
     document.getElementById('route-side-panel')?.classList.add('open');
     document.body.classList.add('panel-open');
@@ -589,10 +489,6 @@ function _closeRoutePanel() {
     document.body.classList.remove('panel-open');
 }
 
-/**
- * Inject the route side panel once. Reuses the same slide-in styling contract
- * as the spot-details panel (#spot-details-menu) so it matches the app.
- */
 function _ensureSidePanel() {
     if (document.getElementById('route-side-panel')) return;
     const aside = document.createElement('aside');
@@ -606,8 +502,6 @@ function _ensureSidePanel() {
     document.getElementById('route-panel-close')
         ?.addEventListener('click', () => { _closeRoutePanel(); _clearDraftMarker(); });
 
-    // Minimal styling injected once — mirrors #spot-details-menu behaviour but
-    // is self-contained so it works even if the stylesheet lacks a rule for it.
     if (!document.getElementById('route-panel-style')) {
         const style = document.createElement('style');
         style.id = 'route-panel-style';
@@ -629,10 +523,6 @@ function _ensureSidePanel() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public — module initialisation
-// ---------------------------------------------------------------------------
-
 export function initRoutes() {
     const map = getMap();
     map.on('locationfound', _onLocationFound);
@@ -650,7 +540,6 @@ export function initRoutes() {
     const closeBtn = document.querySelector('#save-route-dialog .close, #save-route-dialog .cancel-btn');
     if (closeBtn) closeBtn.addEventListener('click', () => closeModal('save-route-dialog'));
 
-    // --- Show Routes toggle ---
     const showCb = document.getElementById('show-routes-toggle');
     if (showCb) {
         showCb.addEventListener('change', (e) => {
@@ -659,15 +548,13 @@ export function initRoutes() {
         });
     }
 
-    // --- EventBus: keep the layer fresh, only when the toggle is on ---
     EventBus.on(EVENTS.PROJECT_CHANGED, () => {
         const pid = getActiveProjectId();
         const switched = pid !== _lastProjectId;
         _lastProjectId = pid;
 
-        // A background sync also fires PROJECT_CHANGED — don't tear down the
-        // annotation panel the user is filling in unless the project truly changed.
         if (switched) {
+            _cancelTracking();
             _closeRoutePanel();
             _clearDraftMarker();
         }
@@ -681,5 +568,4 @@ export function initRoutes() {
         if (_isRoutesCheckboxChecked()) displayRoutes();
     });
 
-    console.log('[RouteManager] Initialised.');
 }

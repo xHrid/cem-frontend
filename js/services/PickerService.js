@@ -1,59 +1,16 @@
-/**
- * PickerService.js — Google Picker wrapper for shared-folder access
- *
- * Pattern : Singleton loader + thin Promise-based facade
- *
- * Why this exists
- * ---------------
- * The app uses the NON-restricted `drive.file` OAuth scope. With drive.file
- * the app can only touch files it created OR files the user explicitly opens
- * through the Google Picker. To import a project a collaborator shared with
- * us, the user picks the shared FOLDER in the Picker dialog — Drive then
- * grants this app drive.file access to that folder and its contents, with no
- * need for the broad `drive.readonly` ("whole Drive") scope.
- *
- * Requirements (see Config.google):
- *  - pickerApiKey : Browser API key with the Picker API enabled.
- *  - appId        : Cloud project number (associates picked files with the app).
- *  - A loaded GIS access token (from AuthService.ensureValidToken()).
- *
- * The Picker JS library is loaded from `https://apps.google.com/api/js`,
- * which is included via a <script> tag in index.html.
- *
- * Usage:
- *   import { pickSharedProjectFile } from './services/PickerService.js';
- *   const file = await pickSharedProjectFile(); // { id, name } or null if cancelled
- */
-
 import Config from '../core/Config.js';
 import { ensureValidToken } from './AuthService.js';
 
-// ---------------------------------------------------------------------------
-// Lazy Picker library loader
-// ---------------------------------------------------------------------------
-
-/** @type {Promise<void>|null} Resolves once google.picker is ready. */
 let _pickerLoadPromise = null;
 
-/**
- * Load the Google Picker library exactly once.
- * Relies on the `gapi` loader script tag in index.html.
- *
- * @returns {Promise<void>}
- */
 function _loadPicker() {
     if (_pickerLoadPromise) return _pickerLoadPromise;
 
     _pickerLoadPromise = (async () => {
-        // Already loaded?
         if (globalThis.google?.picker) return;
 
-        // The loader (apis.google.com/js/api.js) is async — on the first click
-        // it may not have executed yet. Wait for `gapi` to appear instead of
-        // failing instantly.
         await _waitForGapi(10000);
 
-        // gapi.load is callback-based; wrap it in a Promise.
         await new Promise((resolve, reject) => {
             gapi.load('picker', {
                 callback: () => resolve(),
@@ -67,12 +24,6 @@ function _loadPicker() {
     return _pickerLoadPromise;
 }
 
-/**
- * Poll until `globalThis.gapi` is defined or the timeout elapses.
- *
- * @param {number} timeoutMs
- * @returns {Promise<void>}
- */
 function _waitForGapi(timeoutMs) {
     return new Promise((resolve, reject) => {
         if (globalThis.gapi) { resolve(); return; }
@@ -93,28 +44,6 @@ function _waitForGapi(timeoutMs) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Open the Google Picker so the editor selects the shared project's
- * `project_data.json` FILE (not the folder).
- *
- * WHY a file, not a folder: under the narrow `drive.file` scope, picking a
- * folder grants access to the folder but NOT the right to list/read the files
- * the owner created inside it. Picking the `project_data.json` file directly
- * grants read+write to THAT file (the editor already has writer permission via
- * the share) — which is exactly the one file collaborators edit. No restricted
- * scope, no OAuth verification.
- *
- * The view shows "Shared with me", filtered to JSON, with folder navigation so
- * the user can open the shared folder and pick `project_data.json` inside it.
- *
- * @returns {Promise<{id: string, name: string}|null>}
- *          The picked file, or null if the user cancelled.
- * @throws  {Error} If config is missing or the Picker fails to load.
- */
 export async function pickSharedProjectFile() {
     const apiKey = Config.google.pickerApiKey;
     const appId  = Config.google.appId;
@@ -126,21 +55,12 @@ export async function pickSharedProjectFile() {
         );
     }
 
-    // Ensure we have a fresh OAuth token AND the Picker library is loaded.
     const [oauthToken] = await Promise.all([ensureValidToken(), _loadPicker()]);
 
     if (!oauthToken) throw new Error('Not logged in — cannot open Drive Picker.');
 
     return new Promise((resolve, reject) => {
         try {
-            // "Shared with me", navigable folders, but select a JSON FILE.
-            // Select the shared FOLDER. Under drive.file, picking a folder grants
-            // this app access to the folder AND its contents (project_data.json +
-            // every media/result file) — so a collaborator can download everything
-            // through the authenticated Drive API: no CORS, no restricted scope.
-            // Allow selecting EITHER the shared folder OR the project_data.json
-            // file inside it. File-pick always grants read of project_data.json
-            // (drive.file). importSharedProject handles whichever is picked.
             const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
                 .setSelectFolderEnabled(true)
                 .setIncludeFolders(true)

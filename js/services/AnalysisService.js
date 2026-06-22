@@ -1,25 +1,3 @@
-/**
- * AnalysisService.js — Pure business-logic layer for the Analysis panel
- *
- * Pattern  : Module Pattern (IIFE that returns a frozen public API; internal
- *            helpers are never exposed)
- *
- * Extracted from analysis.js, which mixed DOM manipulation, event wiring,
- * and data logic together.  This module contains ONLY pure data / business
- * logic with no DOM access.  UI components import these functions and own
- * the rendering themselves.
- *
- * All I/O goes through the storage layer (storage.js), keeping this module
- * decoupled from the underlying persistence backend (native FS or IndexedDB).
- *
- * Public exports:
- *   getWatcherOnlineStatus   — parse status.json blob -> status descriptor
- *   loadInstalledScripts     — read installed.json -> script array
- *   calculateCacheOverlap    — pure cache/dependency intersection calculation
- *   buildJobData             — assemble the job JSON object
- *   queueJob                 — persist a job to the queue folder via storage
- */
-
 import {
     getWatcherStatus,
     getInstalledScripts,
@@ -27,26 +5,7 @@ import {
     saveJobRequest,
 } from '../data/Repository.js';
 
-// ---------------------------------------------------------------------------
-// Watcher status parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Parse raw status.json data into a display-ready descriptor.
- *
- * The age thresholds come from `analysis.js` and mirror the watcher.py
- * defaults documented in Config.watcher.
- *
- * @param {object|null} statusData  Object from `getWatcherStatus()`, or null.
- * @returns {{
- *   isOnline: boolean,
- *   isBusy:   boolean,
- *   color:    string,
- *   text:     string,
- * }}
- */
 export function getWatcherOnlineStatus(statusData) {
-    // Offline state — no data or stale heartbeat
     const offlineResult = {
         isOnline: false,
         isBusy:   false,
@@ -56,22 +15,22 @@ export function getWatcherOnlineStatus(statusData) {
 
     if (!statusData) return offlineResult;
 
-    // Compute how many seconds ago the watcher last wrote status.json.
-    // The watcher may store `last_active_ts` as a UNIX epoch number (seconds)
-    // or as an ISO-8601 string — handle both.
     const lastActiveMs = typeof statusData.last_active_ts === 'number'
         ? statusData.last_active_ts * 1000
         : new Date(statusData.last_active_ts).getTime();
 
     const ageSeconds = (Date.now() - lastActiveMs) / 1000;
 
-    // Per-status maximum acceptable age (seconds) before considered stale
+    // The watcher now refreshes the heartbeat every ~10s while a job runs, so a
+    // short window is enough: a watcher that died mid-job goes stale within
+    // ~90s, while a legitimately long job keeps itself fresh and never flips to
+    // "Offline (stale)". (Pre-fix this was a flat 1800s, which both hid a dead
+    // watcher for 30 min and wrongly stale-d jobs running longer than 30 min.)
     const maxAge = {
-        processing_job:           1800, // 30 min — jobs can take a while
-        installing_dependencies:   600, // 10 min — pip installs can be slow
-    }[statusData.status] ?? 15;         // default: heartbeat every ~10-15 s
+        processing_job:             90,
+        installing_dependencies:   600,
+    }[statusData.status] ?? 15;
 
-    // Allow up to 5 seconds of clock skew in either direction
     const isAlive = !isNaN(ageSeconds) && ageSeconds >= -5 && ageSeconds < maxAge;
 
     if (!isAlive) {
@@ -107,19 +66,6 @@ export function getWatcherOnlineStatus(statusData) {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Script registry
-// ---------------------------------------------------------------------------
-
-/**
- * Load the list of installed analysis scripts from the local storage layer.
- *
- * Delegates to `getInstalledScripts()` (storage.js) which reads
- * `system/scripts/installed.json` from the user's folder / IndexedDB.
- *
- * @returns {Promise<object[]>}  Array of script descriptor objects.
- *                               Returns `[]` if the registry is absent.
- */
 export async function loadInstalledScripts() {
     try {
         return await getInstalledScripts();
@@ -129,35 +75,6 @@ export async function loadInstalledScripts() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cache overlap calculation
-// ---------------------------------------------------------------------------
-
-/**
- * @typedef {object} CacheOverlapResult
- * @property {number}  matchingFiles        Files in range that match the selection.
- * @property {number}  cachedFiles          Of those, how many already have results.
- * @property {number}  newFiles             Files that need fresh ML processing.
- * @property {boolean} isCheckingDependency True when checking a dependency script's cache.
- * @property {boolean} hasMissingDeps       True when a dependency has unprocessed files.
- * @property {string}  message              Human-readable summary for the UI.
- */
-
-/**
- * Calculate how many files in the selected date range / spots are already
- * cached, how many need fresh processing, and whether dependencies are met.
- *
- * This is a pure calculation — it reads from the storage layer but never
- * writes to the DOM.
- *
- * @param {string[]}  spotIds        IDs of the selected recording spots.
- * @param {string}    startDate      ISO date string "YYYY-MM-DD".
- * @param {string}    endDate        ISO date string "YYYY-MM-DD".
- * @param {object}    currentScript  Script descriptor from `installed.json`.
- * @param {object[]}  spots          Full array of spot objects (from getSpots()).
- * @param {object[]}  externalFiles  Full array of external-file entries.
- * @returns {Promise<CacheOverlapResult>}
- */
 export async function calculateCacheOverlap(
     spotIds,
     startDate,
@@ -168,9 +85,6 @@ export async function calculateCacheOverlap(
 ) {
     const allScripts = await loadInstalledScripts();
 
-    // ------------------------------------------------------------------
-    // 1. Collect matching files in the selected range / spots
-    // ------------------------------------------------------------------
     const startVal  = parseInt(startDate.replace(/-/g, ''), 10);
     const endVal    = parseInt(endDate.replace(/-/g, ''),   10);
     const validExts = currentScript.inputs?.[0]?.valid_extensions ?? ['.wav'];
@@ -200,9 +114,6 @@ export async function calculateCacheOverlap(
         };
     }
 
-    // ------------------------------------------------------------------
-    // 2. No dependencies — check this script's own cache
-    // ------------------------------------------------------------------
     if (!currentScript.depends_on || currentScript.depends_on.length === 0) {
         const processedFiles = await getProcessedFilesCache(currentScript.script_file);
         const processedSet   = new Set(processedFiles);
@@ -220,14 +131,10 @@ export async function calculateCacheOverlap(
         };
     }
 
-    // ------------------------------------------------------------------
-    // 3. Has dependencies — check ALL of them
-    // ------------------------------------------------------------------
-    const missingByDep = [];   // [{depName, missingCount}]
-    let worstCached    = matchingFiles; // track the dep with fewest cached
+    const missingByDep = [];
+    let worstCached    = matchingFiles;
 
     for (const depId of currentScript.depends_on) {
-        // Resolve dependency id → script_file for cache lookup
         const depScript     = allScripts.find(s => s.id === depId);
         const depScriptFile = depScript ? depScript.script_file : depId;
         const depName       = depScript ? depScript.name : depId;
@@ -248,9 +155,6 @@ export async function calculateCacheOverlap(
     const newFiles       = matchingFiles - cachedFiles;
     const hasMissingDeps = missingByDep.length > 0;
 
-    // ------------------------------------------------------------------
-    // 4. Build message
-    // ------------------------------------------------------------------
     let message;
     if (hasMissingDeps) {
         const parts = missingByDep.map(d =>
@@ -274,27 +178,6 @@ export async function calculateCacheOverlap(
     };
 }
 
-// ---------------------------------------------------------------------------
-// Job assembly
-// ---------------------------------------------------------------------------
-
-/**
- * Assemble a job JSON object from the analysis form state.
- *
- * Pure function — no I/O, no DOM.  Returns a plain object ready to be
- * passed to `queueJob()`.
- *
- * @param {string}   jobName         Human-readable job name (sanitised by caller).
- * @param {object}   currentScript   Script descriptor from `installed.json`.
- * @param {string[]} spotIds         Selected spot IDs.
- * @param {string}   startDate       ISO date "YYYY-MM-DD".
- * @param {string}   endDate         ISO date "YYYY-MM-DD".
- * @param {object}   dynamicParams   Key/value pairs from the dynamic parameter form.
- * @param {object[]} spots           Full spot array (for name & audio path lookups).
- * @param {object[]} externalFiles   Full external-file array.
- * @returns {object}  Raw job descriptor (no id or timestamps yet — those are
- *                    added by `saveJobRequest` in the storage layer).
- */
 export function buildJobData(
     jobName,
     currentScript,
@@ -307,15 +190,8 @@ export function buildJobData(
 ) {
     const params = { ...dynamicParams };
 
-    // Resolve inputs from the selected spots + their external files.
-    //   - Regular copies + spot audio  → directories (relative to the project
-    //     storage root).  The watcher scans these recursively.
-    //   - Reference files              → explicit absolute file paths.  These
-    //     live OUTSIDE the spot dirs, so the watcher passes each one through
-    //     as an INPUT_FILE_LIST entry rather than collapsing it to a directory.
-    // Track {path: spotName} so we can build dataset_spots aligned with datasets.
-    const pathToSpot = new Map();   // relative-path → canonical spot name
-    const referenceFiles = [];      // [{ path, spot }] — spot travels with each file
+    const pathToSpot = new Map();
+    const referenceFiles = [];
 
     externalFiles.forEach(file => {
         if (!file.local_path || !file.linked_spots) return;
@@ -340,12 +216,8 @@ export function buildJobData(
         }
     });
 
-    /**
-     * Collapse file paths to their containing directories and build an
-     * aligned spot-name array (dataset_spots).
-     */
     function toDirsWithSpots(pathMap) {
-        const dirMap = new Map();   // dir → spotName
+        const dirMap = new Map();
         for (const [p, spotName] of pathMap) {
             const norm = p.replace(/\\/g, '/');
             let dir = norm;
@@ -364,9 +236,6 @@ export function buildJobData(
     const { dirs: datasetDirs, spots: datasetSpots } = toDirsWithSpots(pathToSpot);
     const inputFiles = referenceFiles;
 
-    // Build spot-name string for CLI --spots flag.
-    // The UI-selected spot name IS the canonical name — BirdNET will write it
-    // into the aggregate via --dataset-spots, so the filter step matches.
     if (spotIds.length > 0) {
         const spotNames = spotIds.map(id => {
             const s = spots.find(spot => spot.spotId === id);
@@ -381,26 +250,12 @@ export function buildJobData(
         job_name:     jobName,
         script_name:  currentScript.script_file,
         datasets:     datasetDirs,
-        dataset_spots: datasetSpots,   // aligned 1:1 with datasets — canonical UI spot name per dir
+        dataset_spots: datasetSpots,
         input_files:  inputFiles,
         parameters:   params,
     };
 }
 
-// ---------------------------------------------------------------------------
-// Job queuing
-// ---------------------------------------------------------------------------
-
-/**
- * Persist a job descriptor to the local queue folder so that the watcher
- * process can pick it up.
- *
- * Delegates entirely to `saveJobRequest()` in the storage layer, which
- * stamps the job with an id, project_id, status, and created_at timestamp.
- *
- * @param {object} jobData  Raw job descriptor from `buildJobData()`.
- * @returns {Promise<object>}  Finalised job object as saved to disk.
- */
 export async function queueJob(jobData) {
     return saveJobRequest(jobData);
 }

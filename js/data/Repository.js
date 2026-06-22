@@ -1,23 +1,3 @@
-/**
- * Repository.js — All data read / write operations
- *
- * Pattern : Factory (elements of)
- *           Each save function acts as a factory: it assembles a typed record
- *           object (Spot, Site, Route, ExternalFile, Job) from raw inputs,
- *           persists it, and returns the canonical record so callers don't have
- *           to reconstruct it themselves.
- *
- * Bug fixes over original storage.js
- * ------------------------------------
- *  1. saveSpot()         — 4th parameter `recordDate` was silently dropped.
- *                          The timestamp is now `recordDate.toISOString()` when
- *                          supplied, falling back to `new Date().toISOString()`.
- *  2. saveExternalFile() — 3rd parameter `importDate` was silently dropped.
- *                          Same fix: use it for the timestamp when provided.
- *  3. saveSite()         — Now accepts a `clusters` parameter and stores it on
- *                          the site record so clustering metadata is not lost.
- */
-
 import EventBus, { EVENTS }       from '../core/EventBus.js';
 import * as StorageAdapter         from './StorageAdapter.js';
 import * as MasterData             from './MasterData.js';
@@ -32,18 +12,8 @@ import {
     upsertFile,
     ensureDrivePath
 } from '../services/DriveService.js';
+import { mergeById } from './mergeUtils.js';
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Return the active project, throwing a descriptive error if none exists.
- * Used by every save function as a guard before writing any data.
- *
- * @returns {object}
- * @throws  {Error}
- */
 function _requireActiveProject() {
     const project = MasterData.getActiveProject();
     if (!project) {
@@ -55,15 +25,6 @@ function _requireActiveProject() {
     return project;
 }
 
-/**
- * Sanitize a display name for use as a filesystem folder / file segment.
- * Converts non-alphanumeric characters to underscores, collapses runs of
- * underscores, and strips leading/trailing underscores.
- *
- * @param {string} name
- * @param {string} [fallback='Unknown']
- * @returns {string}
- */
 function _safeName(name, fallback = 'Unknown') {
     const clean = (name || '')
         .replace(/[^a-z0-9]/gi, '_')
@@ -72,27 +33,6 @@ function _safeName(name, fallback = 'Unknown') {
     return clean || fallback;
 }
 
-// ---------------------------------------------------------------------------
-// Spot
-// ---------------------------------------------------------------------------
-
-/**
- * Persist a new spot (with optional image and audio blobs) to local storage,
- * then emit DATA_UPDATED and push master JSON to Drive.
- *
- * Bug fix: the original accepted only 3 parameters; the `recordDate` (4th)
- * was dropped, so all spots got `new Date().toISOString()` regardless of when
- * the observation was actually made.  Now `recordDate` drives the timestamp
- * when provided.
- *
- * @param {object}         spotData     Plain spot object (name, coords, notes, …).
- * @param {Blob[]|Blob|null} imageBlobs  One or more cover images. Accepts a
- *                                       single Blob for backward compat.
- * @param {Blob|null}      audioBlob    Voice note; null if no audio was recorded.
- * @param {Date|null}      recordDate   The real observation date/time. When omitted
- *                                      the current system clock is used.
- * @returns {Promise<object>}           The fully populated spot record that was saved.
- */
 export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
@@ -102,7 +42,6 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
     const spotPath    = [projectFolder, 'spots', safeSpot];
     const shortId     = spotId.substring(0, 8);
 
-    // Normalise: single Blob → array, null/undefined → empty array
     const blobs = imageBlobs
         ? (Array.isArray(imageBlobs) ? imageBlobs : [imageBlobs])
         : [];
@@ -137,9 +76,7 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
         projectId              : project.id,
         created_by             : spotData.created_by || getUserEmail() || null,
         timestamp,
-        // First image stays here for backward compat with sync/sharing services
         image_local_filename   : imagePaths[0] || null,
-        // Full list of all image paths (includes first)
         images                 : imagePaths.length > 0 ? imagePaths : null,
         audio_local_filename   : audioPath
     };
@@ -150,7 +87,6 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
 
-    // Auto-sync media files
     for (const p of imagePaths) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: p, isExternal: false });
     }
@@ -161,53 +97,30 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
     return newSpot;
 }
 
-/**
- * Edit an EXISTING spot entry in place (notes and/or photo).
- *
- * Unlike saveSpot (which always appends a new temporal entry), this mutates the
- * one record identified by spotId. Identity fields — name, coordinates, the
- * observation `timestamp` — are intentionally left untouched; this is "fix the
- * details of this observation", not "move/rename/re-date it".
- *
- * Sync: we stamp `updated_at` (a version marker distinct from the display
- * `timestamp`) so the edit wins last-write-wins merges WITHOUT corrupting the
- * observation date shown to the user. See SyncService._mergeArray.
- *
- * @param {string}      spotId     UUID of the entry to edit.
- * @param {object}      fields     Partial fields to overwrite, e.g. { description }.
- * @param {Blob|null}   imageBlob  Optional NEW photo; replaces the existing one.
- * @returns {Promise<object>}      The updated spot record.
- */
 export async function updateSpot(spotId, fields, addBlobs = [], removePaths = [], clearDriveImg = false) {
     const project = _requireActiveProject();
     const spot    = (project.spots || []).find(s => s.spotId === spotId);
     if (!spot) throw new Error(`Spot "${spotId}" not found.`);
 
-    // Whitelist editable fields — never touch name / lat / lng / timestamp here.
     if (fields && typeof fields.description === 'string') {
         spot.description = fields.description;
     }
 
-    // --- Backward compat: single imageBlob as legacy call ---
     const blobs = addBlobs instanceof Blob ? [addBlobs] : (Array.isArray(addBlobs) ? addBlobs : []);
 
-    // Current images array (normalise from old single-image entries)
     let images = spot.images && spot.images.length > 0
         ? [...spot.images]
         : (spot.image_local_filename ? [spot.image_local_filename] : []);
 
-    // Remove deleted paths
     if (removePaths.length > 0) {
         const removeSet = new Set(removePaths);
         images = images.filter(p => !removeSet.has(p));
     }
 
-    // Clear Drive-only image if user deleted it
     if (clearDriveImg) {
         spot.image_drive_id = null;
     }
 
-    // Add new images
     const projectFolder = getProjectFolderName(project);
     const safeSpot      = _safeName(spot.name, `Spot_${spotId.substring(0, 8)}`);
     const shortId       = spotId.substring(0, 8);
@@ -224,16 +137,12 @@ export async function updateSpot(spotId, fields, addBlobs = [], removePaths = []
         newPaths.push(path);
     }
 
-    // Persist multi-image array + backward-compat single field
     spot.images = images.length > 0 ? images : null;
     spot.image_local_filename = images[0] || null;
 
-    // If all local images removed and no Drive fallback, clear drive id too
     if (!spot.image_local_filename && !clearDriveImg) {
-        // keep existing drive id as fallback
     }
 
-    // Version marker for last-write-wins merge
     spot.updated_at = new Date().toISOString();
 
     await MasterData.saveMasterData();
@@ -246,30 +155,11 @@ export async function updateSpot(spotId, fields, addBlobs = [], removePaths = []
     return spot;
 }
 
-// ---------------------------------------------------------------------------
-// Site
-// ---------------------------------------------------------------------------
-
-/**
- * Persist a new site (KML file + optional cluster data).
- *
- * Bug fix: original accepted only 2 parameters; `clusters` was added as a 3rd
- * so cluster metadata from the analysis layer is stored alongside the site.
- *
- * @param {string}    siteName  Display name for the site.
- * @param {File|Blob} kmlFile   The KML boundary file.
- * @param {object[]|null} clusters  Optional cluster analysis results to attach.
- * @returns {Promise<object>}   The saved site record.
- */
 export async function saveSite(siteName, kmlFile, clusters) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
     const siteId        = crypto.randomUUID();
 
-    // Sanitize the display name AND key the file on the unique siteId, so two
-    // sites that share a name never overwrite each other's KML (same overwrite
-    // class as saveSpot's per-entry media). Raw names also leaked illegal path
-    // chars into the filename — _safeName fixes that too.
     const safeSite = _safeName(siteName, `Site_${siteId.substring(0, 8)}`);
     const shortId  = siteId.substring(0, 8);
 
@@ -284,7 +174,7 @@ export async function saveSite(siteName, kmlFile, clusters) {
         projectId      : project.id,
         name           : siteName,
         kml_filename   : kmlPath,
-        clusters       : clusters || null,  // Bug fix: persist clusters param.
+        clusters       : clusters || null,
         created_by     : getUserEmail() || null,
         timestamp      : new Date().toISOString()
     };
@@ -294,9 +184,7 @@ export async function saveSite(siteName, kmlFile, clusters) {
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 
-    // Auto-sync KML (non-external → automatic)
     if (kmlPath) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: kmlPath, isExternal: false });
     }
@@ -304,16 +192,6 @@ export async function saveSite(siteName, kmlFile, clusters) {
     return newSite;
 }
 
-// ---------------------------------------------------------------------------
-// Route
-// ---------------------------------------------------------------------------
-
-/**
- * Persist a new route (GeoJSON / GPX payload already in routeData).
- *
- * @param {object} routeData  Raw route payload (coordinates, name, notes, …).
- * @returns {Promise<object>} The saved route record.
- */
 export async function saveRoute(routeData) {
     const project = _requireActiveProject();
 
@@ -330,26 +208,10 @@ export async function saveRoute(routeData) {
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 
     return newRoute;
 }
 
-/**
- * Attach an annotation (description + optional image/audio) to a point on a
- * recorded route. Routes are treated like spots: a route is a line of
- * coordinates onto which observations can be pinned at specific points.
- *
- * The annotation's media is stored under the route's own folder and queued for
- * Drive sync exactly like spot media, so routes are first-class shareable
- * location objects.
- *
- * @param {string}    routeId    UUID of the route to annotate.
- * @param {object}    data       { lat, lng, description }.
- * @param {Blob|null} imageBlob  Optional photo for this point.
- * @param {Blob|null} audioBlob  Optional voice note for this point.
- * @returns {Promise<object>}    The saved annotation record.
- */
 export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
@@ -385,8 +247,6 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
 
     if (!route.annotations) route.annotations = [];
     route.annotations.push(annotation);
-    // Bump the route timestamp so last-write-wins merges carry the new
-    // annotation across to collaborators (routes merge whole-record by id).
     route.timestamp = now;
 
     await MasterData.saveMasterData();
@@ -398,13 +258,6 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
     return annotation;
 }
 
-/**
- * Delete a single annotation from a route.
- *
- * @param {string} routeId  UUID of the route.
- * @param {string} annId    UUID of the annotation to remove.
- * @returns {Promise<void>}
- */
 export async function deleteRouteAnnotation(routeId, annId) {
     const project = _requireActiveProject();
     const route   = (project.routes || []).find(r => r.id === routeId);
@@ -415,28 +268,10 @@ export async function deleteRouteAnnotation(routeId, annId) {
     EventBus.emit(EVENTS.DATA_UPDATED);
 }
 
-// ---------------------------------------------------------------------------
-// External file
-// ---------------------------------------------------------------------------
-
-/**
- * Persist a file imported from an external source and link it to one or more spots.
- *
- * Bug fix: the original accepted only 2 parameters; `importDate` was the
- * documented 3rd parameter but was silently dropped, causing all imported files
- * to receive the current timestamp instead of their true import date.
- *
- * @param {File|Blob} fileObj     The file to save.
- * @param {string[]}  spotIds     UUIDs of spots this file is associated with.
- * @param {Date|null} importDate  When the file was originally imported; falls
- *                                back to current time if not provided.
- * @returns {Promise<object>}     The saved external-file record.
- */
 export async function saveExternalFile(fileObj, spotIds, importDate) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
 
-    // Resolve the primary spot so we can place the file inside its folder.
     const primarySpotId = spotIds[0];
     const spot          = (project.spots || []).find(s => s.spotId === primarySpotId);
 
@@ -448,7 +283,6 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
     const pathArray = [projectFolder, 'spots', safeSpot, 'external_data'];
     const savedPath = await StorageAdapter.saveFile(fileObj, fileObj.name, pathArray);
 
-    // Bug fix: use importDate for the canonical timestamp when provided.
     const timestamp = (importDate instanceof Date)
         ? importDate.toISOString()
         : new Date().toISOString();
@@ -469,9 +303,7 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 
-    // External imports → manual sync only (isExternal: true)
     if (savedPath) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: savedPath, isExternal: true });
     }
@@ -479,21 +311,10 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
     return newFileEntry;
 }
 
-// ---------------------------------------------------------------------------
-// Delete — Spot
-// ---------------------------------------------------------------------------
-
-/**
- * Delete a spot by its spotId from the active project.
- *
- * @param {string} spotId  UUID of the spot to remove.
- * @returns {Promise<void>}
- */
 export async function deleteSpot(spotId) {
     const project = _requireActiveProject();
     if (!project.spots) return;
     project.spots = project.spots.filter(s => s.spotId !== spotId);
-    // Also remove any external files linked exclusively to this spot
     if (project.external_files) {
         project.external_files = project.external_files.filter(f => {
             if (!f.linked_spots) return true;
@@ -503,83 +324,50 @@ export async function deleteSpot(spotId) {
     }
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 }
 
-// ---------------------------------------------------------------------------
-// Delete — Site
-// ---------------------------------------------------------------------------
-
-/**
- * Delete a site by its id from the active project.
- *
- * @param {string} siteId  UUID of the site to remove.
- * @returns {Promise<void>}
- */
 export async function deleteSite(siteId) {
     const project = _requireActiveProject();
     if (!project.sites) return;
     project.sites = project.sites.filter(s => s.id !== siteId);
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 }
 
-// ---------------------------------------------------------------------------
-// Delete — Route
-// ---------------------------------------------------------------------------
-
-/**
- * Delete a route by its id from the active project.
- *
- * @param {string} routeId  UUID of the route to remove.
- * @returns {Promise<void>}
- */
 export async function deleteRoute(routeId) {
     const project = _requireActiveProject();
     if (!project.routes) return;
     project.routes = project.routes.filter(r => r.id !== routeId);
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 }
 
-// ---------------------------------------------------------------------------
-// Delete — External file
-// ---------------------------------------------------------------------------
-
-/**
- * Delete an external file by its id from the active project.
- *
- * @param {string} fileId  UUID of the external file to remove.
- * @returns {Promise<void>}
- */
 export async function deleteExternalFile(fileId) {
     const project = _requireActiveProject();
     if (!project.external_files) return;
     project.external_files = project.external_files.filter(f => f.id !== fileId);
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
-    // Drive push is centralised in SyncEngine (debounced on DATA_UPDATED).
 }
 
-// ---------------------------------------------------------------------------
-// Delete — Job
-// ---------------------------------------------------------------------------
-
-/**
- * Delete a job JSON file from its status folder.
- *
- * @param {string} jobId          UUID of the job.
- * @param {string} currentStatus  The job's current status folder (queue/processing/completed/failed).
- * @returns {Promise<void>}
- */
 export async function deleteJob(jobId, currentStatus) {
     const project = MasterData.getActiveProject();
-    if (!project) return;
+    if (!project) return false;
     const projectFolder = getProjectFolderName(project);
-    await StorageAdapter.deleteFile(`${projectFolder}/jobs/${currentStatus}/${jobId}.json`);
-    // Also try to delete result files
+
+    // currentStatus was captured when the dashboard loaded; the watcher may have
+    // moved the job since (e.g. queue→processing), so deleting only that path can
+    // silently miss. Try every status folder by job_id and report whether the
+    // descriptor was actually removed.
+    const statuses = ['queue', 'processing', 'completed', 'failed'];
+    const ordered  = [currentStatus, ...statuses.filter(s => s !== currentStatus)].filter(Boolean);
+
+    let deleted = false;
+    for (const status of ordered) {
+        const ok = await StorageAdapter.deleteFile(`${projectFolder}/jobs/${status}/${jobId}.json`);
+        if (ok) deleted = true;
+    }
+
     try {
         const resultFiles = await StorageAdapter.listDirectoryFiles(
             [projectFolder, 'jobs', 'results', jobId]
@@ -587,29 +375,16 @@ export async function deleteJob(jobId, currentStatus) {
         for (const f of resultFiles) {
             await StorageAdapter.deleteFile(`${projectFolder}/jobs/results/${jobId}/${f}`);
         }
-    } catch { /* results folder may not exist */ }
+    } catch { }
+
+    return deleted;
 }
 
-// ---------------------------------------------------------------------------
-// Save — External file by reference (no copy)
-// ---------------------------------------------------------------------------
-
-/**
- * Save an external file entry as a reference (path only, no file copy).
- *
- * @param {string}   fileName    Original file name.
- * @param {string}   filePath    Full path to the file on disk.
- * @param {string}   fileType    MIME type of the file.
- * @param {string[]} spotIds     UUIDs of spots this file is associated with.
- * @param {Date|null} importDate When the file was originally imported.
- * @returns {Promise<object>}    The saved external-file record.
- */
 export async function saveExternalFileByReference(fileName, filePath, fileType, spotIds, importDate) {
     const project = _requireActiveProject();
 
     if (!project.external_files) project.external_files = [];
 
-    // Silent duplicate skip
     if (project.external_files.some(f => f.local_path === filePath)) return null;
 
     const timestamp = (importDate instanceof Date)
@@ -636,17 +411,6 @@ export async function saveExternalFileByReference(fileName, filePath, fileType, 
     return newFileEntry;
 }
 
-/**
- * Batch-import external files by reference (path only, no file copy).
- * Pushes all entries into masterData in memory first, then persists once
- * and emits a single DATA_UPDATED event — O(1) I/O instead of O(n).
- *
- * @param {Array<{name:string, path:string, type:string}>} fileDescriptors
- * @param {string[]}  spotIds     UUIDs of spots to link.
- * @param {Date|null} importDate  Canonical import timestamp.
- * @param {function}  [onProgress] Optional callback(processed, total).
- * @returns {Promise<object[]>}   All saved file entries.
- */
 export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds, importDate, onProgress) {
     const project = _requireActiveProject();
 
@@ -656,7 +420,6 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
 
     if (!project.external_files) project.external_files = [];
 
-    // Build set of existing paths for O(1) duplicate detection
     const existingPaths = new Set(
         project.external_files.map(f => f.local_path).filter(Boolean)
     );
@@ -668,7 +431,6 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
     for (let i = 0; i < total; i++) {
         const { name, path, type } = fileDescriptors[i];
 
-        // Silent skip if path already exists
         if (existingPaths.has(path)) { skipped++; continue; }
         existingPaths.add(path);
 
@@ -686,14 +448,12 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
         project.external_files.push(entry);
         entries.push(entry);
 
-        // Yield to UI thread periodically so progress updates render
         if (onProgress && (i % 200 === 0 || i === total - 1)) {
             onProgress(i + 1, total);
             await new Promise(r => setTimeout(r, 0));
         }
     }
 
-    // Single persist + single event
     if (entries.length > 0) {
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
@@ -702,18 +462,6 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
     return entries;
 }
 
-/**
- * Batch-import external files (copy into storage).
- * Copies files with bounded concurrency, persists masterData once at the
- * end, and emits a single DATA_UPDATED + MEDIA_SAVED event.
- *
- * @param {File[]}    files       File objects to import.
- * @param {string[]}  spotIds     UUIDs of spots to link.
- * @param {Date|null} importDate  Canonical import timestamp.
- * @param {function}  [onProgress] Optional callback(processed, total).
- * @param {number}    [concurrency=5] Max parallel file writes.
- * @returns {Promise<object[]>}   All saved file entries.
- */
 export async function saveExternalFilesBatch(files, spotIds, importDate, onProgress, concurrency = 5) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
@@ -731,15 +479,12 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
 
     if (!project.external_files) project.external_files = [];
 
-    // Build set of existing file names for duplicate detection (copy imports
-    // don't have stable absolute paths, so match on name within same spot)
     const existingNames = new Set(
         project.external_files
             .filter(f => !f.is_reference && f.linked_spots?.includes(primarySpotId))
             .map(f => f.name)
     );
 
-    // Filter out duplicates before queuing any work
     const uniqueFiles = files.filter(f => {
         if (existingNames.has(f.name)) return false;
         existingNames.add(f.name);
@@ -750,7 +495,6 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
     let processed = 0;
     const entries = new Array(total);
 
-    // Process file copies with bounded concurrency
     const queue = uniqueFiles.map((file, idx) => ({ file, idx }));
     const workers = [];
 
@@ -779,7 +523,6 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
 
     await Promise.all(workers);
 
-    // Push all entries at once, persist once, emit once
     for (const entry of entries) {
         if (entry) project.external_files.push(entry);
     }
@@ -793,32 +536,10 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
     return entries.filter(Boolean);
 }
 
-// ---------------------------------------------------------------------------
-// File URL helper
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve a stored relative path to an Object URL.
- * Delegates to StorageAdapter — see that module for blob-URL tracking notes.
- *
- * @param {string|null} relativePath
- * @returns {Promise<string|null>}
- */
 export async function getLocalFileUrl(relativePath) {
     return StorageAdapter.getFileUrl(relativePath);
 }
 
-// ---------------------------------------------------------------------------
-// Analysis — Jobs
-// ---------------------------------------------------------------------------
-
-/**
- * Queue a new analysis job by writing its descriptor JSON into the project's
- * jobs/queue/ folder.  The watcher.py process polls this folder.
- *
- * @param {object} jobData  Job descriptor (target files, script name, params, …).
- * @returns {Promise<object>} The finalised job descriptor (with generated id).
- */
 export async function saveJobRequest(jobData) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
@@ -842,12 +563,6 @@ export async function saveJobRequest(jobData) {
     return finalData;
 }
 
-/**
- * Collect all job descriptors from every status sub-folder (queue, processing,
- * completed, failed) and return them sorted newest-first.
- *
- * @returns {Promise<object[]>}
- */
 export async function getAllJobs() {
     const project = MasterData.getActiveProject();
     if (!project) return [];
@@ -855,12 +570,10 @@ export async function getAllJobs() {
     const projectFolder = getProjectFolderName(project);
     const statuses      = ['queue', 'processing', 'completed', 'failed'];
 
-    // Parallel folder listing — all 4 status folders are independent I/O
     const listResults = await Promise.allSettled(
         statuses.map(s => StorageAdapter.listDirectoryFiles([projectFolder, 'jobs', s]))
     );
 
-    // Parallel JSON reads across all folders
     const readPromises = [];
     for (let i = 0; i < statuses.length; i++) {
         const result = listResults[i];
@@ -889,19 +602,28 @@ export async function getAllJobs() {
         .filter(r => r.status === 'fulfilled' && r.value !== null)
         .map(r => r.value);
 
-    return jobs.sort((a, b) => {
+    // The four folders are listed concurrently, so if the watcher moves a job
+    // (queue→processing→completed/failed) between two listings, the same job_id
+    // can be read from two folders. Dedup, keeping the most-advanced status —
+    // moves only ever go forward — so a row never doubles or shows a stale state.
+    const STATUS_RANK = { queue: 0, processing: 1, failed: 2, completed: 3 };
+    const byId = new Map();
+    for (const job of jobs) {
+        const id   = job.job_id || `__noid_${Math.random()}`;
+        const prev = byId.get(id);
+        if (!prev ||
+            (STATUS_RANK[job.current_status] ?? -1) > (STATUS_RANK[prev.current_status] ?? -1)) {
+            byId.set(id, job);
+        }
+    }
+
+    return [...byId.values()].sort((a, b) => {
         const tA = new Date(a.created_at || 0).getTime();
         const tB = new Date(b.created_at || 0).getTime();
         return tB - tA;
     });
 }
 
-/**
- * List result files produced by a completed job.
- *
- * @param {string} jobId
- * @returns {Promise<Array<{name: string, path: string}>>}
- */
 export async function getJobResultFiles(jobId) {
     const project = MasterData.getActiveProject();
     if (!project) return [];
@@ -917,16 +639,6 @@ export async function getJobResultFiles(jobId) {
     }));
 }
 
-// ---------------------------------------------------------------------------
-// System — watcher / scripts / caches
-// ---------------------------------------------------------------------------
-
-/**
- * Read the watcher.py heartbeat status file.
- * This file lives at the global system root, not inside any project folder.
- *
- * @returns {Promise<object|null>}
- */
 export async function getWatcherStatus() {
     try {
         const blob = await StorageAdapter.getFileBlob('system/status.json');
@@ -937,12 +649,6 @@ export async function getWatcherStatus() {
     }
 }
 
-/**
- * Read the installed-scripts registry.
- * Lives at system/scripts/installed.json (global, not per-project).
- *
- * @returns {Promise<object[]>}
- */
 export async function getInstalledScripts() {
     try {
         const blob = await StorageAdapter.getFileBlob('system/scripts/installed.json');
@@ -954,17 +660,6 @@ export async function getInstalledScripts() {
     }
 }
 
-/**
- * Read the per-script list of already-processed file names.
- *
- * Single source of truth: the script's own processed-files list at
- * <projectFolder>/system/database/processed_<scriptFile>.txt — one filename
- * per line, written by the analysis script itself. (The old watcher-generated
- * cache_<scriptFile>.json has been removed to avoid two copies of the same data.)
- *
- * @param {string} targetScriptFile  Script identifier, e.g. 'birdnet_predictions.py'.
- * @returns {Promise<string[]>}       Array of processed file names.
- */
 export async function getProcessedFilesCache(targetScriptFile) {
     try {
         const project = MasterData.getActiveProject();
@@ -983,11 +678,6 @@ export async function getProcessedFilesCache(targetScriptFile) {
     }
 }
 
-/**
- * Read the global analysis result cache.
- *
- * @returns {Promise<object>}
- */
 export async function getAnalysisCache() {
     try {
         const blob = await StorageAdapter.getFileBlob('system/analysis_cache.json');
@@ -999,33 +689,11 @@ export async function getAnalysisCache() {
     }
 }
 
-/**
- * Check whether a specific dependency is recorded in the analysis cache.
- *
- * @param {string} scriptName  The script whose cache entry to inspect.
- * @param {string} cacheKey    The dependency key to look up.
- * @returns {Promise<boolean>}
- */
 export async function checkDependencyExists(scriptName, cacheKey) {
     const cache = await getAnalysisCache();
     return !!(cache[scriptName] && cache[scriptName][cacheKey]);
 }
 
-// ---------------------------------------------------------------------------
-// Drive sync — master JSON push
-// ---------------------------------------------------------------------------
-
-/**
- * Push the current local masterData JSON to Google Drive.
- *
- * Fire-and-forget: callers should NOT await this.  Errors are caught and
- * logged without bubbling so a connectivity issue never breaks a local save.
- *
- * Requires an active Drive access token (getAccessToken() returns non-null).
- * If the user is not authenticated the function returns immediately.
- *
- * @returns {Promise<void>}
- */
 export async function pushMasterToDrive() {
     const token = getAccessToken();
     if (!token) return;
@@ -1033,7 +701,6 @@ export async function pushMasterToDrive() {
     try {
         const rootFolderId = await findOrCreateRootFolder();
         const state        = MasterData.getLocalState();
-        // Strip imported projects — they belong to other users, not our Drive
         const cleanState = {
             ...state,
             projects: (state.projects || []).filter(p => !p.shared?.isImported),
@@ -1043,14 +710,11 @@ export async function pushMasterToDrive() {
             { type: 'application/json' }
         );
 
-        // Idempotent upsert → never creates a duplicate master_data.json.
         await upsertFile('master_data.json', rootFolderId, blob, 'application/json', 'master_data.json');
-        console.log('Repository: pushed master JSON to Drive.');
     } catch (e) {
         console.error('Repository.pushMasterToDrive: auto-push failed (offline?):', e);
     }
 
-    // Also push per-project project_data.json for the active project
     try {
         const activeProject = MasterData.getActiveProject();
         if (activeProject) {
@@ -1061,20 +725,6 @@ export async function pushMasterToDrive() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Drive sync — per-project JSON push
-// ---------------------------------------------------------------------------
-
-/**
- * Push a project's data as `project_data.json` inside its Drive folder.
- *
- * This makes the project folder self-contained — when shared, recipients
- * can read project_data.json directly without needing access to the
- * parent master_data.json.
- *
- * @param {object} project  The project object to push.
- * @returns {Promise<void>}
- */
 export async function pushProjectDataToDrive(project) {
     const token = getAccessToken();
     if (!token || !project) return;
@@ -1084,20 +734,13 @@ export async function pushProjectDataToDrive(project) {
         const projectFolder = getProjectFolderName(project);
         const folderId      = await ensureDrivePath([projectFolder], rootFolderId);
 
-        // Build clean project data (strip local sharing/import metadata)
         let projectData = { ...project };
-        delete projectData.sharing; // Owner-only metadata, not for recipients
-        // Keep shared metadata only if it's the owner's project (not imported)
+        delete projectData.sharing;
         if (projectData.shared?.isImported) {
             delete projectData.shared;
         }
-        // External/imported media is never shared — drop it (and its paths)
-        // entirely from project_data.json.
         delete projectData.external_files;
 
-        // For a SHARED (collaborative) project, editors write into this same
-        // project_data.json. Merge their remote edits in before we overwrite,
-        // so an owner push never clobbers editor changes.
         if (project.sharing?.isShared) {
             const existing = await findFileByName('project_data.json', folderId);
             if (existing) {
@@ -1107,12 +750,9 @@ export async function pushProjectDataToDrive(project) {
                     projectData.routes         = _mergeItemArray(projectData.routes,         remote.routes);
                     projectData.sites          = _mergeItemArray(projectData.sites,          remote.sites);
                     projectData.jobs           = _mergeItemArray(projectData.jobs,           remote.jobs);
-                    // external_files intentionally NOT merged — never shared.
-                } catch { /* unreadable remote — fall back to local */ }
+                } catch { }
             }
 
-            // Media bytes travel via Drive files (public links) — no inline
-            // encoding. Strip any legacy inline_files from the data.
             delete projectData.inline_files;
         }
 
@@ -1121,32 +761,11 @@ export async function pushProjectDataToDrive(project) {
             { type: 'application/json' }
         );
 
-        // Idempotent upsert → exactly one project_data.json per folder.
         await upsertFile('project_data.json', folderId, blob);
 
-        console.log(`[Repository] Pushed project_data.json for "${project.name}".`);
     } catch (e) {
         console.error(`[Repository] pushProjectDataToDrive failed for "${project.name}":`, e);
     }
 }
 
-/**
- * Merge two item arrays by id (spotId or id), keeping the newer `timestamp`
- * when both sides share an id. Items unique to either side are kept.
- *
- * @param {object[]} a
- * @param {object[]} b
- * @returns {object[]}
- */
-function _mergeItemArray(a = [], b = []) {
-    const map = new Map();
-    for (const item of [...(a || []), ...(b || [])]) {
-        const id = item.spotId || item.id;
-        if (!id) continue;
-        const prev = map.get(id);
-        const t    = new Date(item.timestamp || 0).getTime();
-        const pt   = new Date(prev?.timestamp || 0).getTime();
-        if (!prev || t > pt) map.set(id, item);
-    }
-    return Array.from(map.values());
-}
+const _mergeItemArray = (a = [], b = []) => mergeById(a, b);

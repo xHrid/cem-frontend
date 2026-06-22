@@ -1,18 +1,3 @@
-/**
- * ProjectUI.js — Project management UI controller
- *
- * Extracted from the DOMContentLoaded block of ui.js.
- *
- * Responsibilities
- * ----------------
- *  - Project dropdown: render, on-change → ProjectManager.switchProject
- *  - New project / rename → native <dialog> input (replaces blocking prompt())
- *  - Conflict modal (pull / push / merge / cancel) → SyncService.resolveMasterConflict
- *  - Import-media form → Repository.saveExternalFile (all 3 args)
- *  - Re-render dropdown on EVENTS.PROJECT_CHANGED and EVENTS.STORAGE_READY
- *  - Open conflict modal on EVENTS.MASTER_SYNC_CONFLICT
- */
-
 import EventBus, { EVENTS }         from '../core/EventBus.js';
 import {
     createProject,
@@ -25,35 +10,16 @@ import { saveExternalFile, saveExternalFileByReference, saveExternalFilesByRefer
 import { showToast }                 from './Toast.js';
 import { openModal, closeModal }     from './ModalManager.js';
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 export function initProjectUI() {
     _initProjectDropdown();
-    _initConflictModal(); // legacy modal kept as a fallback; no longer auto-opened
+    _initConflictModal();
     _initImportMediaForm();
 
     EventBus.on(EVENTS.STORAGE_READY,  _renderProjectList);
     EventBus.on(EVENTS.PROJECT_CHANGED, _renderProjectList);
 
-    // Conflict handling is now owned by SyncDiffUI (interactive git-diff style
-    // resolver). We intentionally do NOT open the old localCount/remoteCount
-    // modal here anymore.
 }
 
-// ---------------------------------------------------------------------------
-// Project name dialog (replaces blocking prompt())
-// ---------------------------------------------------------------------------
-
-/**
- * Open the project-name <dialog> and return a Promise that resolves with
- * the entered name, or null if the user cancelled.
- *
- * @param {string} title        Dialog heading text.
- * @param {string} defaultValue Pre-filled input value.
- * @returns {Promise<string|null>}
- */
 function _askProjectName(title, defaultValue = '') {
     return new Promise(resolve => {
         const dialog = document.getElementById('project-name-dialog');
@@ -63,7 +29,6 @@ function _askProjectName(title, defaultValue = '') {
         const cancelBtn = document.getElementById('cancel-project-name');
 
         if (!dialog || !form || !input) {
-            // Fallback for missing dialog element
             resolve(null);
             return;
         }
@@ -71,7 +36,6 @@ function _askProjectName(title, defaultValue = '') {
         if (heading) heading.textContent = title;
         input.value = defaultValue;
 
-        // Clean up listeners on close
         const cleanup = () => {
             form.removeEventListener('submit', onSubmit);
             cancelBtn?.removeEventListener('click', onCancel);
@@ -94,17 +58,13 @@ function _askProjectName(title, defaultValue = '') {
 
         form.addEventListener('submit', onSubmit);
         cancelBtn?.addEventListener('click', onCancel);
-        dialog.addEventListener('cancel', onCancel); // ESC key
+        dialog.addEventListener('cancel', onCancel);
 
         openModal('project-name-dialog');
         input.focus();
         input.select();
     });
 }
-
-// ---------------------------------------------------------------------------
-// Project dropdown
-// ---------------------------------------------------------------------------
 
 function _renderProjectList() {
     const projectSelect = document.getElementById('project-select');
@@ -165,10 +125,6 @@ function _initProjectDropdown() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Conflict modal
-// ---------------------------------------------------------------------------
-
 function _openConflictModal(localCount, remoteCount) {
     const conflictMsg = document.getElementById('conflict-msg');
 
@@ -214,10 +170,6 @@ function _wireConflictBtn(id, handler) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Import-media form
-// ---------------------------------------------------------------------------
-
 function _initImportMediaForm() {
     const importBtn       = document.getElementById('import-media-btn');
     const spotContainer   = document.getElementById('spot-selection-container');
@@ -226,7 +178,6 @@ function _initImportMediaForm() {
 
     if (!importBtn) return;
 
-    // Toggle base-directory input visibility when reference checkbox changes
     const refCheckbox    = document.getElementById('import-as-reference');
     const baseDirContainer = document.getElementById('reference-base-dir-container');
     if (refCheckbox && baseDirContainer) {
@@ -243,11 +194,13 @@ function _initImportMediaForm() {
         if (!spots || spots.length === 0) {
             spotContainer.innerHTML = '<p>No spots found. Create a spot first.</p>';
         } else {
+            const seen = new Set();
             for (const spot of spots) {
+                if (seen.has(spot.name)) continue;
+                seen.add(spot.name);
                 const div     = document.createElement('div');
                 const label   = document.createElement('label');
                 const cb      = document.createElement('input');
-                // Radio (not checkbox): imported media attaches to ONE spot only.
                 cb.type       = 'radio';
                 cb.name       = 'selected_spot';
                 cb.value      = spot.spotId;
@@ -293,12 +246,10 @@ function _initImportMediaForm() {
                 if (cDate) importDate = new Date(`${cDate}T${cTime}`);
             }
 
-            // For reference imports, build full path from user-supplied base directory
             let baseDir = '';
             if (importAsRef) {
                 baseDir = (document.getElementById('reference-base-dir')?.value || '').trim();
                 if (!baseDir) throw new Error('Please enter the base directory path for reference imports.');
-                // Normalise: strip trailing slashes/backslashes
                 baseDir = baseDir.replace(/[\\/]+$/, '');
             }
 
@@ -307,9 +258,6 @@ function _initImportMediaForm() {
             };
 
             if (importAsRef) {
-                // Build descriptors, then batch-import in one shot.
-                // Normalize all separators to forward slashes so paths are
-                // consistent regardless of OS the webapp runs on.
                 const normBase = baseDir.replace(/\\/g, '/');
                 const descriptors = files.map(file => {
                     const relPart = (file.webkitRelativePath || file.name).replace(/\\/g, '/');
@@ -328,7 +276,6 @@ function _initImportMediaForm() {
             closeModal('import-media-popup');
             importForm.reset();
 
-            // Reset toggleable sections (form.reset() doesn't fire change events)
             const refBaseDirEl = document.getElementById('reference-base-dir-container');
             if (refBaseDirEl) refBaseDirEl.style.display = 'none';
 

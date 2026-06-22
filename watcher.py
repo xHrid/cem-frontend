@@ -14,6 +14,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import ssl
@@ -25,10 +26,6 @@ from pathlib import Path
 from typing import Optional
 import re as _re
 
-# ---------------------------------------------------------------------------
-# SSL context — use system certificates so corporate proxies / custom CAs work.
-# Falls back to unverified context only if system certs unavailable.
-# ---------------------------------------------------------------------------
 _ssl_ctx = ssl.create_default_context()
 try:
     import certifi
@@ -38,18 +35,12 @@ except ImportError:
 
 _opener = urllib.request.build_opener(
     urllib.request.HTTPSHandler(context=_ssl_ctx),
-    urllib.request.ProxyHandler(),  # reads HTTP(S)_PROXY env vars automatically
+    urllib.request.ProxyHandler(),
 )
 urllib.request.install_opener(_opener)
 
-
-# ---------------------------------------------------------------------------
-# Path utilities
-# ---------------------------------------------------------------------------
-
 _IS_WSL = Path('/mnt').is_dir() and sys.platform != "darwin"
 _IS_WINDOWS = sys.platform == "win32"
-
 
 def _normalize_path(path_str: str) -> str:
     """Normalize a path for the *current* OS, handling cross-platform inputs.
@@ -66,29 +57,30 @@ def _normalize_path(path_str: str) -> str:
     if not path_str:
         return path_str
 
-    # Unify separators to forward slashes for pattern matching
     norm = path_str.replace('\\', '/')
 
-    # Detect Windows drive letter: D:/... or D:
     m = _re.match(r'^([A-Za-z]):(/.*)?$', norm)
 
     if m and _IS_WSL:
-        # Convert  D:/foo/bar  →  /mnt/d/foo/bar
         drive = m.group(1).lower()
         rest  = m.group(2) or ''
         return f'/mnt/{drive}{rest}'
 
     if _IS_WINDOWS:
-        # On native Windows, let Path normalize separators consistently.
-        # This handles both "D:/foo/bar" and "D:\\foo/bar" → "D:\\foo\\bar"
         return str(Path(norm))
 
-    # POSIX (Linux / Mac) — just return with consistent forward slashes
     return norm
 
-
-# Keep old name as alias for backward compat
 _win_to_wsl = _normalize_path
+
+# While a job runs, refresh the heartbeat at least this often so the UI can tell
+# "still working" from "died mid-job". Must stay well below the UI's stale window.
+_HEARTBEAT_REFRESH_SEC = 10
+
+# A queued descriptor is created (0 bytes) and filled in a separate write/close on
+# the UI side. If we catch it before the content lands, wait this long before
+# treating an empty file as a genuine failure.
+_QUEUE_SETTLE_GRACE = 5.0
 
 _AUDIO_EXTS = frozenset({'.wav', '.mp3', '.flac', '.ogg', '.opus', '.m4a', '.wma', '.aac'})
 
@@ -102,17 +94,12 @@ def _count_audio_files(directory: str) -> int:
     except (OSError, PermissionError):
         return 0
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 @dataclass
 class WatcherConfig:
     root_path: Path
     watch_interval: int = 2
-    job_timeout: int = 1800  # 30 minutes in seconds
-    pip_timeout: Optional[int] = None  # None = no timeout (heavy deps: tensorflow/birdnetlib)
+    job_timeout: int = 1800
+    pip_timeout: Optional[int] = None
     heartbeat_file: str = "system/status.json"
     scripts_dir: str = "system/scripts"
     installed_registry: str = "system/scripts/installed.json"
@@ -123,7 +110,6 @@ class WatcherConfig:
         "https://raw.githubusercontent.com/xHrid/cem-backend/master"
     )
 
-    # Derived paths (computed post-init)
     status_path: Path = field(init=False)
     scripts_path: Path = field(init=False)
     venv_path: Path = field(init=False)
@@ -145,15 +131,10 @@ class WatcherConfig:
             return str(self.venv_path / "Scripts" / "python.exe")
         return str(self.venv_path / "bin" / "python")
 
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 def build_logger(name: str = "cem_watcher") -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
-        return logger  # already configured — avoid duplicate handlers on reload
+        return logger
 
     logger.setLevel(logging.DEBUG)
     handler = logging.StreamHandler(sys.stdout)
@@ -163,13 +144,7 @@ def build_logger(name: str = "cem_watcher") -> logging.Logger:
     logger.addHandler(handler)
     return logger
 
-
 logger = build_logger()
-
-
-# ---------------------------------------------------------------------------
-# Lock file — prevent concurrent watcher instances
-# ---------------------------------------------------------------------------
 
 class LockFile:
     """PID-based lock file.  Acquired on __enter__, released on __exit__."""
@@ -178,28 +153,78 @@ class LockFile:
         self.path = path
         self._acquired = False
 
-    def _stale(self) -> bool:
-        """Return True if the recorded PID is no longer running."""
+    @staticmethod
+    def _proc_start_time(pid: int):
+        """Kernel start time (jiffies since boot) for *pid*, or None if unknown.
+
+        Lets us tell a still-running watcher apart from an unrelated process the
+        OS handed the same PID after an uncleaned crash (PID reuse). Linux/WSL
+        only; returns None elsewhere (callers fall back to a plain liveness test).
+        """
         try:
-            pid = int(self.path.read_text().strip())
-            if os.name == "nt":
-                import ctypes
-                handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-                if handle:
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    return False
-                return True
-            else:
-                os.kill(pid, 0)  # signal 0 = existence check
-            return False
-        except (ValueError, FileNotFoundError):
-            return True
+            with open(f"/proc/{pid}/stat", "r") as fh:
+                data = fh.read()
+            # comm (field 2) is parenthesised and may contain spaces or ')',
+            # so the numeric fields resume right after the final ')'.
+            after = data[data.rindex(")") + 1:].split()
+            return int(after[19])  # field 22 = starttime
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def _read_lock(self):
+        """Return (pid, start_time) from the lock file.
+
+        Tolerates the legacy plain-integer format (start_time None) so an
+        existing lock from an older build is still understood.
+        """
+        try:
+            raw = self.path.read_text().strip()
         except OSError:
+            return None, None
+        try:
+            obj = json.loads(raw)
+            return int(obj["pid"]), obj.get("start")
+        except (ValueError, KeyError, TypeError):
+            try:
+                return int(raw), None
+            except ValueError:
+                return None, None
+
+    def _stale(self) -> bool:
+        """Return True if the lock's recorded process is no longer running.
+
+        Also True when the PID is alive but its start time no longer matches what
+        we recorded — i.e. the OS reused the PID — so a stale lock left by a crash
+        can't permanently block startup ("Another watcher is already running").
+        """
+        pid, recorded_start = self._read_lock()
+        if pid is None:
             return True
+
+        if os.name == "nt":
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return False
+            return True
+
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True  # no such process
+
+        # PID is alive — if we recorded a start time and can read the current
+        # one, a mismatch means this is a different process (PID reuse).
+        if recorded_start is not None:
+            current_start = self._proc_start_time(pid)
+            if current_start is not None and current_start != recorded_start:
+                return True
+        return False
 
     def acquire(self) -> bool:
         if self.path.exists() and not self._stale():
-            existing_pid = self.path.read_text().strip()
+            existing_pid, _ = self._read_lock()
             logger.error(
                 "Another watcher instance is already running (PID %s). "
                 "Remove %s to force-start.",
@@ -208,7 +233,8 @@ class LockFile:
             )
             return False
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(str(os.getpid()))
+        my_pid = os.getpid()
+        self.path.write_text(json.dumps({"pid": my_pid, "start": self._proc_start_time(my_pid)}))
         self._acquired = True
         return True
 
@@ -228,18 +254,9 @@ class LockFile:
     def __exit__(self, *_) -> None:
         self.release()
 
-
-# ---------------------------------------------------------------------------
-# Setup — virtual environment & script sync
-# ---------------------------------------------------------------------------
-
 class WatcherSetup:
     def __init__(self, cfg: WatcherConfig) -> None:
         self.cfg = cfg
-
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
 
     def update_heartbeat(self, current_status: str = "online") -> None:
         cfg = self.cfg
@@ -264,10 +281,6 @@ class WatcherSetup:
                 self.cfg.status_path.unlink()
         except OSError as exc:
             logger.warning("Could not remove heartbeat file: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Virtual environment
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _file_sha256(path: Path) -> str:
@@ -298,7 +311,6 @@ class WatcherSetup:
             urllib.request.urlretrieve(req_url, tmp_req)
             new_hash = self._file_sha256(tmp_req)
 
-            # Compare against stored hash — skip pip install if unchanged
             stored_hash: Optional[str] = None
             if cfg.req_hash_path.exists():
                 stored_hash = cfg.req_hash_path.read_text().strip()
@@ -308,7 +320,6 @@ class WatcherSetup:
                 tmp_req.unlink()
                 return
 
-            # Hash changed (or first run) — replace file and reinstall
             tmp_req.replace(req_path)
             logger.info("Installing dependencies in venv...")
             self.update_heartbeat("installing_dependencies")
@@ -333,10 +344,6 @@ class WatcherSetup:
             )
         except Exception as exc:
             logger.warning("Failed to setup requirements: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Script sync
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _content_sha256(data: bytes) -> str:
@@ -394,7 +401,6 @@ class WatcherSetup:
         try:
             with urllib.request.urlopen(remote_url, timeout=30) as resp:
                 remote_bytes = resp.read()
-                # Check Content-Length if server provided it
                 expected_len = resp.headers.get("Content-Length")
                 if expected_len is not None:
                     expected_len = int(expected_len)
@@ -408,7 +414,6 @@ class WatcherSetup:
             logger.warning("    Could not fetch %s/%s: %s", folder, filename, exc)
             return
 
-        # Validate Python files compile (catches truncation / corruption)
         if filename.endswith(".py"):
             try:
                 compile(remote_bytes, filename, "exec")
@@ -425,30 +430,20 @@ class WatcherSetup:
         if local_path.exists():
             local_hash = self._file_sha256(local_path)
             if local_hash == remote_hash:
-                return  # already up-to-date
+                return
             logger.info("    Updating: %s (from %s)", filename, folder)
         else:
             logger.info("    Downloading: %s (from %s)", filename, folder)
 
-        # Atomic write: temp file + rename prevents partial-write corruption
         local_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
         tmp_path.write_bytes(remote_bytes)
         tmp_path.replace(local_path)
 
-
-# ---------------------------------------------------------------------------
-# Job processor
-# ---------------------------------------------------------------------------
-
 class JobProcessor:
     def __init__(self, cfg: WatcherConfig, setup: WatcherSetup) -> None:
         self.cfg = cfg
         self.setup = setup
-
-    # ------------------------------------------------------------------
-    # Aggregate path resolution
-    # ------------------------------------------------------------------
 
     def _resolve_aggregate_path(
         self, script_name: str, db_dir: Path
@@ -479,16 +474,11 @@ class JobProcessor:
         if agg_name:
             return str(db_dir / agg_name)
 
-        # Fallback: use outputs.master_csv if no aggregate_file declared
         master_name = script_def.get("outputs", {}).get("master_csv")
         if master_name:
             return str(db_dir / master_name)
 
         return None
-
-    # ------------------------------------------------------------------
-    # Job processing
-    # ------------------------------------------------------------------
 
     def process(self, job_file: Path) -> None:
         cfg = self.cfg
@@ -496,6 +486,19 @@ class JobProcessor:
 
         if not job_id or job_id.startswith('.'):
             job_id = f"unnamed_job_{int(time.time())}"
+
+        # Empty-file race: the UI creates the descriptor (0 bytes) and writes its
+        # content in a separate step. If we observe it mid-write, skip and retry
+        # next cycle instead of moving a valid, about-to-be-filled job to failed/.
+        try:
+            stat = job_file.stat()
+        except OSError:
+            return  # vanished between scan and now (e.g. UI deleted it)
+        if stat.st_size == 0:
+            if time.time() - stat.st_mtime < _QUEUE_SETTLE_GRACE:
+                logger.debug("Job %s still being written (0 bytes) — retry next cycle", job_id)
+                return
+            logger.warning("Job %s empty after %.0fs — treating as failed", job_id, _QUEUE_SETTLE_GRACE)
 
         logger.info("Found Job: %s", job_id)
 
@@ -520,40 +523,29 @@ class JobProcessor:
             params = job_data.get("parameters", {})
 
             script_path = (cfg.scripts_path / script_name).resolve()
+            # Containment: resolve() happily escapes scripts_path for a name like
+            # "../../x.py". script_name comes from a file in a shared folder, so
+            # refuse anything that lands outside the managed scripts dir.
+            try:
+                script_path.relative_to(cfg.scripts_path.resolve())
+            except ValueError:
+                raise ValueError(f"Script path escapes scripts dir: {script_name}")
             if not script_path.exists():
                 raise FileNotFoundError(f"Script not found: {script_name}")
 
             job_result_dir = results_dir / job_id
             job_result_dir.mkdir(parents=True, exist_ok=True)
 
-            # Build command
             cmd = [cfg.venv_python, str(script_path)]
 
-            # 1. Core paths
             cmd.extend(["--output-dir", str(job_result_dir)])
             cmd.extend(["--root-dir", str(cfg.root_path)])
             cmd.extend(["--project-dir", str(project_root)])
 
-            # 2. Resolve ALL inputs — both copy-imported dirs AND reference files.
-            #
-            # The webapp stores two lists in the job JSON:
-            #   - "datasets"    → dirs of copy-imported files (relative to root).
-            #   - "input_files" → reference files with absolute OS paths + spot name.
-            #
-            # Scripts receive everything as --datasets (directories to scan) plus
-            # --dataset-spots (aligned spot names). Reference files are collapsed
-            # into their parent directories and merged into the same lists so
-            # existing scripts see ALL files — no separate --input-file-list needed.
-            #
-            # Spot info is preserved: each directory carries the canonical spot name
-            # so the script stamps it onto every detection from that directory.
-
             raw_dataset_spots = job_data.get("dataset_spots", [])
 
-            # dir_path → spot_name (preserves first-seen spot per dir)
             dir_to_spot = {}
 
-            # (A) Copy-imported dataset dirs
             for idx, d in enumerate(job_data.get("datasets", [])):
                 spot_label = raw_dataset_spots[idx] if idx < len(raw_dataset_spots) else ""
                 norm_d = _normalize_path(d)
@@ -567,8 +559,6 @@ class JobProcessor:
                 else:
                     logger.warning("  ⚠ dataset dir not found: %s", d)
 
-            # (B) Reference files — collapse each into its parent directory.
-            #     This way the script scans the dir and finds the file naturally.
             ref_file_count = 0
             ref_missing    = 0
             for entry in job_data.get("input_files", []):
@@ -595,13 +585,9 @@ class JobProcessor:
                     ref_missing,
                 )
 
-            # Build final deduped lists (aligned: dirs ↔ spots)
             unique_dirs      = list(dir_to_spot.keys())
             unique_dir_spots = [dir_to_spot[d] for d in unique_dirs]
 
-            # Write to temp files to avoid WinError 206 on Windows (~32k char limit).
-            # Always pass --datasets-file / --dataset-spots-file.
-            # For small lists, also pass inline args for backward compat.
             job_tmp_dir = job_result_dir / "_tmp"
             job_tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -623,11 +609,9 @@ class JobProcessor:
                 if len(unique_dir_spots) <= _INLINE_THRESHOLD:
                     cmd.extend(["--dataset-spots"] + [s or "_" for s in unique_dir_spots])
 
-            # 3. Unpack UI parameters (spots, start_date, end_date, snr_db, ...)
             for key, val in params.items():
                 cmd.extend([f"--{key.replace('_', '-')}", str(val)])
 
-            # 4. Pass denoise clips + eBird checklist if synced into scripts dir
             noise_file = (cfg.scripts_path / "static_noise.wav").resolve()
             if noise_file.exists():
                 cmd.extend(["--noise-path", str(noise_file)])
@@ -638,18 +622,14 @@ class JobProcessor:
             if ebird_file.exists():
                 cmd.extend(["--ebird-file", str(ebird_file)])
 
-            # 5. Pass aggregate + processed-files paths (scripts own read/write)
             aggregate_path = self._resolve_aggregate_path(script_name, db_dir)
             if aggregate_path:
                 cmd.extend(["--aggregate-file", aggregate_path])
                 logger.info("  Aggregate: %s", aggregate_path)
-            # Strip .py extension so we get "processed_birdnet_predictions.txt"
-            # instead of "processed_birdnet_predictions.py.txt"
             script_stem = Path(script_name).stem
             processed_path = str(db_dir / f"processed_{script_stem}.txt")
             cmd.extend(["--processed-file", processed_path])
 
-            # ── Meaningful job summary ──────────────────────────────────
             logger.info("  Scanning input directories for audio files...")
             total_files = sum(_count_audio_files(d) for d in unique_dirs)
             spot_names = sorted(set(s for s in unique_dir_spots if s and s != "_"))
@@ -677,9 +657,6 @@ class JobProcessor:
             logger.debug("  Full CMD: %s", " ".join(str(c) for c in cmd))
             self.setup.update_heartbeat("processing_job")
 
-            # ── Launch script inline ──────────────────────────────────
-            # Runs in the same terminal so live logs are visible.
-            # Stdout+stderr stream to console AND saved to log file.
             stdout_log_path = job_result_dir / "stdout.log"
 
             logger.info("  ── Launching script ──────────────────────")
@@ -694,16 +671,41 @@ class JobProcessor:
                     text=True,
                     bufsize=1,
                 )
-                for line in proc.stdout:
-                    print(line, end="", flush=True)
-                    log_fh.write(line)
 
-            proc.wait(timeout=cfg.job_timeout)
+                # Drain stdout on a background thread. Doing it inline blocks until
+                # the child *closes* stdout (i.e. exits), so a hung child that never
+                # exits would never reach proc.wait() and the timeout below would
+                # never fire — freezing the whole single-threaded watcher.
+                def _drain() -> None:
+                    try:
+                        for line in proc.stdout:
+                            log_fh.write(line)
+                    except (ValueError, OSError):
+                        pass  # log file closed during shutdown/kill
+
+                drain_thread = threading.Thread(target=_drain, daemon=True)
+                drain_thread.start()
+
+                # Wait in short slices so we can (a) enforce job_timeout even on a
+                # silently-hung child and (b) refresh the heartbeat so the UI sees
+                # the job as alive for its full (possibly long) duration.
+                deadline = start_time + cfg.job_timeout
+                try:
+                    while True:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(cmd, cfg.job_timeout)
+                        try:
+                            proc.wait(timeout=min(remaining, _HEARTBEAT_REFRESH_SEC))
+                            break
+                        except subprocess.TimeoutExpired:
+                            self.setup.update_heartbeat("processing_job")
+                finally:
+                    drain_thread.join(timeout=5)
 
             execution_duration = time.time() - start_time
             logger.info("  ─────────────────────────────────────────")
 
-            # Clean up temp list files
             if job_tmp_dir.exists():
                 shutil.rmtree(job_tmp_dir, ignore_errors=True)
 
@@ -734,7 +736,6 @@ class JobProcessor:
                     "  ❌ Failed after %dm%02ds (code %d)",
                     elapsed_m, elapsed_s, proc.returncode,
                 )
-                # Copy stdout log as error log too for easy finding
                 error_log = job_result_dir / "error.log"
                 if stdout_log_path.exists():
                     shutil.copy2(str(stdout_log_path), str(error_log))
@@ -745,16 +746,35 @@ class JobProcessor:
             if 'proc' in locals():
                 proc.kill()
                 proc.wait()
-            shutil.move(str(processing_path), str(failed_dir / job_file.name))
+            self._write_failure_reason(
+                results_dir / job_id,
+                f"Job exceeded the time limit ({cfg.job_timeout}s) and was terminated.",
+            )
+            if processing_path.exists():
+                shutil.move(str(processing_path), str(failed_dir / job_file.name))
         except Exception as exc:
             logger.error("  Job failed: %s", exc)
+            self._write_failure_reason(
+                results_dir / job_id,
+                f"Job failed before or during execution:\n{exc}",
+            )
             if processing_path.exists():
                 shutil.move(str(processing_path), str(failed_dir / job_file.name))
 
+    @staticmethod
+    def _write_failure_reason(job_result_dir: Path, message: str) -> None:
+        """Write error.log so the dashboard has something to show for a failed job.
 
-# ---------------------------------------------------------------------------
-# Main watcher loop
-# ---------------------------------------------------------------------------
+        Never clobbers an existing error.log (the script's own copied stdout).
+        """
+        try:
+            err_path = job_result_dir / "error.log"
+            if err_path.exists():
+                return
+            job_result_dir.mkdir(parents=True, exist_ok=True)
+            err_path.write_text(message + "\n", encoding="utf-8")
+        except OSError:
+            pass
 
 class Watcher:
     def __init__(self, cfg: WatcherConfig) -> None:
@@ -762,10 +782,6 @@ class Watcher:
         self.setup = WatcherSetup(cfg)
         self.processor = JobProcessor(cfg, self.setup)
         self._running = False
-
-    # ------------------------------------------------------------------
-    # Signal / graceful shutdown
-    # ------------------------------------------------------------------
 
     def _handle_signal(self, signum, _frame) -> None:
         sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
@@ -776,17 +792,45 @@ class Watcher:
         signal.signal(signal.SIGINT, self._handle_signal)
         if hasattr(signal, "SIGTERM"):
             signal.signal(signal.SIGTERM, self._handle_signal)
-        # Survive the controlling terminal closing: SIGHUP's default action is
-        # to kill the process (and its whole foreground group, including a
-        # running analysis child). Ignore it so closing the terminal no longer
-        # terminates the watcher. Still run detached (nohup/setsid/systemd) and
-        # redirect output, or log writes to the dead TTY can fail.
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_mtime(f: Path) -> float:
+        """mtime for sorting; missing files sort last instead of raising.
+
+        glob() materialises the list, then the sort stat()s each path. A file the
+        UI deleted (or we just moved) in between would otherwise raise
+        FileNotFoundError mid-sort and crash the loop.
+        """
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return float("inf")
+
+    def _reclaim_orphaned_processing(self) -> None:
+        """Fail jobs stranded in processing/ by a previous crash or restart.
+
+        The loop only scans queue/, so a job interrupted mid-run (crash, reboot,
+        machine sleep) would otherwise show 'Processing…' in the UI forever. We
+        hold the lock, so no other watcher owns these — move each to failed/ with
+        an error.log so the user gets a clear, re-runnable failure.
+        """
+        for proc_dir in self.cfg.root_path.glob("*/jobs/processing"):
+            for job_file in proc_dir.glob("*.json"):
+                try:
+                    project_root = job_file.parent.parent.parent
+                    failed_dir = project_root / "jobs" / "failed"
+                    failed_dir.mkdir(parents=True, exist_ok=True)
+                    JobProcessor._write_failure_reason(
+                        project_root / "jobs" / "results" / job_file.stem,
+                        "Job was interrupted by a watcher restart or crash and "
+                        "could not be resumed. Please re-run it.",
+                    )
+                    shutil.move(str(job_file), str(failed_dir / job_file.name))
+                    logger.warning("Reclaimed orphaned job %s → failed/", job_file.stem)
+                except Exception as exc:
+                    logger.warning("Could not reclaim orphaned job %s: %s", job_file, exc)
 
     def run(self) -> None:
         cfg = self.cfg
@@ -802,29 +846,30 @@ class Watcher:
                 self.setup.update_heartbeat("syncing_scripts")
                 self.setup.sync_scripts()
 
+                self._reclaim_orphaned_processing()
+
                 self._running = True
                 while self._running:
-                    self.setup.update_heartbeat("online")
-                    job_files = sorted(
-                        cfg.root_path.glob("*/jobs/queue/*.json"),
-                        key=lambda f: f.stat().st_mtime,
-                    )
-                    if job_files:
-                        self.processor.process(job_files[0])
+                    # Never let one bad job (vanished file, unexpected error) kill
+                    # the daemon — log and keep serving the queue.
+                    try:
+                        self.setup.update_heartbeat("online")
+                        job_files = sorted(
+                            cfg.root_path.glob("*/jobs/queue/*.json"),
+                            key=self._safe_mtime,
+                        )
+                        if job_files:
+                            self.processor.process(job_files[0])
+                    except Exception:
+                        logger.exception("Unexpected error in watch loop — continuing")
                     time.sleep(cfg.watch_interval)
 
         except RuntimeError as exc:
-            # Lock acquisition failure
             logger.error("%s", exc)
             sys.exit(1)
         finally:
             logger.info("Watcher stopped. Cleaning up...")
             self.setup.remove_heartbeat()
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -857,7 +902,6 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def main() -> None:
     args = parse_args()
     cfg = WatcherConfig(
@@ -867,7 +911,6 @@ def main() -> None:
         pip_timeout=args.pip_timeout,
     )
     Watcher(cfg).run()
-
 
 if __name__ == "__main__":
     main()

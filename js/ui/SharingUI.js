@@ -1,13 +1,3 @@
-/**
- * SharingUI.js — Share & Import project UI controller
- *
- * Responsibilities:
- *  - Share modal: select projects, enter emails, pick role, share
- *  - Import modal: paste link/folder ID, import
- *  - Shared project indicators in the project dropdown
- *  - Sync button for imported projects
- */
-
 import EventBus, { EVENTS } from '../core/EventBus.js';
 import { getLocalState } from '../data/MasterData.js';
 import { isReadOnlyImport } from '../data/ProjectManager.js';
@@ -21,29 +11,18 @@ import { pickSharedProjectFile } from '../services/PickerService.js';
 import { showToast } from './Toast.js';
 import { openModal, closeModal } from './ModalManager.js';
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
 export function initSharingUI() {
     _initShareButton();
     _initImportButton();
     _initShareModal();
     _initImportModal();
-    // Per-project sync is now automatic (SyncEngine on project switch + edits).
 
-    // Update project dropdown with sharing indicators
     EventBus.on(EVENTS.PROJECT_CHANGED, _decorateProjectDropdown);
     EventBus.on(EVENTS.PROJECT_SHARED, _decorateProjectDropdown);
     EventBus.on(EVENTS.PROJECT_IMPORTED, _decorateProjectDropdown);
 
-    // Check URL for ?import= param on load
     _checkUrlForImport();
 }
-
-// ---------------------------------------------------------------------------
-// Share button & modal
-// ---------------------------------------------------------------------------
 
 function _initShareButton() {
     const btn = document.getElementById('btn-share-project');
@@ -67,9 +46,6 @@ function _populateShareModal() {
     for (const p of state.projects) {
         const info       = getSharingInfo(p);
         const isImported = info.isImported;
-        // Imported projects can only be re-shared if WE are an editor (writer).
-        // The Drive folder's owner never changes — we just grant new permissions
-        // on the same shared folder. Viewer-only imports cannot be re-shared.
         const isViewerOnlyImport = isImported && info.permission !== 'writer';
         if (isViewerOnlyImport) continue;
 
@@ -84,14 +60,10 @@ function _populateShareModal() {
         cb.name     = 'share_project';
         cb.value    = p.id;
 
-        // Pre-select the project the user is currently viewing. This fixes the
-        // bug where Share defaulted to the first project in the list (often a
-        // stray "Untitled") instead of the open project.
         if (p.id === state.currentProjectId) cb.checked = true;
 
         let nameText = p.name;
         if (isImported) {
-            // Re-sharing a project we edit — make the role + ownership clear.
             nameText += ` (editor — owner: ${info.ownerEmail || 'unknown'})`;
         } else if (info.isShared) {
             nameText += ` (shared with ${info.collaboratorCount})`;
@@ -100,15 +72,13 @@ function _populateShareModal() {
         const span = document.createElement('span');
         span.className = 'share-project-name';
         span.textContent = nameText;
-        span.title = nameText; // full text on hover since we ellipsize
+        span.title = nameText;
 
         label.append(cb, span);
         div.append(label);
         projectList.appendChild(div);
     }
 
-    // Fallback: nothing pre-selected (e.g. current project was filtered out) →
-    // select the first available so Share never silently targets the wrong one.
     if (renderable > 0) {
         const checked = projectList.querySelector('input[name="share_project"]:checked');
         if (!checked) {
@@ -136,7 +106,6 @@ function _initShareModal() {
         if (submitBtn) { submitBtn.textContent = 'Sharing...'; submitBtn.disabled = true; }
 
         try {
-            // Gather selected projects
             const checkedBoxes = document.querySelectorAll(
                 '#share-project-list input[name="share_project"]:checked'
             );
@@ -144,12 +113,10 @@ function _initShareModal() {
 
             if (projectIds.length === 0) throw new Error('Select at least one project.');
 
-            // Gather emails
             const emailInput = document.getElementById('share-emails-input');
             const rawEmails  = (emailInput?.value || '').split(/[,;\s]+/).filter(Boolean);
             if (rawEmails.length === 0) throw new Error('Enter at least one email address.');
 
-            // Validate email format
             const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
             for (const email of rawEmails) {
                 if (!emailRegex.test(email)) {
@@ -157,11 +124,9 @@ function _initShareModal() {
                 }
             }
 
-            // Get role
             const roleSelect = document.getElementById('share-role-select');
             const role = roleSelect?.value || 'reader';
 
-            // Share each project
             let totalShared = 0;
             let lastShareLink = '';
 
@@ -172,7 +137,6 @@ function _initShareModal() {
                 lastShareLink = result.shareLink;
             }
 
-            // Show share link
             const linkDisplay = document.getElementById('share-link-display');
             if (linkDisplay && lastShareLink) {
                 linkDisplay.textContent = lastShareLink;
@@ -185,7 +149,6 @@ function _initShareModal() {
                 'success'
             );
 
-            // Don't close modal — let user see/copy the link
             if (emailInput) emailInput.value = '';
 
         } catch (err) {
@@ -196,7 +159,6 @@ function _initShareModal() {
         }
     });
 
-    // Copy link button
     const copyLinkBtn = document.getElementById('copy-share-link-btn');
     copyLinkBtn?.addEventListener('click', () => {
         const linkText = document.getElementById('share-link-display')?.textContent;
@@ -208,10 +170,6 @@ function _initShareModal() {
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// Import button & modal
-// ---------------------------------------------------------------------------
 
 function _initImportButton() {
     const btn = document.getElementById('btn-import-project');
@@ -229,24 +187,16 @@ function _initImportModal() {
 
     cancelBtn?.addEventListener('click', () => closeModal('import-project-dialog'));
 
-    // --- Primary path: pick the shared folder via Google Picker -----------
-    // With the drive.file scope, selecting the folder here is what grants the
-    // app access to it. This is the "popup asking to work in the shared
-    // folder" flow.
     pickBtn?.addEventListener('click', async () => {
         const originalText = pickBtn.textContent;
         pickBtn.textContent = 'Opening Drive...';
         pickBtn.disabled = true;
 
-        // CRITICAL: the import dialog is a native <dialog> shown with
-        // showModal(), which lives in the browser top-layer. The Google Picker
-        // is a normal DOM overlay and would render BEHIND it. Close the dialog
-        // first so the Picker is visible and clickable.
         closeModal('import-project-dialog');
 
         try {
             const file = await pickSharedProjectFile();
-            if (!file) return; // user cancelled the picker
+            if (!file) return;
 
             const project = await importSharedProject(file.id);
             showToast(`Imported "${project.name}" successfully!`, 'success');
@@ -259,9 +209,6 @@ function _initImportModal() {
         }
     });
 
-    // --- Secondary path: paste a link / folder ID -------------------------
-    // Only succeeds if the folder was already opened via the picker (drive.file
-    // limitation). On an access error we point the user back to the picker.
     form?.addEventListener('submit', async (e) => {
         e.preventDefault();
 
@@ -286,7 +233,6 @@ function _initImportModal() {
 
         } catch (err) {
             console.error('[SharingUI] Import failed:', err);
-            // drive.file can't read a folder the user hasn't picked — hint them.
             const accessIssue = /40[34]|access|permission|not.*found/i.test(err.message);
             const hint = accessIssue
                 ? ' Use "Select Shared Folder from Drive" above to grant access first.'
@@ -297,10 +243,6 @@ function _initImportModal() {
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// Project dropdown decoration
-// ---------------------------------------------------------------------------
 
 function _decorateProjectDropdown() {
     const select = document.getElementById('project-select');
@@ -320,12 +262,10 @@ function _decorateProjectDropdown() {
             suffix = ` [shared]`;
         }
 
-        // Strip old suffixes and re-add
         const baseName = project.name;
         opt.textContent = baseName + suffix;
     }
 
-    // Also toggle read-only UI hints
     _updateReadOnlyHints();
 }
 
@@ -334,12 +274,11 @@ function _updateReadOnlyHints() {
     const project = state.projects.find(p => p.id === state.currentProjectId);
     const isRO    = isReadOnlyImport(project);
 
-    // Disable mutation buttons for read-only imports
     const mutationButtons = [
         'btn-rename-project',
-        'open-form',          // Add spot
-        'toggle-tracking',    // Record route
-        'import-media-btn',   // Import media
+        'open-form',
+        'toggle-tracking',
+        'import-media-btn',
     ];
 
     for (const id of mutationButtons) {
@@ -350,7 +289,6 @@ function _updateReadOnlyHints() {
         }
     }
 
-    // Show read-only banner
     let banner = document.getElementById('readonly-banner');
     if (isRO && !banner) {
         banner = document.createElement('div');
@@ -367,22 +305,16 @@ function _updateReadOnlyHints() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-import from URL
-// ---------------------------------------------------------------------------
-
 function _checkUrlForImport() {
     const params = new URLSearchParams(globalThis.location?.search || '');
     const importId = params.get('import');
 
     if (importId) {
-        // Delay slightly to let app finish initializing
         setTimeout(async () => {
             try {
                 const project = await importSharedProject(importId);
                 showToast(`Imported "${project.name}" from share link!`, 'success');
 
-                // Clean the URL
                 const url = new URL(globalThis.location.href);
                 url.searchParams.delete('import');
                 globalThis.history.replaceState({}, '', url.toString());

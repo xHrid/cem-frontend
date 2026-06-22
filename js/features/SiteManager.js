@@ -1,46 +1,186 @@
-/**
- * SiteManager.js — KML site boundary upload, persistence, and stratification
- *
- * Pattern : Module Pattern (private state + narrow exported API)
- *
- * Flow:
- *   1. User submits Add Site form (name, KML, cluster count)
- *   2. KML + metadata saved locally via Repository.saveSite()
- *   3. Stratification runs in-browser: KML → satellite embeddings (COG)
- *      → K-means → classified overlay on Leaflet map
- *   4. Overlay images saved to the site record for persistence
- *
- * Import graph
- * ------------
- *   saveSite  → ../data/Repository.js
- *   showToast → ../ui/Toast.js
- *   runStratification, createOverlay → ../services/StratificationService.js
- *   getMap → ./MapManager.js
- */
+import { saveSite, deleteSite } from '../data/Repository.js';
+import { showToast }            from '../ui/Toast.js';
+import { closeModal }           from '../ui/ModalManager.js';
+import { getMap }               from './MapManager.js';
+import { getActiveProject, getSites } from '../data/MasterData.js';
+import * as StorageAdapter      from '../data/StorageAdapter.js';
+import EventBus, { EVENTS }     from '../core/EventBus.js';
 
-import { saveSite }       from '../data/Repository.js';
-import { showToast }      from '../ui/Toast.js';
-import { closeModal }     from '../ui/ModalManager.js';
-import { getMap }         from './MapManager.js';
-import { runStratification, createOverlay } from '../services/StratificationService.js';
+const _layers = new Map();
 
-// ---------------------------------------------------------------------------
-// Private state
-// ---------------------------------------------------------------------------
+const _visible = new Map();
 
-/** Active stratification overlays on the map, keyed by siteId. */
-const _overlays = new Map();
+async function _parseKmlCoords(kmlFile) {
+    const text   = await kmlFile.text();
+    const parser = new DOMParser();
+    const doc    = parser.parseFromString(text, 'application/xml');
 
-/** Currently displayed cluster count per site. */
-const _activeK = new Map();
+    const coordEl = doc.querySelector('coordinates');
+    if (!coordEl) throw new Error('No <coordinates> element found in KML.');
 
-// ---------------------------------------------------------------------------
-// Private — form submission handler
-// ---------------------------------------------------------------------------
+    const raw = coordEl.textContent.trim();
+    const coords = raw.split(/\s+/).map(triple => {
+        const [lon, lat] = triple.split(',').map(Number);
+        return [lat, lon];
+    }).filter(([lat, lon]) => !isNaN(lat) && !isNaN(lon));
 
-/**
- * Handle the #add-site-form submit event.
- */
+    if (coords.length < 3) throw new Error('KML polygon has fewer than 3 valid coordinates.');
+    return coords;
+}
+
+const OUTLINE_STYLE = {
+    color:       '#2e7d32',
+    weight:      2.5,
+    opacity:     0.85,
+    fillColor:   '#2e7d32',
+    fillOpacity: 0.08,
+};
+
+function _addOutline(siteId, coords, siteName, fitBounds = false) {
+    const map = getMap();
+    if (!map) return;
+
+    if (_layers.has(siteId)) {
+        map.removeLayer(_layers.get(siteId));
+    }
+
+    const polygon = L.polygon(coords, OUTLINE_STYLE);
+    polygon.bindTooltip(siteName, { sticky: true, className: 'site-tooltip' });
+    polygon.addTo(map);
+    _layers.set(siteId, polygon);
+    _visible.set(siteId, true);
+
+    if (fitBounds) {
+        map.fitBounds(polygon.getBounds(), { padding: [30, 30] });
+    }
+}
+
+function _removeOutline(siteId) {
+    const map = getMap();
+    const layer = _layers.get(siteId);
+    if (layer && map) map.removeLayer(layer);
+    _layers.delete(siteId);
+    _visible.delete(siteId);
+}
+
+function _toggleOutline(siteId) {
+    const map   = getMap();
+    const layer = _layers.get(siteId);
+    if (!layer || !map) return;
+
+    const isVisible = _visible.get(siteId);
+    if (isVisible) {
+        map.removeLayer(layer);
+        _visible.set(siteId, false);
+    } else {
+        layer.addTo(map);
+        _visible.set(siteId, true);
+    }
+    return !isVisible;
+}
+
+function _renderSiteList() {
+    const panel   = document.getElementById('site-list-panel');
+    const listEl  = document.getElementById('site-list');
+    if (!panel || !listEl) return;
+
+    const sites = getSites();
+    if (!sites || sites.length === 0) {
+        panel.style.display = 'none';
+        listEl.innerHTML = '';
+        return;
+    }
+
+    panel.style.display = '';
+    listEl.innerHTML = '';
+
+    for (const site of sites) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:6px; padding:4px 0; font-size:0.82rem;';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = _visible.get(site.id) !== false;
+        cb.title = 'Show / hide on map';
+        cb.addEventListener('change', () => {
+            _toggleOutline(site.id);
+        });
+
+        const label = document.createElement('span');
+        label.textContent = site.name;
+        label.style.cssText = 'flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer;';
+        label.title = 'Zoom to site';
+        label.addEventListener('click', () => {
+            const layer = _layers.get(site.id);
+            if (layer) {
+                if (!_visible.get(site.id)) {
+                    _toggleOutline(site.id);
+                    cb.checked = true;
+                }
+                getMap()?.fitBounds(layer.getBounds(), { padding: [30, 30] });
+            }
+        });
+
+        const del = document.createElement('button');
+        del.textContent = '×';
+        del.title = 'Delete site';
+        del.style.cssText = 'border:none; background:none; color:var(--danger-red,#dc3545); font-size:1.1rem; cursor:pointer; padding:0 2px; line-height:1;';
+        del.addEventListener('click', async () => {
+            if (!confirm(`Delete site "${site.name}"?`)) return;
+            try {
+                _removeOutline(site.id);
+                await deleteSite(site.id);
+                showToast(`Site "${site.name}" deleted.`, 'success');
+                _renderSiteList();
+            } catch (err) {
+                console.error('[SiteManager] deleteSite failed:', err);
+                showToast(`Error deleting site: ${err.message}`, 'failed');
+            }
+        });
+
+        row.appendChild(cb);
+        row.appendChild(label);
+        row.appendChild(del);
+        listEl.appendChild(row);
+    }
+}
+
+function _clearAllLayers() {
+    const map = getMap();
+    for (const [, layer] of _layers) {
+        if (map) map.removeLayer(layer);
+    }
+    _layers.clear();
+    _visible.clear();
+}
+
+async function _loadProjectSites() {
+    _clearAllLayers();
+
+    const sites = getSites();
+    if (!sites || sites.length === 0) {
+        _renderSiteList();
+        return;
+    }
+
+    for (const site of sites) {
+        if (!site.kml_filename) continue;
+        try {
+            const blob = await StorageAdapter.getFileBlob(site.kml_filename);
+            if (!blob) {
+                console.warn(`[SiteManager] KML not found locally for site "${site.name}"`);
+                continue;
+            }
+            const coords = await _parseKmlCoords(blob);
+            _addOutline(site.id, coords, site.name);
+        } catch (err) {
+            console.warn(`[SiteManager] Failed to load site "${site.name}":`, err.message);
+        }
+    }
+
+    _renderSiteList();
+}
+
 async function _handleSiteFormSubmit(e) {
     e.preventDefault();
     const form = e.target;
@@ -58,181 +198,33 @@ async function _handleSiteFormSubmit(e) {
         return;
     }
 
-    const clustersRaw = form.clusters?.value;
-    const clusters    = clustersRaw ? Number(clustersRaw) : null;
-
     const statusEl = document.getElementById('add-site-status');
 
     try {
-        // ── Save locally ─────────────────────────────────────────────────
-        if (statusEl) statusEl.textContent = 'Saving locally…';
-        const siteRecord = await saveSite(name, file, clusters);
-        showToast('Site saved locally.', 'success');
+        if (statusEl) statusEl.textContent = 'Saving…';
+
+        const coords = await _parseKmlCoords(file);
+
+        const siteRecord = await saveSite(name, file, null);
+
+        _addOutline(siteRecord.id, coords, name, true);
+
+        showToast(`Site "${name}" added.`, 'success');
         closeModal('add-site-popup-form');
         form.reset();
         const kmlLabel = document.getElementById('kml-file-name');
         if (kmlLabel) kmlLabel.textContent = 'Choose KML file…';
 
-        // ── Run stratification if clusters are specified ─────────────────
-        if (clusters && clusters >= 2) {
-            _runStratification(file, clusters, siteRecord?.id || name);
-        }
-
-        if (statusEl) statusEl.textContent = '';
+        _renderSiteList();
 
     } catch (err) {
         console.error('[SiteManager] saveSite failed:', err);
         showToast(`Error saving site: ${err.message}`, 'failed');
+    } finally {
         if (statusEl) statusEl.textContent = '';
     }
 }
 
-/**
- * Run stratification in background and show results on map.
- * Non-blocking — errors show toast, don't crash the form flow.
- */
-async function _runStratification(kmlFile, maxClusters, siteId) {
-    showToast('Running stratification analysis…', 'info');
-
-    try {
-        const results = await runStratification(kmlFile, maxClusters, 2024, (msg, pct) => {
-            console.log(`[SiteManager] Stratification: ${msg} (${pct}%)`);
-        });
-
-        if (results.length === 0) {
-            showToast('Stratification produced no results.', 'failed');
-            return;
-        }
-
-        // Store results and show the max-cluster result by default
-        _overlays.set(siteId, results);
-        _showOverlay(siteId, maxClusters);
-
-        showToast(`Stratification complete — ${results.length} cluster maps generated.`, 'success');
-
-        // Show cluster selector UI on the map
-        _showClusterSelector(siteId, results);
-
-    } catch (err) {
-        console.error('[SiteManager] Stratification failed:', err);
-        showToast(`Stratification failed: ${err.message}`, 'failed');
-    }
-}
-
-/**
- * Display a specific cluster overlay on the map.
- */
-function _showOverlay(siteId, k) {
-    const map     = getMap();
-    const results = _overlays.get(siteId);
-    if (!results) return;
-
-    // Remove current overlay for this site
-    const currentK = _activeK.get(siteId);
-    if (currentK) {
-        const current = results.find(r => r.k === currentK);
-        if (current?._leafletOverlay) {
-            map.removeLayer(current._leafletOverlay);
-        }
-    }
-
-    // Add new overlay
-    const result = results.find(r => r.k === k);
-    if (!result) return;
-
-    if (!result._leafletOverlay) {
-        result._leafletOverlay = createOverlay(result);
-    }
-    result._leafletOverlay.addTo(map);
-    _activeK.set(siteId, k);
-
-    // Fit map to the overlay bounds
-    map.fitBounds(result.bounds, { padding: [30, 30] });
-}
-
-/**
- * Show a small floating cluster selector control on the map.
- */
-function _showClusterSelector(siteId, results) {
-    // Remove any existing selector
-    const existing = document.getElementById('cluster-selector');
-    if (existing) existing.remove();
-
-    const container = document.createElement('div');
-    container.id = 'cluster-selector';
-    container.style.cssText = `
-        position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
-        z-index: 1000; background: var(--bg-card, #fff); padding: 8px 16px;
-        border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-        display: flex; gap: 8px; align-items: center; font-size: 0.85rem;
-    `;
-
-    container.innerHTML = `<span style="font-weight:600; color:var(--text-dark);">Clusters:</span>`;
-
-    for (const r of results) {
-        const btn = document.createElement('button');
-        btn.textContent = r.k;
-        btn.dataset.k   = r.k;
-        btn.style.cssText = `
-            width: 32px; height: 32px; border-radius: 50%; border: 2px solid var(--border-color);
-            background: var(--bg-surface); cursor: pointer; font-weight: 700;
-            font-size: 0.85rem; color: var(--text-dark); transition: all 0.15s;
-        `;
-        btn.addEventListener('click', () => {
-            _showOverlay(siteId, r.k);
-            // Highlight active button
-            container.querySelectorAll('button').forEach(b => {
-                b.style.background = 'var(--bg-surface)';
-                b.style.borderColor = 'var(--border-color)';
-            });
-            btn.style.background = 'var(--forest, #2e7d32)';
-            btn.style.borderColor = 'var(--forest, #2e7d32)';
-            btn.style.color = '#fff';
-        });
-
-        // Highlight the default (max clusters)
-        if (r.k === results[results.length - 1].k) {
-            btn.style.background = 'var(--forest, #2e7d32)';
-            btn.style.borderColor = 'var(--forest, #2e7d32)';
-            btn.style.color = '#fff';
-        }
-
-        container.appendChild(btn);
-    }
-
-    // Close button
-    const close = document.createElement('button');
-    close.textContent = '✕';
-    close.title = 'Hide overlay';
-    close.style.cssText = `
-        width: 28px; height: 28px; border-radius: 50%; border: none;
-        background: var(--danger-red, #dc3545); color: #fff; cursor: pointer;
-        font-size: 0.8rem; margin-left: 8px;
-    `;
-    close.addEventListener('click', () => {
-        // Remove overlay from map
-        const currentK = _activeK.get(siteId);
-        if (currentK) {
-            const current = results.find(r => r.k === currentK);
-            if (current?._leafletOverlay) getMap().removeLayer(current._leafletOverlay);
-        }
-        _activeK.delete(siteId);
-        container.remove();
-    });
-    container.appendChild(close);
-
-    // Append to map container
-    const mapEl = document.getElementById('map');
-    if (mapEl) mapEl.appendChild(container);
-}
-
-// ---------------------------------------------------------------------------
-// Public — module initialisation
-// ---------------------------------------------------------------------------
-
-/**
- * Wire the Add Site form submit handler.
- */
 export function initSites() {
     const form = document.getElementById('add-site-form');
     if (!form) {
@@ -250,5 +242,12 @@ export function initSites() {
         });
     }
 
-    console.log('[SiteManager] Initialised.');
+    EventBus.on(EVENTS.PROJECT_CHANGED, () => _loadProjectSites());
+
+    EventBus.on(EVENTS.DATA_UPDATED, () => _renderSiteList());
+
+    if (getActiveProject()) {
+        _loadProjectSites();
+    }
+
 }

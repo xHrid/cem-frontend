@@ -1,38 +1,3 @@
-/**
- * SpotManager.js — Observation spot recording and map display
- *
- * Pattern : Module Pattern (IIFE / private-scope encapsulation)
- *
- * Replaces the legacy js/spots.js. Bugs fixed:
- *
- *  Bug 1 — saveSpot called with 4 args but old storage only accepted 3.
- *           Now fixed in Repository.saveSpot() which accepts the 4th
- *           `recordDate` parameter. This module passes all four.
- *
- *  Bug 2 — displaySpots() was called on PROJECT_CHANGED even when the
- *           "Show Spots" checkbox was unchecked, creating ghost markers.
- *           Fixed: all three event handlers gate on the checkbox state.
- *
- *  Bug 3 — Audio recording state (mediaRecorder, audioChunks) was mixed
- *           with form-submit scope, making the blob unreliable when the
- *           user stopped recording after opening the form a second time.
- *           Fixed: encapsulated in _startRecording() / _stopRecording().
- *
- *  Bug 4 — DOM queries ran at module top level (import-time), before
- *           DOMContentLoaded. Fixed: all querySelector calls deferred
- *           inside initSpots() and the functions it calls.
- *
- *  Bug 5 — alert() used for all user feedback. Replaced with showToast().
- *
- * Import graph
- * ------------
- *   EventBus, EVENTS          → ../core/EventBus.js
- *   saveSpot, getLocalFileUrl → ../data/Repository.js
- *   getSpots, getExternalFiles → ../data/MasterData.js
- *   getMap                    → ./MapManager.js
- *   showToast                 → ../ui/Toast.js
- */
-
 import Config                         from '../core/Config.js';
 import EventBus, { EVENTS }          from '../core/EventBus.js';
 import { saveSpot, updateSpot, getLocalFileUrl, deleteSpot, deleteExternalFile } from '../data/Repository.js';
@@ -45,48 +10,20 @@ import { downscaleImage }            from '../data/imageUtils.js';
 import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 import { getUserEmail } from '../services/AuthService.js';
 
-// ---------------------------------------------------------------------------
-// Module-private state
-// ---------------------------------------------------------------------------
-
-/** @type {L.LayerGroup|null} — the layer that holds all spot circle-markers */
 let _spotsLayer = null;
 
-/** Last active project id seen — used to tell a real project SWITCH apart from a
- *  background data refresh (sync also emits PROJECT_CHANGED). */
 let _lastProjectId = null;
 
-// _drivePublicUrl is now the shared getPublicUrl() from ProjectFilesSync.
-
-// Audio recording state — encapsulated here (Bug 3 fix)
-/** @type {MediaRecorder|null} */
 let _mediaRecorder = null;
-/** @type {Blob[]} */
 let _audioChunks = [];
-/** @type {Blob|null} */
 let _recordedAudioBlob = null;
 
-/** Pre-fill spot name when using "Add More" from spot details */
 let _prefillSpotName = null;
 
-/**
- * When set, the spot form is in "Add More" mode: we are appending another
- * temporal entry to an EXISTING spot. Name and coordinates are locked to the
- * original spot — only the new observation's notes/media/time may change.
- * @type {object|null}
- */
 let _addMoreSpot = null;
 
-/**
- * Pending image files for the spot form (multi-image support).
- * Each element: { file: File, id: string }
- * @type {{ file: File, id: string }[]}
- */
 let _pendingImages = [];
 
-/**
- * Render the image preview grid from _pendingImages.
- */
 function _renderImagePreviews() {
     const grid = document.getElementById('image-preview-grid');
     if (!grid) return;
@@ -114,10 +51,6 @@ function _renderImagePreviews() {
     });
 }
 
-/**
- * Add files to _pendingImages and refresh previews.
- * @param {FileList|File[]} files
- */
 function _addImageFiles(files) {
     for (const f of files) {
         _pendingImages.push({ file: f, id: crypto.randomUUID() });
@@ -125,16 +58,6 @@ function _addImageFiles(files) {
     _renderImagePreviews();
 }
 
-/**
- * Lock or unlock the spot-form name + location inputs.
- *
- * In Add More mode the name field is read-only and the location is pinned to
- * the original spot's coordinates (the "use current location" path is
- * disabled), because the user is adding info to the same spot — not moving it
- * or renaming it.
- *
- * @param {object|null} spot  The spot to lock onto, or null to unlock.
- */
 function _setAddMoreMode(spot) {
     _addMoreSpot = spot || null;
 
@@ -145,13 +68,11 @@ function _setAddMoreMode(spot) {
     const lonInput     = document.getElementById('custom-lon');
 
     if (spot) {
-        // --- Lock name ---
         if (nameInput) {
             nameInput.value    = spot.name;
             nameInput.readOnly = true;
             nameInput.title    = 'Name locked — adding to the same spot';
         }
-        // --- Pin location to the spot's coordinates, lock the inputs ---
         if (useLocCb) {
             useLocCb.checked  = false;
             useLocCb.disabled = true;
@@ -168,7 +89,6 @@ function _setAddMoreMode(spot) {
             lonInput.disabled = true;
         }
     } else {
-        // --- Unlock everything (normal "Add" path) ---
         if (nameInput) { nameInput.readOnly = false; nameInput.title = ''; }
         if (useLocCb)  { useLocCb.disabled  = false; }
         if (latInput)  { latInput.readOnly  = false; latInput.disabled  = false; }
@@ -176,16 +96,6 @@ function _setAddMoreMode(spot) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private — audio recording (Bug 3: was inlined inside the click handler)
-// ---------------------------------------------------------------------------
-
-/**
- * Request microphone access and start a new MediaRecorder session.
- * Clears any previously recorded blob so a fresh recording always starts clean.
- *
- * @returns {Promise<void>}
- */
 async function _startRecording() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -208,24 +118,12 @@ async function _startRecording() {
     }
 }
 
-/**
- * Stop the currently active MediaRecorder.
- * The `onstop` handler above assembles the blob asynchronously.
- */
 function _stopRecording() {
     if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
         _mediaRecorder.stop();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private — audio toggle wiring
-// ---------------------------------------------------------------------------
-
-/**
- * Bind the microphone toggle button inside the spot form.
- * Called once from initSpots() after DOMContentLoaded.
- */
 function _bindAudioToggle() {
     const audioToggle = document.getElementById('audio-toggle');
     if (!audioToggle) return;
@@ -236,7 +134,6 @@ function _bindAudioToggle() {
         if (isIdle) {
             await _startRecording();
             if (_mediaRecorder) {
-                // Only update UI if recording started successfully
                 audioToggle.classList.add('recording');
                 audioToggle.style.backgroundColor = 'red';
             }
@@ -248,25 +145,10 @@ function _bindAudioToggle() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Private — spot form submission
-// ---------------------------------------------------------------------------
-
-/**
- * Handle the #spot-form submit event.
- *
- * Date-handling fix (Bug 1 extension): the form exposes a "use current time"
- * checkbox. When unchecked, custom date/time inputs determine recordDate,
- * which is passed as the 4th argument to saveSpot() so Repository uses it as
- * the observation timestamp rather than always calling new Date().
- *
- * @param {SubmitEvent} e
- */
 async function _handleSpotFormSubmit(e) {
     e.preventDefault();
     const form = e.target;
 
-    // --- Date handling ---
     let recordDate = new Date();
     const useCurrentCb = document.getElementById('use-current-time');
     if (useCurrentCb && !useCurrentCb.checked) {
@@ -275,10 +157,8 @@ async function _handleSpotFormSubmit(e) {
         if (cDate) recordDate = new Date(`${cDate}T${cTime}`);
     }
 
-    // --- Location handling ---
     let lat, lng;
     if (_addMoreSpot) {
-        // Add More mode — coordinates are locked to the original spot.
         lat = _addMoreSpot.latitude;
         lng = _addMoreSpot.longitude;
     } else {
@@ -294,15 +174,17 @@ async function _handleSpotFormSubmit(e) {
             const pos = getCurrentPosition();
             lat = pos.lat;
             lng = pos.lng;
+            if (lat === 0 && lng === 0) {
+                showToast('Location not available yet. Wait for a GPS fix or enter coordinates manually.', 'failed');
+                return;
+            }
         }
     }
 
-    // Add More mode — name is locked to the original spot.
     const spotName = _addMoreSpot ? _addMoreSpot.name : form.name.value;
 
     const statusEl = document.getElementById('status');
 
-    // Downscale all pending images before storage
     const imageBlobs = [];
     if (_pendingImages.length > 0) {
         for (let i = 0; i < _pendingImages.length; i++) {
@@ -327,10 +209,9 @@ async function _handleSpotFormSubmit(e) {
 
         showToast('Spot saved locally!', 'success');
 
-        // --- Reset the form ---
         form.reset();
         _prefillSpotName = null;
-        _setAddMoreMode(null); // unlock name/location for the next normal add
+        _setAddMoreMode(null);
         const useCurrentCbReset = document.getElementById('use-current-time');
         if (useCurrentCbReset) useCurrentCbReset.checked = true;
         const useCurrentLocReset = document.getElementById('use-current-location');
@@ -344,7 +225,6 @@ async function _handleSpotFormSubmit(e) {
         closeModal('popup-form');
         if (statusEl) statusEl.textContent = '';
 
-        // Reset image + audio state
         _pendingImages = [];
         _renderImagePreviews();
         _recordedAudioBlob = null;
@@ -353,7 +233,6 @@ async function _handleSpotFormSubmit(e) {
         const playback = document.getElementById('audioPlayback');
         if (playback) playback.src = '';
 
-        // Refresh the map layer if the checkbox is checked
         if (_isSpotsCheckboxChecked()) displaySpots();
 
     } catch (err) {
@@ -363,45 +242,25 @@ async function _handleSpotFormSubmit(e) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Private — detail panel
-// ---------------------------------------------------------------------------
-
-/**
- * Read the display-spots checkbox state.
- *
- * @returns {boolean}
- */
 function _isSpotsCheckboxChecked() {
     const cb = document.getElementById('display-spots');
     return cb ? cb.checked : false;
 }
 
-/**
- * Populate the side panel with details for the clicked spot.
- *
- * Loads image and audio blob URLs asynchronously via Repository.getLocalFileUrl()
- * (which delegates to StorageAdapter for the native File System handle).
- *
- * @param {object} spot  The spot record from MasterData.
- */
 async function _showSpotDetails(spot) {
     const menu    = document.getElementById('spot-details-menu');
     const content = document.getElementById('spot-details-content');
     if (!menu || !content) return;
 
-    // Find all entries with the same spot name (temporal tracking)
     const allSpots = getSpots();
     const spotEntries = allSpots.filter(s => s.name === spot.name);
 
-    // Build external-files button
     const allExternal   = getExternalFiles();
     const externalFiles = allExternal.filter(
         (f) => f.linked_spots && f.linked_spots.some(id => spotEntries.some(s => s.spotId === id))
     );
     const hasExternal = externalFiles.length > 0;
 
-    // Build header + a horizontal rail of temporal entries (see them side by side)
     const plural = spotEntries.length === 1 ? 'observation' : 'observations';
     let html = `
         <div class="spot-detail-head">
@@ -439,21 +298,17 @@ async function _showSpotDetails(spot) {
 
     content.innerHTML = html;
 
-    // Gallery arrows: scroll the rail by one card width.
     const rail = content.querySelector('.spot-entry-rail');
     if (rail) {
         const step = () => (rail.querySelector('.spot-entry')?.getBoundingClientRect().width || rail.clientWidth) + 16;
         content.querySelector('.rail-nav.prev')?.addEventListener('click', () => rail.scrollBy({ left: -step(), behavior: 'smooth' }));
         content.querySelector('.rail-nav.next')?.addEventListener('click', () => rail.scrollBy({ left:  step(), behavior: 'smooth' }));
 
-        // No mouse-scrolling the gallery — only buttons or touch swipe. Block
-        // horizontal-intent wheel/trackpad; let vertical wheel scroll the panel.
         rail.addEventListener('wheel', (e) => {
             if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) e.preventDefault();
         }, { passive: false });
     }
 
-    // Set user content via textContent (XSS-safe)
     content.querySelector('#spot-name').textContent = spot.name;
     content.querySelector('#spot-coordinates').textContent =
         `${spot.latitude.toFixed(5)}, ${spot.longitude.toFixed(5)}`;
@@ -467,7 +322,6 @@ async function _showSpotDetails(spot) {
             `${entry.latitude.toFixed(5)}, ${entry.longitude.toFixed(5)}`;
         div.querySelector('.entry-desc').textContent = entry.description || 'No notes';
 
-        // Tap-to-expand creator pill
         const pill = div.querySelector('.creator-pill');
         if (pill) pill.addEventListener('click', () => pill.classList.toggle('expanded'));
     });
@@ -475,8 +329,6 @@ async function _showSpotDetails(spot) {
     menu.classList.add('open');
     document.body.classList.add('panel-open');
 
-    // "Add More" button — opens the spot form locked to THIS spot (same name +
-    // coordinates; the user is appending another observation, not editing identity).
     document.getElementById('add-more-spot-btn')?.addEventListener('click', () => {
         _prefillSpotName = spot.name;
         _setAddMoreMode(spot);
@@ -489,7 +341,6 @@ async function _showSpotDetails(spot) {
         });
     }
 
-    // Delete buttons for each entry
     content.querySelectorAll('.delete-spot-entry-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
             const spotId = btn.dataset.spotId;
@@ -497,7 +348,6 @@ async function _showSpotDetails(spot) {
             try {
                 await deleteSpot(spotId);
                 showToast('Spot entry deleted.', 'success');
-                // Refresh panel — if entries remain, show first; otherwise close panel
                 const remaining = getSpots().filter(s => s.name === spot.name);
                 if (remaining.length > 0) {
                     _showSpotDetails(remaining[0]);
@@ -512,7 +362,6 @@ async function _showSpotDetails(spot) {
         });
     });
 
-    // Edit buttons for each entry — swap the card into an inline editor.
     content.querySelectorAll('.edit-spot-entry-btn').forEach((btn, idx) => {
         btn.addEventListener('click', () => {
             const entry = spotEntries[idx];
@@ -521,11 +370,9 @@ async function _showSpotDetails(spot) {
         });
     });
 
-    // Async media loads for each entry
     for (let idx = 0; idx < spotEntries.length; idx++) {
         const entry = spotEntries[idx];
 
-        // ── Images ──────────────────────────────────────────────────────────
         const imgContainer = content.querySelector(`.media-container-img-${idx}`);
         const imgPaths = entry.images && entry.images.length > 0
             ? entry.images
@@ -542,19 +389,17 @@ async function _showSpotDetails(spot) {
                     imgHtml += `<img src="${url}" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
                     anyLocal = true;
                 } else {
-                    // Not local — try Drive ID for this specific image
                     const did = driveIds[imgI] || (imgI === 0 ? entry.image_drive_id : null);
                     if (did) {
                         const src = getPublicUrl(did, 'image');
                         imgHtml += `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px; margin-bottom:6px;">`;
                         imgHtml += `<button class="on-demand-dl" data-drive-id="${did}" data-rel-path="${imgPath}" data-kind="image" style="font-size:0.72rem; background:none; border:none; padding:2px 8px; cursor:pointer; color:var(--text-muted); opacity:0.7;">☁️ Streaming from Drive · tap to save locally</button>`;
-                        anyLocal = true; // prevent fallback
+                        anyLocal = true;
                     } else {
                         imgHtml += `<p style="font-size:0.8rem; color:var(--text-muted);">⏳ Image syncing to Drive…</p>`;
                     }
                 }
             }
-            // All images missing locally but legacy single Drive ID exists
             if (!anyLocal && entry.image_drive_id) {
                 const src = getPublicUrl(entry.image_drive_id, 'image');
                 imgHtml = `<img src="${src}" referrerpolicy="no-referrer" style="max-width:100%; border-radius:8px;">`;
@@ -563,7 +408,6 @@ async function _showSpotDetails(spot) {
             imgContainer.innerHTML = imgHtml;
         }
 
-        // ── Audio (on-demand: CORS blocks public URL playback) ──────────────
         const audioContainer = content.querySelector(`.media-container-audio-${idx}`);
         if ((entry.audio_local_filename || entry.audio_drive_id) && audioContainer) {
             const url = entry.audio_local_filename
@@ -574,12 +418,10 @@ async function _showSpotDetails(spot) {
             } else if (entry.audio_drive_id) {
                 const dl = getPublicUrl(entry.audio_drive_id, 'audio');
                 if (Config.proxy?.workerUrl) {
-                    // Proxy adds CORS headers → inline <audio> playback works
                     audioContainer.innerHTML =
                         `<audio controls src="${dl}" style="width:100%;"></audio>` +
                         `<button class="on-demand-dl" data-drive-id="${entry.audio_drive_id}" data-rel-path="${entry.audio_local_filename || ''}" data-kind="audio" style="font-size:0.72rem; background:none; border:none; padding:2px 8px; cursor:pointer; color:var(--text-muted); opacity:0.7;">☁️ Streaming from Drive · tap to save locally</button>`;
                 } else {
-                    // No proxy — CORS blocks <audio>. Show download button.
                     audioContainer.innerHTML =
                         `<div class="on-demand-audio" style="display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-surface-alt, #f5f5f5); border-radius:8px; margin-top:4px;">` +
                             `<span style="font-size:1.1rem;">🎤</span>` +
@@ -592,7 +434,6 @@ async function _showSpotDetails(spot) {
         }
     }
 
-    // Wire up on-demand download buttons
     content.querySelectorAll('.on-demand-dl').forEach(btn => {
         btn.addEventListener('click', async () => {
             const { driveId, relPath, kind } = btn.dataset;
@@ -603,9 +444,8 @@ async function _showSpotDetails(spot) {
                 const result = await downloadMediaFile(driveId, relPath, kind);
                 if (result) {
                     showToast('Downloaded — rendering.', 'success');
-                    _showSpotDetails(spot); // re-render with local file
+                    _showSpotDetails(spot);
                 } else {
-                    // CORS blocked — open download link in new tab
                     const dl = getPublicUrl(driveId, kind);
                     window.open(dl, '_blank');
                     showToast('Opened download in new tab.', 'info');
@@ -621,37 +461,22 @@ async function _showSpotDetails(spot) {
     });
 }
 
-/**
- * Replace one entry card with an inline editor for its notes + photo.
- *
- * Scope is deliberately narrow: notes and the photo only. Name, coordinates and
- * the observation date stay fixed (that's identity, not "details"). Cancel — or
- * closing without saving — re-renders the panel from stored data, so nothing
- * changes unless the user explicitly hits Save.
- *
- * @param {object}      spot   The spot whose panel is open (for re-render).
- * @param {object}      entry  The specific temporal entry being edited.
- * @param {HTMLElement} div    The .spot-entry card element to take over.
- */
 async function _beginEntryEdit(spot, entry, div) {
-    // Resolve all existing images for preview grid.
     const existingPaths = entry.images && entry.images.length > 0
         ? [...entry.images]
         : (entry.image_local_filename ? [entry.image_local_filename] : []);
 
-    const existingImages = []; // { path, src }
+    const existingImages = [];
     for (const p of existingPaths) {
         const url = await getLocalFileUrl(p);
         if (url) existingImages.push({ path: p, src: url });
     }
-    // Drive-only fallback (single image)
     if (existingImages.length === 0 && entry.image_drive_id) {
         existingImages.push({ path: '__drive__', src: getPublicUrl(entry.image_drive_id, 'image') });
     }
 
-    // State: tracks deletions + new additions
     const deletedPaths = new Set();
-    const newFiles = [];   // { file: File, id: string }
+    const newFiles = [];
 
     div.innerHTML = `
         <span class="entry-index">Editing entry</span>
@@ -683,7 +508,6 @@ async function _beginEntryEdit(spot, entry, div) {
 
     function renderEditGrid() {
         grid.innerHTML = '';
-        // Existing images (not deleted)
         existingImages.forEach(img => {
             if (deletedPaths.has(img.path)) return;
             const thumb = document.createElement('div');
@@ -695,7 +519,6 @@ async function _beginEntryEdit(spot, entry, div) {
             });
             grid.appendChild(thumb);
         });
-        // New files
         newFiles.forEach(item => {
             const thumb = document.createElement('div');
             thumb.className = 'image-preview-thumb';
@@ -716,7 +539,6 @@ async function _beginEntryEdit(spot, entry, div) {
 
     div.querySelector('.edit-desc').value = entry.description || '';
 
-    // Gallery — add multiple
     div.querySelector('.edit-gallery-input').addEventListener('change', (e) => {
         for (const f of e.target.files) {
             newFiles.push({ file: f, id: crypto.randomUUID() });
@@ -725,7 +547,6 @@ async function _beginEntryEdit(spot, entry, div) {
         renderEditGrid();
     });
 
-    // Camera — add one (appends, not override)
     div.querySelector('.edit-camera-input').addEventListener('change', (e) => {
         if (e.target.files[0]) {
             newFiles.push({ file: e.target.files[0], id: crypto.randomUUID() });
@@ -734,12 +555,10 @@ async function _beginEntryEdit(spot, entry, div) {
         renderEditGrid();
     });
 
-    // Cancel → clean revert
     div.querySelector('.edit-cancel-btn').addEventListener('click', () => {
         _showSpotDetails(spot);
     });
 
-    // Save → persist notes + image changes
     div.querySelector('.edit-save-btn').addEventListener('click', async (e) => {
         const saveBtn = e.currentTarget;
         saveBtn.disabled = true;
@@ -767,11 +586,6 @@ async function _beginEntryEdit(spot, entry, div) {
     });
 }
 
-/**
- * Render the external-files viewer panel.
- *
- * @param {object[]} files  External file records linked to the current spot.
- */
 function _openExternalViewer(files) {
     const viewer      = document.getElementById('external-data-viewer');
     const dataContent = document.getElementById('external-data-content');
@@ -802,7 +616,6 @@ function _openExternalViewer(files) {
                 await deleteExternalFile(f.id);
                 showToast('File deleted.', 'success');
                 row.remove();
-                // Close viewer if empty
                 if (dataContent.children.length === 0) closeModal('external-data-viewer');
             } catch (err) {
                 showToast(`Delete failed: ${err.message}`, 'failed');
@@ -817,30 +630,15 @@ function _openExternalViewer(files) {
     openModal('external-data-viewer');
 }
 
-// ---------------------------------------------------------------------------
-// Public — map layer management
-// ---------------------------------------------------------------------------
-
-/**
- * Render all spots for the active project as Leaflet CircleMarkers.
- *
- * Clears the existing layer first, then re-creates it from the current
- * MasterData state. Invalid spots (missing coordinates) are skipped with a
- * console warning rather than throwing.
- *
- * Safe to call multiple times — each call rebuilds the layer from scratch.
- */
 export function displaySpots() {
     const map = getMap();
 
-    // Remove existing layer cleanly before rebuilding
     if (_spotsLayer) map.removeLayer(_spotsLayer);
     _spotsLayer = L.layerGroup().addTo(map);
 
     const spots = getSpots();
     if (!spots || spots.length === 0) return;
 
-    // Group by name — show one marker per unique spot name (latest position)
     const spotByName = new Map();
     spots.forEach(spot => {
         if (spot.latitude == null || spot.longitude == null) {
@@ -871,39 +669,22 @@ export function displaySpots() {
     }
 }
 
-/**
- * Remove all markers from the spots layer without destroying the layer itself.
- * Used when switching projects or unchecking the "Show" checkbox.
- */
 export function clearSpotsLayer() {
     if (_spotsLayer) _spotsLayer.clearLayers();
 }
 
-// ---------------------------------------------------------------------------
-// Public — module initialisation
-// ---------------------------------------------------------------------------
-
-/**
- * Wire all DOM event listeners and EventBus subscriptions for the Spots feature.
- *
- * Must be called exactly once from App.js after DOMContentLoaded fires.
- * Defers all document.getElementById calls to this point (Bug 4 fix).
- */
 export function initSpots() {
 
-    // --- Audio toggle ---
     _bindAudioToggle();
 
-    // --- Multi-image: gallery picker (multiple) ---
     const imageUpload = document.getElementById('image-upload');
     if (imageUpload) {
         imageUpload.addEventListener('change', () => {
             if (imageUpload.files.length) _addImageFiles(imageUpload.files);
-            imageUpload.value = '';   // allow re-selecting same files
+            imageUpload.value = '';
         });
     }
 
-    // --- Multi-image: camera capture (single shot, appended) ---
     const cameraInput = document.getElementById('camera-capture');
     const cameraBtn   = document.getElementById('camera-capture-btn');
     if (cameraBtn && cameraInput) {
@@ -914,18 +695,15 @@ export function initSpots() {
         });
     }
 
-    // --- Spot form submission ---
     const spotForm = document.getElementById('spot-form');
     if (spotForm) spotForm.addEventListener('submit', _handleSpotFormSubmit);
 
-    // --- Normal "Add" button clears any Add More lock (fresh, editable spot) ---
     document.getElementById('open-form')?.addEventListener('click', () => {
         _pendingImages = [];
         _renderImagePreviews();
         _setAddMoreMode(null);
     });
 
-    // --- "Current Location" checkbox toggle ---
     const useCurrentLocCb = document.getElementById('use-current-location');
     if (useCurrentLocCb) {
         useCurrentLocCb.addEventListener('change', () => {
@@ -934,7 +712,6 @@ export function initSpots() {
         });
     }
 
-    // --- "Current Date/Time" checkbox toggle ---
     const useCurrentTimeCb = document.getElementById('use-current-time');
     if (useCurrentTimeCb) {
         useCurrentTimeCb.addEventListener('change', () => {
@@ -943,32 +720,27 @@ export function initSpots() {
         });
     }
 
-    // --- "Show Spots" checkbox ---
     const displayCb = document.getElementById('display-spots');
     if (displayCb) {
         displayCb.addEventListener('change', (e) => {
             if (e.target.checked) {
                 displaySpots();
             } else {
-                // Remove the layer group from the map entirely when unchecked
                 if (_spotsLayer) getMap().removeLayer(_spotsLayer);
                 _spotsLayer = null;
             }
         });
     }
 
-    // --- Close spot details panel ---
     const closeDetails = document.getElementById('close-spot-details');
     if (closeDetails) {
         closeDetails.addEventListener('click', () => {
             document.getElementById('spot-details-menu')?.classList.remove('open');
             document.body.classList.remove('panel-open');
-            // Release the Object URLs this panel created for its images/audio.
             revokeObjectUrls();
         });
     }
 
-    // --- Close external viewer ---
     const closeExternal = document.getElementById('close-external-viewer');
     if (closeExternal) {
         closeExternal.addEventListener('click', () => {
@@ -976,40 +748,26 @@ export function initSpots() {
         });
     }
 
-    // -----------------------------------------------------------------------
-    // EventBus subscriptions
-    // -----------------------------------------------------------------------
-
-    /**
-     * PROJECT_CHANGED — clear markers and redisplay only if checkbox is checked.
-     * Bug 2 fix: legacy code called displaySpots() unconditionally, causing ghost
-     * markers to appear even when the "Show" checkbox was unchecked.
-     */
     EventBus.on(EVENTS.PROJECT_CHANGED, () => {
         const pid = getActiveProjectId();
         const switched = pid !== _lastProjectId;
         _lastProjectId = pid;
 
         clearSpotsLayer();
-        // Only close the open details panel on a REAL project switch — a routine
-        // Drive sync also fires PROJECT_CHANGED and must not slam the panel shut.
         if (switched) {
             document.getElementById('spot-details-menu')?.classList.remove('open');
             document.body.classList.remove('panel-open');
-            revokeObjectUrls(); // free media URLs from the now-closed details panel
+            revokeObjectUrls();
         }
         if (_isSpotsCheckboxChecked()) displaySpots();
     });
 
-    /** DATA_UPDATED — refresh layer if currently displayed */
     EventBus.on(EVENTS.DATA_UPDATED, () => {
         if (_isSpotsCheckboxChecked()) displaySpots();
     });
 
-    /** STORAGE_READY — initial render once storage is open */
     EventBus.on(EVENTS.STORAGE_READY, () => {
         if (_isSpotsCheckboxChecked()) displaySpots();
     });
 
-    console.log('[SpotManager] Initialised.');
 }

@@ -1,36 +1,9 @@
-/**
- * ServerService.js — "Connect to Server" compute backend
- *
- * Talks to the CEM FastAPI server:
- *
- *      1. POST /api/v1/scripts                    -> create job + run script (script name in body)
- *      2. GET  /api/v1/jobs/{id}/results          -> list produced files
- *         GET  /api/v1/jobs/{id}/file?path=...    -> download each one
- *
- * Files are uploaded separately via ServerUploadService (project upload system).
- * This service only triggers analysis and downloads results.
- *
- * Downloaded results are written into the SAME local storage layout the watcher
- * uses, so JobsDashboard renders server jobs with zero changes.
- *
- * Public exports:
- *   isConfigured        — true when Config.server has a baseUrl
- *   getServerConfig     — { baseUrl }
- *   checkServerHealth   — GET /health -> { online, steps }
- *   getServerSteps      — GET /steps  -> UI-ready script descriptor array
- *   runJobOnServer      — full run -> download orchestration
- */
-
 import Config                    from '../core/Config.js';
 import EventBus, { EVENTS }      from '../core/EventBus.js';
 import * as StorageAdapter       from '../data/StorageAdapter.js';
 import * as MasterData           from '../data/MasterData.js';
 import { getProjectFolderName }  from '../data/projectUtils.js';
 import { buildJobData }          from './AnalysisService.js';
-
-// ---------------------------------------------------------------------------
-// Config helpers
-// ---------------------------------------------------------------------------
 
 function _base() {
     return (Config.server?.baseUrl || '').replace(/\/+$/, '');
@@ -58,10 +31,6 @@ export function getServerConfig() {
     return { baseUrl: _base(), airflowUrl: _airflowUrl() };
 }
 
-// ---------------------------------------------------------------------------
-// Low-level fetch wrappers
-// ---------------------------------------------------------------------------
-
 async function _fetch(url, opts = {}, timeoutMs = 30000) {
     const ctrl  = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -82,17 +51,13 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
             const body = await resp.clone().json();
             const msg = body?.detail || body?.message;
             if (msg) detail += ` — ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`;
-        } catch { /* non-JSON body */ }
+        } catch { }
         throw new Error(detail);
     }
     return resp;
 }
 
 const _json = (url, opts, t) => _fetch(url, opts, t).then(r => r.json());
-
-// ---------------------------------------------------------------------------
-// Health + step catalogue
-// ---------------------------------------------------------------------------
 
 export async function checkServerHealth() {
     if (!_base()) return { online: false, steps: [], error: 'No server URL configured.' };
@@ -131,56 +96,28 @@ export async function getServerSteps() {
     }));
 }
 
-// ---------------------------------------------------------------------------
-// Local job-record + result persistence
-// ---------------------------------------------------------------------------
-
 const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ---------------------------------------------------------------------------
-// Airflow helpers
-// ---------------------------------------------------------------------------
-
-async function _triggerAirflow(body) {
-    const url = _airflowUrl();
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        throw new Error(`Airflow trigger failed: ${resp.status}${text ? ' — ' + text : ''}`);
-    }
-}
-
-async function _pollJobCompletion(jobId, onProgress) {
-    const POLL_MS = 5000;
-    const MAX_MS  = 60 * 60 * 1000;          // 1 hour
+async function _pollAirflow(poll, onProgress) {
+    const POLL_MS = poll.interval_ms || 5000;
+    const MAX_MS  = 60 * 60 * 1000;
     const start   = Date.now();
+    const pollUrl = poll.path ? _url(poll.path) : poll.url;
 
     while (Date.now() - start < MAX_MS) {
         await _sleep(POLL_MS);
-        let data;
+        let state = '';
         try {
-            data = await _json(_url(`/api/v1/jobs/${jobId}`), {}, 10000);
+            const data = await _json(pollUrl, {}, 10000);
+            state = (data.state || '').toLowerCase();
         } catch (e) {
-            // 404 → Airflow hasn't called the server yet
-            if (e.message.includes('404')) {
-                onProgress('Waiting for pipeline to start…');
-                continue;
-            }
-            throw e;
+            onProgress('Waiting for Airflow…');
+            continue;
         }
-        const tasks = data.tasks || [];
-        if (!tasks.length) { onProgress('Job created — waiting for task…'); continue; }
-        const task = tasks[tasks.length - 1];
-        if (task.status === 'success' || task.status === 'failed') {
-            return { jobData: data, task };
-        }
-        onProgress(`Server processing… (${task.status})`);
+        if (state === 'success' || state === 'failed') return state;
+        onProgress(`Airflow: ${state || 'running'}…`);
     }
-    throw new Error('Timed out waiting for pipeline (1 hour).');
+    throw new Error('Timed out waiting for Airflow (1 hour).');
 }
 
 async function _writeJobRecord(projectFolder, jobId, record, status) {
@@ -202,40 +139,12 @@ async function _appendProcessedCache(projectFolder, scriptFile, names, server = 
     try {
         const blob = await StorageAdapter.getFileBlob(path);
         if (blob) existing = (await blob.text()).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    } catch { /* none yet */ }
+    } catch { }
     const merged = Array.from(new Set([...existing, ...names]));
     const blob   = new Blob([merged.join('\n') + '\n'], { type: 'text/plain' });
     await StorageAdapter.saveFile(blob, fileName, [projectFolder, 'system', 'database']);
 }
 
-// ---------------------------------------------------------------------------
-// Main orchestration
-// ---------------------------------------------------------------------------
-
-/**
- * Run one analysis step end-to-end.
- *
- * Two modes determined by Config.airflow.triggerUrl:
- *
- *   Airflow mode  — POST body to Airflow trigger URL → poll server
- *                   GET /jobs/{id} until task completes → download results.
- *   Direct mode   — POST /api/v1/scripts synchronously → download results.
- *
- * In both modes the frontend generates the job_id and passes it in the body
- * so the server uses it (no ID mismatch between local record & server).
- *
- * @param {object}   opts
- * @param {string}   opts.jobName
- * @param {object}   opts.currentScript    Script descriptor (id, script_file, …).
- * @param {string[]} opts.spotIds
- * @param {string}   opts.startDate        'YYYY-MM-DD'
- * @param {string}   opts.endDate          'YYYY-MM-DD'
- * @param {object}   opts.dynamicParams    e.g. { snr_db: '18' }
- * @param {object[]} opts.spots
- * @param {object[]} opts.externalFiles
- * @param {(msg:string)=>void} [opts.onProgress]
- * @returns {Promise<{ jobId: string, status: 'completed', files: number }>}
- */
 export async function runJobOnServer(opts) {
     const {
         jobName, currentScript, spotIds, startDate, endDate,
@@ -253,7 +162,6 @@ export async function runJobOnServer(opts) {
 
     const stepId     = currentScript.id;
     const isBirdnet  = stepId === 'birdnet';
-    const useAirflow = Boolean(_airflowUrl());
     const jobId      = _generateJobId();
 
     const jobData = buildJobData(
@@ -267,7 +175,7 @@ export async function runJobOnServer(opts) {
         job_id:     jobId,
         job_name:   jobName || `Job ${jobId}`,
         project_id: project.id,
-        mode:       useAirflow ? 'airflow' : 'server',
+        mode:       'server',
         status:     'processing',
         created_at: new Date().toISOString(),
         server: { base_url: _base(), job_id: jobId, task_id: null },
@@ -277,7 +185,6 @@ export async function runJobOnServer(opts) {
     EventBus.emit(EVENTS.DATA_UPDATED, null);
 
     try {
-        // ── 1. Build request body ──────────────────────────────────────
         onProgress('Preparing analysis…');
 
         const _spotNames = spotIds.map(id => {
@@ -303,78 +210,82 @@ export async function runJobOnServer(opts) {
             if (val != null && val !== '') runBody[key] = val;
         }
 
-        // ── 2. Trigger + await completion ──────────────────────────────
+        onProgress('Running analysis on server…');
         let taskId = null;
 
-        if (useAirflow) {
-            // ── Airflow mode: trigger DAG, then poll server ────────────
-            onProgress('Triggering Airflow pipeline…');
-            await _triggerAirflow(runBody);
+        const dispatchCtrl  = new AbortController();
+        const dispatchTimer = setTimeout(() => dispatchCtrl.abort(), 60 * 60 * 1000);
+        let resp, result;
+        try {
+            resp = await fetch(_url('/api/v1/analyze'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                body: JSON.stringify(runBody),
+                signal: dispatchCtrl.signal,
+            });
+        } catch (e) {
+            if (e.name === 'AbortError') throw new Error('Analysis request timed out (1 h).');
+            throw new Error(`Network error reaching server: ${e.message}`);
+        } finally {
+            clearTimeout(dispatchTimer);
+        }
+        result = await resp.json().catch(() => ({}));
 
-            onProgress('Pipeline triggered — polling for results…');
-            const { task } = await _pollJobCompletion(jobId, onProgress);
-            taskId = task.task_id;
-            record.server.task_id = taskId;
-
-            if (task.status === 'failed') {
-                let logText = '';
+        const _failJob = async (message, tid) => {
+            let logText = '';
+            if (tid) {
                 try {
                     const logResp = await _fetch(
-                        _url(`/api/v1/jobs/${jobId}/tasks/${taskId}/log`), {}, 10000);
+                        _url(`/api/v1/jobs/${jobId}/tasks/${tid}/log`), {}, 10000);
                     logText = await logResp.text();
-                } catch { /* not critical */ }
-                record.status = 'failed';
-                record.error  = task.error || 'Pipeline failed on server.';
-                if (logText) record.run_log = logText;
-                record.finished_at = new Date().toISOString();
-                await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
-                EventBus.emit(EVENTS.DATA_UPDATED, null);
-                throw new Error(record.error);
+                } catch { }
+            }
+            record.status      = 'failed';
+            record.error       = message;
+            if (logText) record.run_log = logText;
+            record.finished_at = new Date().toISOString();
+            await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
+            EventBus.emit(EVENTS.DATA_UPDATED, null);
+            throw new Error(message);
+        };
+
+        if (result.status === 'queued') {
+            record.mode = 'airflow';
+            record.server.dag_run_id = result.dag_run_id || null;
+            await _writeJobRecord(projectFolder, jobId, record, 'processing');
+
+            if (!result.poll?.path && !result.poll?.url) {
+                await _failJob('Server did not return Airflow polling info.', null);
+            }
+
+            onProgress('Pipeline triggered — polling Airflow…');
+            const airflowState = await _pollAirflow(result.poll, onProgress);
+
+            let jobData = {};
+            try { jobData = await _json(_url(`/api/v1/jobs/${jobId}`), {}, 10000); }
+            catch { }
+            const task = (jobData.tasks || []).slice(-1)[0] || null;
+            taskId = task?.task_id || null;
+            record.server.task_id = taskId;
+
+            if (airflowState === 'failed' || task?.status === 'failed') {
+                await _failJob(
+                    task?.error || jobData.status_detail?.message ||
+                        'Pipeline failed (Airflow reported failure).',
+                    taskId);
             }
         } else {
-            // ── Direct mode: POST /scripts synchronously ───────────────
-            onProgress('Running analysis on server…');
-            const scriptCtrl  = new AbortController();
-            const scriptTimer = setTimeout(() => scriptCtrl.abort(), 60 * 60 * 1000);
-            let scriptResp;
-            try {
-                scriptResp = await fetch(_url('/api/v1/scripts'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
-                    body: JSON.stringify(runBody),
-                    signal: scriptCtrl.signal,
-                });
-            } catch (e) {
-                if (e.name === 'AbortError') throw new Error('Script request timed out (1 h).');
-                throw new Error(`Network error reaching server: ${e.message}`);
-            } finally {
-                clearTimeout(scriptTimer);
-            }
-            const result = await scriptResp.json();
-            taskId = result.task_id;
+            taskId = result.task_id || null;
             record.server.task_id = taskId;
             await _writeJobRecord(projectFolder, jobId, record, 'processing');
 
-            if (!scriptResp.ok || result.status === 'skipped' || result.status === 'failed') {
-                let logText = '';
-                if (taskId) {
-                    try {
-                        const logResp = await _fetch(
-                            _url(`/api/v1/jobs/${jobId}/tasks/${taskId}/log`), {}, 10000);
-                        logText = await logResp.text();
-                    } catch { /* not critical */ }
-                }
-                record.status = 'failed';
-                record.error  = result.message || result.detail || `Server returned ${scriptResp.status}`;
-                if (logText) record.run_log = logText;
-                record.finished_at = new Date().toISOString();
-                await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
-                EventBus.emit(EVENTS.DATA_UPDATED, null);
-                throw new Error(record.error);
+            if (!resp.ok || result.status === 'skipped' || result.status === 'failed') {
+                await _failJob(
+                    result.message || result.detail || `Server returned ${resp.status}`,
+                    taskId);
             }
         }
 
-        // ── 3. Download results ────────────────────────────────────────
         onProgress('Downloading results…');
         const { results = [] } = await _json(
             _url(`/api/v1/jobs/${jobId}/results`), {}, 30000);
@@ -394,7 +305,6 @@ export async function runJobOnServer(opts) {
             if (isBirdnet && /processed_files\.txt$/i.test(rel)) processedBlob = blob;
         }
 
-        // ── 4. BirdNET: persist aggregate + processed cache ────────────
         if (isBirdnet) {
             if (aggregateBlob) {
                 await StorageAdapter.saveFile(
@@ -408,7 +318,6 @@ export async function runJobOnServer(opts) {
             }
         }
 
-        // ── 5. Mark completed ──────────────────────────────────────────
         record.status      = 'completed';
         record.finished_at = new Date().toISOString();
         record.result_count = saved;
@@ -431,7 +340,7 @@ export async function runJobOnServer(opts) {
             record.finished_at = record.finished_at || new Date().toISOString();
             await _moveJobRecord(projectFolder, jobId, record, 'processing', 'failed');
             EventBus.emit(EVENTS.DATA_UPDATED, null);
-        } catch { /* record may already be moved */ }
+        } catch { }
         throw e;
     }
 }

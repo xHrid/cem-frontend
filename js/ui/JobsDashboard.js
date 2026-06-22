@@ -1,26 +1,3 @@
-/**
- * JobsDashboard.js — Analysis jobs viewer
- *
- * Pattern : Module Pattern
- *           Private state (cached DOM refs) is never exposed; only the public
- *           initJobsDashboard() entry point is exported.
- *
- * Extracted from analysis.js lines 420-596, which contained DOM-querying
- * module-level code that ran at script parse time (before DOMContentLoaded).
- *
- * Bug fixes over analysis.js
- * --------------------------
- *  1. All DOM element references are now resolved LAZILY inside openJobsModal()
- *     rather than at module parse time, where most elements do not yet exist.
- *  2. Error messages use showToast() instead of relying on a bare try/catch
- *     that left the sidebar in a broken state silently.
- *
- * Dependencies
- * ------------
- *   Repository  — ../data/Repository.js  (getAllJobs, getJobResultFiles, getLocalFileUrl)
- *   showToast   — ./Toast.js
- */
-
 import {
     getAllJobs,
     getJobResultFiles,
@@ -33,14 +10,6 @@ import { getActiveProject } from '../data/MasterData.js';
 import { revokeObjectUrls } from '../data/StorageAdapter.js';
 import { recordCompletedJobs, downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 
-// ---------------------------------------------------------------------------
-// Module-private state — DOM element cache (lazy)
-// ---------------------------------------------------------------------------
-
-/**
- * Lazily resolved DOM element references.
- * All null until _cacheElements() is called on first openJobsModal().
- */
 const els = {
     popup              : null,
     listSidebar        : null,
@@ -55,15 +24,6 @@ const els = {
 
 let _elsCached = false;
 
-// ---------------------------------------------------------------------------
-// DOM element cache — lazy init
-// ---------------------------------------------------------------------------
-
-/**
- * Populate the `els` cache from the live DOM.
- * Called on first modal open, when the HTML is guaranteed to be present.
- * @private
- */
 function _cacheElements() {
     if (_elsCached) return;
 
@@ -80,27 +40,15 @@ function _cacheElements() {
     _elsCached = true;
 }
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
-/**
- * Wire up the jobs button, close button, and refresh button.
- * Must be called once after DOMContentLoaded.
- */
 export function initJobsDashboard() {
-    // Open trigger — click on the nav button
     const jobsBtn = document.getElementById('jobs-btn');
     if (jobsBtn) {
         jobsBtn.addEventListener('click', openJobsModal);
     }
 
-    // Close button — using event delegation so it works even if the popup is
-    // rendered after initJobsDashboard() is called.
     document.addEventListener('click', (e) => {
         if (e.target && e.target.id === 'close-jobs-btn') {
             closeModal('jobs-popup');
-            // Release Object URLs created by file previews in this dashboard.
             revokeObjectUrls();
         }
 
@@ -110,13 +58,6 @@ export function initJobsDashboard() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Modal lifecycle
-// ---------------------------------------------------------------------------
-
-/**
- * Open the jobs popup and load the job list sidebar.
- */
 export async function openJobsModal() {
     _cacheElements();
 
@@ -124,8 +65,6 @@ export async function openJobsModal() {
     if (els.viewerPlaceholder) els.viewerPlaceholder.style.display = 'block';
     if (els.viewerContent)     els.viewerContent.style.display     = 'none';
 
-    // Fold any newly-completed jobs into the project (queues their results for
-    // upload + share when shared). Pull is on-demand — no materializeProjectFiles.
     try {
         const active = getActiveProject();
         if (active) {
@@ -138,28 +77,15 @@ export async function openJobsModal() {
     await _loadJobsSidebar();
 }
 
-// ---------------------------------------------------------------------------
-// Sidebar — job list
-// ---------------------------------------------------------------------------
-
-/**
- * Fetch all jobs (all statuses) and render them as clickable sidebar items.
- * Jobs are sorted newest-first by the Repository layer.
- *
- * @private
- */
 async function _loadJobsSidebar() {
     if (!els.listSidebar) return;
 
     els.listSidebar.innerHTML = "<p style='padding:15px; color:var(--text-muted);'>Loading jobs...</p>";
 
     try {
-        // Local disk jobs (own jobs that were run on this device)
         const localJobs = await getAllJobs();
         const localIds = new Set(localJobs.map(j => j.job_id));
 
-        // Merge in project.jobs[] from shared project_data.json — these carry
-        // jobs run by the owner (or other editors) that exist only on Drive.
         const project = getActiveProject();
         const sharedJobs = (project?.jobs || [])
             .filter(j => !localIds.has(j.job_id))
@@ -168,7 +94,7 @@ async function _loadJobsSidebar() {
                 job_name: j.job_name || j.job_id,
                 current_status: j.status || 'completed',
                 created_at: j.completed_at || j.timestamp || new Date().toISOString(),
-                _remote: true, // flag: no local files, results on Drive only
+                _remote: true,
             }));
 
         const jobs = [...localJobs, ...sharedJobs].sort((a, b) => {
@@ -186,7 +112,6 @@ async function _loadJobsSidebar() {
             const div       = document.createElement('div');
             div.className   = 'job-row';
 
-            // Colour-code by status
             const color = _statusColor(job.current_status);
 
             div.innerHTML = `
@@ -202,15 +127,13 @@ async function _loadJobsSidebar() {
                 </div>
             `;
 
-            // Delete handler (stop propagation so it doesn't trigger job detail view)
             div.querySelector('.delete-job-btn').addEventListener('click', async (e) => {
                 e.stopPropagation();
                 if (!confirm(`Delete job "${job.job_name || 'Unnamed Job'}"?`)) return;
                 try {
-                    await deleteJob(job.job_id, job.current_status);
-                    showToast('Job deleted.', 'success');
+                    const removed = await deleteJob(job.job_id, job.current_status);
+                    showToast(removed ? 'Job deleted.' : 'Job entry cleared.', 'success');
                     div.remove();
-                    // Reset detail panel
                     if (els.viewerPlaceholder) els.viewerPlaceholder.style.display = 'block';
                     if (els.viewerContent) els.viewerContent.style.display = 'none';
                 } catch (err) {
@@ -232,17 +155,6 @@ async function _loadJobsSidebar() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Job detail panel
-// ---------------------------------------------------------------------------
-
-/**
- * Show the right-hand detail panel for a selected job.
- *
- * @param {object} job          Job descriptor from Repository.getAllJobs().
- * @param {string} statusColor  Hex / named colour for the status label.
- * @private
- */
 async function _renderJobDetails(job, statusColor) {
     if (!els.viewerContent || !els.viewerPlaceholder) return;
 
@@ -265,18 +177,15 @@ async function _renderJobDetails(job, statusColor) {
     els.viewerFileList.innerHTML = "<span style='color:var(--text-muted);'>Loading output files...</span>";
 
     if (job.current_status === 'completed' || job.current_status === 'failed') {
-        // Local result files on disk
         const localFiles = await getJobResultFiles(job.job_id);
 
-        // Merge with project-level job records (which carry drive_id for shared files)
         const project  = getActiveProject();
         const projJob  = (project?.jobs || []).find(j => j.job_id === job.job_id);
-        const driveMap = new Map(); // rel_path → drive_id
+        const driveMap = new Map();
         for (const rf of (projJob?.result_files || [])) {
             if (rf.rel_path && rf.drive_id) driveMap.set(rf.rel_path, rf.drive_id);
         }
 
-        // Enrich local files with drive_id; add Drive-only files not on disk
         const enriched = localFiles.map(f => ({
             ...f,
             drive_id: driveMap.get(f.path) || null
@@ -300,12 +209,10 @@ async function _renderJobDetails(job, statusColor) {
             btn.textContent = file.name;
             btn.className   = 'job-file-chip';
 
-            // Colour-code border by file type
             if (file.name.endsWith('.csv'))                               btn.style.borderColor = '#3f8f4f';
             if (file.name.endsWith('.log'))                               btn.style.borderColor = 'var(--danger-red)';
             if (file.name.endsWith('.png') || file.name.endsWith('.jpg')) btn.style.borderColor = 'var(--sky)';
 
-            // Dim chip if file is Drive-only (not on disk)
             if (!localPaths.has(file.path) && file.drive_id) {
                 btn.style.opacity = '0.7';
                 btn.title = 'On Drive — click to download & preview';
@@ -321,20 +228,6 @@ async function _renderJobDetails(job, statusColor) {
     }
 }
 
-/**
- * Load and render a file preview in the preview pane.
- *
- * Supported types:
- *  - Images (.png, .jpg, .jpeg) — rendered as <img>
- *  - Text files (.csv, .log, .txt, .json) — CSV gets a table; others get a
- *    dark pre-formatted block
- *  - Everything else — download link fallback
- *
- * If the file isn't on disk but has a drive_id, offers on-demand download.
- *
- * @param {{ name: string, path: string, drive_id?: string }} file
- * @private
- */
 async function _previewFile(file) {
     if (!els.viewerPreview) return;
 
@@ -343,7 +236,6 @@ async function _previewFile(file) {
     try {
         let url = await getLocalFileUrl(file.path);
 
-        // Not local — try on-demand download if we have a drive_id
         if (!url && file.drive_id) {
             const kind = /\.(png|jpe?g)$/i.test(file.name) ? 'image' : 'result';
             const result = await downloadMediaFile(file.drive_id, file.path, kind);
@@ -353,7 +245,6 @@ async function _previewFile(file) {
             }
         }
 
-        // Still no URL — show Drive-only fallback
         if (!url) {
             if (file.drive_id) {
                 const dl = getPublicUrl(file.drive_id, 'result');
@@ -369,7 +260,6 @@ async function _previewFile(file) {
             return;
         }
 
-        // ── Image preview ────────────────────────────────────────────────────
         if (/\.(png|jpe?g)$/i.test(file.name)) {
             els.viewerPreview.innerHTML = `
                 <div style="text-align:center;">
@@ -382,13 +272,12 @@ async function _previewFile(file) {
             return;
         }
 
-        // ── Text-based preview ───────────────────────────────────────────────
         if (/\.(csv|log|txt|json)$/i.test(file.name)) {
             const response = await fetch(url);
             const text     = await response.text();
 
             if (file.name.endsWith('.csv')) {
-                const rows   = text.split('\n').slice(0, 50); // cap at 50 rows
+                const rows   = text.split('\n').slice(0, 50);
                 let html     = "<div style='overflow-x:auto;'><table style='width:100%; border-collapse:collapse; font-size:0.85rem; text-align:left;'>";
 
                 rows.forEach((row, i) => {
@@ -398,7 +287,7 @@ async function _previewFile(file) {
                     cols.forEach(col => {
                         const tag = i === 0 ? 'th' : 'td';
                         const bg  = i === 0 ? 'background-color:#f0f0f0;' : '';
-                        html += `<${tag} style="border:1px solid #ddd; padding:6px; ${bg}">${col}</${tag}>`;
+                        html += `<${tag} style="border:1px solid #ddd; padding:6px; ${bg}">${_escapeHtml(col)}</${tag}>`;
                     });
                     html += '</tr>';
                 });
@@ -410,7 +299,6 @@ async function _previewFile(file) {
                 els.viewerPreview.innerHTML = html;
 
             } else {
-                // Logs, JSON, plain text → dark terminal block
                 els.viewerPreview.innerHTML = `
                     <pre style="background:#2d2d2d; color:#f8f8f2; padding:15px; overflow:auto; max-height:400px; font-size:0.85rem; border-radius:4px; white-space:pre-wrap;">${_escapeHtml(text)}</pre>
                     <div style="margin-top:15px;">
@@ -421,7 +309,6 @@ async function _previewFile(file) {
             return;
         }
 
-        // ── Fallback ─────────────────────────────────────────────────────────
         els.viewerPreview.innerHTML = `
             <div style="text-align:center; padding:40px;">
                 <p>Preview not available for this file type.</p>
@@ -435,17 +322,6 @@ async function _previewFile(file) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Utility helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Map a job status string to a display colour.
- *
- * @param {string} status
- * @returns {string}  CSS colour value.
- * @private
- */
 function _statusColor(status) {
     const map = {
         completed  : '#28a745',
@@ -456,14 +332,6 @@ function _statusColor(status) {
     return map[status] || '#6c757d';
 }
 
-/**
- * Escape HTML special characters to prevent XSS when injecting raw file text
- * into a <pre> block.
- *
- * @param {string} str
- * @returns {string}
- * @private
- */
 function _escapeHtml(str) {
     return str
         .replace(/&/g,  '&amp;')
