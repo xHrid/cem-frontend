@@ -151,6 +151,31 @@
         </div>
     </dialog>
 
+    <dialog id="stratify-choice-dialog" class="modal-dialog">
+        <div class="popup-content">
+            <h3>Stratify this Site?</h3>
+            <p style="font-size:0.85rem;margin:8px 0 12px">Run GEE satellite clustering to generate stratification overlays for this site boundary.</p>
+            <div style="font-size:0.85rem;margin:0 0 12px">
+                <label>Max clusters (generates 2 to N):
+                    <select id="stratify-max-clusters" style="margin-left:6px;padding:3px 6px;">
+                        <option>2</option>
+                        <option>3</option>
+                        <option>4</option>
+                        <option selected>5</option>
+                        <option>6</option>
+                        <option>7</option>
+                        <option>8</option>
+                    </select>
+                </label>
+            </div>
+            <div id="stratify-status" style="font-size:0.82rem;color:var(--text-secondary,#666);min-height:1.2em;margin-bottom:8px"></div>
+            <div class="button-group">
+                <button type="button" id="btn-stratify-yes" class="popup-btn">Stratify via Server</button>
+                <button type="button" id="btn-stratify-no" class="popup-btn cancel-btn">Don't Stratify</button>
+            </div>
+        </div>
+    </dialog>
+
     <dialog id="save-route-dialog" class="modal-dialog">
         <div class="popup-content">
             <h3>Save Route</h3>
@@ -224,87 +249,6 @@
                     🖥️ Connect to Server
                 </button>
             </div>
-
-            <div id="server-help"
-                style="display:none; background:#e7f3ff; color:#0b5394; padding:12px; border-radius:8px; border:1px solid #b6dafb; margin-bottom:15px; font-size:0.9rem;">
-                <strong>🖥️ Lab Server mode</strong><br>
-                Compute runs on the lab Docker server — no local watcher needed.
-                Upload your project files once, then run any analysis step.
-                <span id="server-help-detail"></span>
-            </div>
-
-            <details id="server-upload-panel" style="display:none; margin-bottom:12px;" open>
-                <summary class="div-label" style="margin-bottom:8px; cursor:pointer; user-select:none;">
-                    0. Project Files on Server <span style="font-weight:normal; font-size:0.8rem; color:var(--text-muted);">(click to collapse)</span>
-                </summary>
-                <div id="server-upload-status-msg" style="font-size:0.82rem; color:var(--text-muted); margin-bottom:10px;">
-                    Checking server…
-                </div>
-
-                <div class="server-file-slot" id="slot-audio"
-                     style="padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
-                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
-                        <div>
-                            <strong>Audio Files</strong>
-                            <span id="slot-audio-info" style="color:var(--text-muted); margin-left:6px;">—</span>
-                        </div>
-                    </div>
-
-                    <div id="audio-upload-controls" style="display:flex; gap:8px; align-items:center;">
-                        <select id="audio-spot-select" style="flex:1; padding:6px 8px; font-size:0.85rem; border:1px solid var(--border-color); border-radius:4px;">
-                            <option value="">Select spot…</option>
-                        </select>
-                        <input type="file" id="upload-audio-input" multiple accept=".wav,.mp3,.m4a,.flac" style="display:none;" />
-                        <button type="button" class="small-btn" id="audio-upload-trigger" disabled
-                                style="white-space:nowrap;">Upload Files</button>
-                    </div>
-
-                    <div id="audio-upload-progress" style="display:none;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:4px; font-size:0.8rem;">
-                            <span id="audio-progress-label">Uploading…</span>
-                            <span id="audio-progress-pct">0%</span>
-                        </div>
-                        <div style="height:6px; background:var(--border-color); border-radius:3px; overflow:hidden;">
-                            <div id="audio-progress-bar" style="height:100%; width:0%; background:var(--accent-blue); border-radius:3px; transition:width 0.3s;"></div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="server-file-slot" id="slot-aggregate"
-                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
-                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
-                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div style="flex:1; min-width:0;">
-                        <strong>aggregate.csv</strong>
-                        <span id="slot-aggregate-info" style="color:var(--text-muted); margin-left:6px;">—</span>
-                        <div id="slot-aggregate-local" style="font-size:0.78rem; color:var(--text-muted); margin-top:2px;"></div>
-                    </div>
-                    <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
-                        <button type="button" class="small-btn server-upload-btn" data-category="aggregate"
-                                style="display:none;">Upload to Server</button>
-                        <button type="button" class="small-btn server-override-btn" data-category="aggregate"
-                                style="display:none; background:#ff9800; color:#fff;">Re-upload</button>
-                    </div>
-                </div>
-
-                <div class="server-file-slot" id="slot-processed"
-                     style="display:flex; align-items:center; justify-content:space-between; gap:8px;
-                            padding:10px 12px; background:var(--bg-surface-alt); border:1px solid var(--border-color);
-                            border-radius:8px; margin-bottom:8px; font-size:0.88rem;">
-                    <div style="flex:1; min-width:0;">
-                        <strong>processed.csv</strong>
-                        <span id="slot-processed-info" style="color:var(--text-muted); margin-left:6px;">—</span>
-                        <div id="slot-processed-local" style="font-size:0.78rem; color:var(--text-muted); margin-top:2px;"></div>
-                    </div>
-                    <div style="display:flex; gap:6px; align-items:center; flex-shrink:0;">
-                        <button type="button" class="small-btn server-upload-btn" data-category="processed"
-                                style="display:none;">Upload to Server</button>
-                        <button type="button" class="small-btn server-override-btn" data-category="processed"
-                                style="display:none; background:#ff9800; color:#fff;">Re-upload</button>
-                    </div>
-                </div>
-            </details>
 
             <div id="watcher-offline-help"
                 style="display:none; background:#fff3cd; color:#856404; padding:15px; border-radius:8px; border:1px solid #ffeeba; margin-bottom:15px; font-size:0.9rem;">
@@ -438,7 +382,7 @@
         <div class="popup-content">
             <h3>Share Project</h3>
             <form id="share-project-form">
-                <div id="share-project-list" style="max-height: 150px; overflow-y: auto; margin-bottom: 10px;"></div>
+                <div id="share-project-list" style="margin-bottom: 10px;"></div>
 
                 <input type="text" id="share-emails-input"
                        placeholder="Enter Gmail addresses (comma-separated)"

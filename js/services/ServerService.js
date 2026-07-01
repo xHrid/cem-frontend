@@ -4,6 +4,8 @@ import * as StorageAdapter       from '../data/StorageAdapter.js';
 import * as MasterData           from '../data/MasterData.js';
 import { getProjectFolderName }  from '../data/projectUtils.js';
 import { buildJobData }          from './AnalysisService.js';
+import { uploadSelectedAudio }   from './ServerUploadService.js';
+import { authHeaders }           from './AuthService.js';
 
 function _base() {
     return (Config.server?.baseUrl || '').replace(/\/+$/, '');
@@ -36,7 +38,7 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     let resp;
     try {
-        const headers = { 'ngrok-skip-browser-warning': 'true', ...(opts.headers || {}) };
+        const headers = { 'ngrok-skip-browser-warning': 'true', ...authHeaders(), ...(opts.headers || {}) };
         resp = await fetch(url, { ...opts, headers, signal: ctrl.signal });
     } catch (e) {
         if (e.name === 'AbortError') throw new Error(`Request timed out: ${url}`);
@@ -185,6 +187,16 @@ export async function runJobOnServer(opts) {
     EventBus.emit(EVENTS.DATA_UPDATED, null);
 
     try {
+        onProgress('Uploading required audio…');
+        await uploadSelectedAudio(
+            {
+                spotIds, startDate, endDate,
+                validExts: currentScript.inputs?.[0]?.valid_extensions,
+                spots, externalFiles,
+            },
+            onProgress,
+        );
+
         onProgress('Preparing analysis…');
 
         const _spotNames = spotIds.map(id => {
@@ -219,7 +231,7 @@ export async function runJobOnServer(opts) {
         try {
             resp = await fetch(_url('/api/v1/analyze'), {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true' },
+                headers: { 'Content-Type': 'application/json', 'ngrok-skip-browser-warning': 'true', ...authHeaders() },
                 body: JSON.stringify(runBody),
                 signal: dispatchCtrl.signal,
             });

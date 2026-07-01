@@ -9,6 +9,7 @@ import { getSpots, getLocalState }   from '../data/MasterData.js';
 import { saveExternalFile, saveExternalFileByReference, saveExternalFilesByReferenceBatch, saveExternalFilesBatch } from '../data/Repository.js';
 import { showToast }                 from './Toast.js';
 import { openModal, closeModal }     from './ModalManager.js';
+import { showAckDialog }             from './Dialog.js';
 
 export function initProjectUI() {
     _initProjectDropdown();
@@ -183,6 +184,13 @@ function _initImportMediaForm() {
     if (refCheckbox && baseDirContainer) {
         refCheckbox.addEventListener('change', () => {
             baseDirContainer.style.display = refCheckbox.checked ? 'block' : 'none';
+            if (refCheckbox.checked) {
+                showAckDialog({
+                    title: 'Reference import',
+                    message: "Files imported as reference can't be analysed on the server. They can only be analysed locally with the watcher.",
+                    storageKey: 'cem-hide-reference-import-note',
+                });
+            }
         });
     }
 

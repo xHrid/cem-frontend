@@ -2,6 +2,7 @@ import Config from '../core/Config.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
 import * as MasterData from '../data/MasterData.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
+import { authHeaders } from './AuthService.js';
 
 function _base() {
     return (Config.server?.baseUrl || '').replace(/\/+$/, '');
@@ -16,7 +17,7 @@ async function _fetch(url, opts = {}, timeoutMs = 30000) {
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     let resp;
     try {
-        const headers = { 'ngrok-skip-browser-warning': 'true', ...(opts.headers || {}) };
+        const headers = { 'ngrok-skip-browser-warning': 'true', ...authHeaders(), ...(opts.headers || {}) };
         resp = await fetch(url, { ...opts, headers, signal: ctrl.signal });
     } catch (e) {
         if (e.name === 'AbortError') throw new Error(`Request timed out: ${url}`);
@@ -44,148 +45,120 @@ function _projectFolder() {
     return getProjectFolderName(project);
 }
 
-export async function checkProjectFiles() {
+export async function checkFilesForUpload(filesBySpot) {
     const name = _projectFolder();
-    try {
-        return await _json(
-            _url(`/api/v1/projects/status?project=${encodeURIComponent(name)}`),
-            {},
-            15000,
-        );
-    } catch (e) {
-        if (e.message.includes('404')) {
-            return {
-                spots: {},
-                total_audio: 0,
-                has_aggregate: false,
-                has_processed: false,
-            };
-        }
-        throw e;
-    }
+    const resp = await _json(
+        _url('/api/v1/projects/check-files'),
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ project: name, files: filesBySpot }),
+        },
+        30000,
+    );
+    return resp.to_upload || {};
 }
 
-export async function uploadAudioFiles(spotName, audioFiles, onProgress = () => {}) {
+// Upload only the raw audio the requested run needs: files in the selected
+// spots and date range that the server doesn't already have. The server
+// computes any downstream dependencies itself, so nothing else is uploaded.
+export async function uploadSelectedAudio(
+    { spotIds, startDate, endDate, validExts, spots, externalFiles },
+    onProgress = () => {},
+) {
     const name = _projectFolder();
 
-    if (!audioFiles.length) return { uploaded: 0, skipped: 0 };
+    const startVal = startDate ? parseInt(startDate.replace(/-/g, ''), 10) : null;
+    const endVal   = endDate ? parseInt(endDate.replace(/-/g, ''), 10) : null;
+    const extList  = (validExts && validExts.length ? validExts : ['.wav'])
+        .map(e => e.replace('.', '')).join('|');
+    const extRegex = new RegExp(`\\.(${extList})$`, 'i');
+    const spotIdSet = new Set(spotIds);
 
-    const status = await checkProjectFiles();
-    const spotInfo = status.spots?.[spotName] || {};
-    const existingSet = new Set(spotInfo.audio_files || []);
+    const filesBySpot = {};
+    const fileMap = {};
+    const add = (spotKey, fname, path) => {
+        if (!filesBySpot[spotKey]) { filesBySpot[spotKey] = []; fileMap[spotKey] = []; }
+        if (!filesBySpot[spotKey].includes(fname)) {
+            filesBySpot[spotKey].push(fname);
+            fileMap[spotKey].push({ name: fname, path });
+        }
+    };
+    const inRange = (fname) => {
+        const m = fname.match(/_(\d{8})_/);
+        if (!m) return true;
+        const d = parseInt(m[1], 10);
+        if (startVal && d < startVal) return false;
+        if (endVal && d > endVal) return false;
+        return true;
+    };
 
-    const toUpload = audioFiles.filter(f => !existingSet.has(f.name));
-    const skipped = audioFiles.length - toUpload.length;
-
-    if (skipped > 0) {
-        onProgress(`${skipped} file(s) already on server, skipping.`);
-    }
-
-    if (toUpload.length === 0) {
-        return { uploaded: 0, skipped };
-    }
-
-    const BATCH_SIZE = 50;
-    let uploaded = 0;
-
-    for (let i = 0; i < toUpload.length; i += BATCH_SIZE) {
-        const batch = toUpload.slice(i, i + BATCH_SIZE);
-        onProgress(`Uploading audio ${i + 1}–${Math.min(i + BATCH_SIZE, toUpload.length)} of ${toUpload.length}…`);
-
-        const fd = new FormData();
-        fd.append('project', name);
-        fd.append('spot', spotName);
-        let appended = 0;
-        for (const a of batch) {
-            const blob = await StorageAdapter.getFileBlob(a.path);
-            if (!blob) {
-                console.warn(`[ServerUpload] Could not read: ${a.name}`);
-                continue;
+    for (const spotId of spotIds) {
+        const spot = spots.find(s => s.spotId === spotId);
+        if (!spot) continue;
+        const spotKey = spot.name.replace(/\s+/g, '').toUpperCase();
+        if (spot.audio_local_filename) {
+            const fname = spot.audio_local_filename.split('/').pop();
+            if (extRegex.test(fname) && inRange(fname)) {
+                add(spotKey, fname, spot.audio_local_filename);
             }
-            fd.append('files', blob, a.name);
-            appended++;
-        }
-
-        if (appended === 0) continue;
-
-        await _fetch(
-            _url('/api/v1/projects/upload/audio'),
-            { method: 'POST', body: fd },
-            20 * 60 * 1000,
-        );
-        uploaded += appended;
-    }
-
-    return { uploaded, skipped };
-}
-
-export async function uploadAggregate(force = false, onProgress = () => {}) {
-    const name = _projectFolder();
-
-    if (!force) {
-        const status = await checkProjectFiles();
-        if (status.has_aggregate) {
-            onProgress('Aggregate already on server.');
-            return { uploaded: false };
         }
     }
 
-    const serverAggPath = `${name}/system/database/birdnet_results_server.csv`;
-    const localAggPath = `${name}/system/database/birdnet_results.csv`;
-    let blob = await StorageAdapter.getFileBlob(serverAggPath);
-    if (!blob) blob = await StorageAdapter.getFileBlob(localAggPath);
-
-    if (!blob) {
-        throw new Error('No aggregate CSV found locally. Run BirdNET first.');
-    }
-
-    onProgress('Uploading aggregate.csv…');
-    const fd = new FormData();
-    fd.append('project', name);
-    fd.append('file', blob, 'aggregate.csv');
-
-    await _fetch(
-        _url('/api/v1/projects/upload/aggregate'),
-        { method: 'POST', body: fd },
-        5 * 60 * 1000,
-    );
-
-    return { uploaded: true };
-}
-
-export async function uploadProcessed(scriptFile, force = false, onProgress = () => {}) {
-    const name = _projectFolder();
-
-    if (!force) {
-        const status = await checkProjectFiles();
-        if (status.has_processed) {
-            onProgress('Processed list already on server.');
-            return { uploaded: false };
+    for (const ef of externalFiles) {
+        if (!extRegex.test(ef.name) || !inRange(ef.name) || !ef.local_path) continue;
+        const linked = (ef.linked_spots || []).filter(id => spotIdSet.has(id));
+        for (const spotId of linked) {
+            const spot = spots.find(s => s.spotId === spotId);
+            if (!spot) continue;
+            add(spot.name.replace(/\s+/g, '').toUpperCase(), ef.name, ef.local_path);
         }
     }
 
-    const serverPath = `${name}/system/database/processed_${scriptFile}_server.txt`;
-    const localPath = `${name}/system/database/processed_${scriptFile}.txt`;
-    let blob = await StorageAdapter.getFileBlob(serverPath);
-    if (!blob) blob = await StorageAdapter.getFileBlob(localPath);
+    const totalBefore = Object.values(filesBySpot).reduce((s, a) => s + a.length, 0);
+    if (totalBefore === 0) return { uploaded: 0, skipped: 0, total: 0 };
 
-    if (!blob) {
-        onProgress('No processed list found locally (first run).');
-        return { uploaded: false };
+    onProgress(`Checking ${totalBefore} file(s) against server…`);
+    const toUpload = await checkFilesForUpload(filesBySpot);
+    const totalNeeded = Object.values(toUpload).reduce((s, a) => s + a.length, 0);
+    const skipped = totalBefore - totalNeeded;
+    if (totalNeeded === 0) return { uploaded: 0, skipped, total: totalBefore };
+
+    let uploaded = 0;
+    const BATCH_SIZE = 50;
+
+    for (const [spotKey, neededNames] of Object.entries(toUpload)) {
+        const neededSet = new Set(neededNames);
+        const filesToSend = (fileMap[spotKey] || []).filter(f => neededSet.has(f.name));
+
+        for (let i = 0; i < filesToSend.length; i += BATCH_SIZE) {
+            const batch = filesToSend.slice(i, i + BATCH_SIZE);
+            const pct = Math.round((uploaded / totalNeeded) * 100);
+            onProgress(`Uploading ${spotKey}: ${Math.min(uploaded + batch.length, totalNeeded)} of ${totalNeeded}…`, pct);
+
+            const fd = new FormData();
+            fd.append('project', name);
+            fd.append('spot', spotKey);
+            let appended = 0;
+            for (const f of batch) {
+                const blob = await StorageAdapter.getFileBlob(f.path);
+                if (!blob) continue;
+                fd.append('files', blob, f.name);
+                appended++;
+            }
+            if (appended === 0) continue;
+
+            await _fetch(
+                _url('/api/v1/projects/upload/audio'),
+                { method: 'POST', body: fd },
+                20 * 60 * 1000,
+            );
+            uploaded += appended;
+        }
     }
 
-    onProgress('Uploading processed list…');
-    const fd = new FormData();
-    fd.append('project', name);
-    fd.append('file', blob, 'processed_files.txt');
-
-    await _fetch(
-        _url('/api/v1/projects/upload/processed'),
-        { method: 'POST', body: fd },
-        60 * 1000,
-    );
-
-    return { uploaded: true };
+    onProgress(`Uploaded ${uploaded} file(s), ${skipped} already on server.`, 100);
+    return { uploaded, skipped, total: totalBefore };
 }
 
 export function getActiveProjectFolder() {

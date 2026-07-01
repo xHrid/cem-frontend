@@ -6,6 +6,8 @@ let accessToken = null;
 
 let userEmail = null;
 
+let userId = null;
+
 let tokenExpiresAt = 0;
 
 export function initAuth(onLoginSuccess) {
@@ -29,7 +31,7 @@ export function initAuth(onLoginSuccess) {
             accessToken = response.access_token;
             tokenExpiresAt = Date.now() + ((response.expires_in || 3600) * 1000);
 
-            _fetchUserEmail();
+            _fetchUserInfo();
 
             if (typeof onLoginSuccess === 'function') onLoginSuccess();
         },
@@ -58,8 +60,38 @@ export function getUserEmail() {
     return userEmail;
 }
 
-async function _fetchUserEmail() {
+export function getUserId() {
+    return userId;
+}
+
+// Identity headers attached to server requests so the backend can log who did
+// what. Google `sub` is the stable account id; email is the human-readable key.
+export function authHeaders() {
+    const h = {};
+    if (userEmail) h['X-User-Email'] = userEmail;
+    if (userId) h['X-User-Id'] = userId;
+    return h;
+}
+
+async function _fetchUserInfo() {
     if (!accessToken) return;
+    try {
+        const res = await fetch(
+            'https://www.googleapis.com/oauth2/v3/userinfo',
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        if (res.ok) {
+            const json = await res.json();
+            userEmail = json.email || userEmail;
+            userId = json.sub || userId;
+        }
+    } catch (e) {
+        console.warn('[AuthService] could not resolve user info:', e.message);
+    }
+    if (!userEmail) await _fetchUserEmailFallback();
+}
+
+async function _fetchUserEmailFallback() {
     try {
         const res = await fetch(
             'https://www.googleapis.com/drive/v3/about?fields=user(emailAddress)',

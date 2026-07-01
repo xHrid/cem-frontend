@@ -39,57 +39,30 @@ function _populateShareModal() {
     if (!projectList) return;
 
     const state = getLocalState();
+    const project = state.projects.find(p => p.id === state.currentProjectId);
     projectList.innerHTML = '';
 
-    let renderable = 0;
-
-    for (const p of state.projects) {
-        const info       = getSharingInfo(p);
-        const isImported = info.isImported;
-        const isViewerOnlyImport = isImported && info.permission !== 'writer';
-        if (isViewerOnlyImport) continue;
-
-        renderable++;
-
-        const div   = document.createElement('div');
-        const label = document.createElement('label');
-        label.className = 'share-project-item';
-
-        const cb    = document.createElement('input');
-        cb.type     = 'checkbox';
-        cb.name     = 'share_project';
-        cb.value    = p.id;
-
-        if (p.id === state.currentProjectId) cb.checked = true;
-
-        let nameText = p.name;
-        if (isImported) {
-            nameText += ` (editor — owner: ${info.ownerEmail || 'unknown'})`;
-        } else if (info.isShared) {
-            nameText += ` (shared with ${info.collaboratorCount})`;
-        }
-
-        const span = document.createElement('span');
-        span.className = 'share-project-name';
-        span.textContent = nameText;
-        span.title = nameText;
-
-        label.append(cb, span);
-        div.append(label);
-        projectList.appendChild(div);
-    }
-
-    if (renderable > 0) {
-        const checked = projectList.querySelector('input[name="share_project"]:checked');
-        if (!checked) {
-            const first = projectList.querySelector('input[name="share_project"]');
-            if (first) first.checked = true;
-        }
-    } else {
+    if (!project) {
         projectList.innerHTML =
-            '<p style="font-size:0.85rem; color:var(--text-muted);">No shareable projects. ' +
-            'You can only re-share projects you own or are an editor of.</p>';
+            '<p style="font-size:0.85rem; color:var(--text-muted);">No active project.</p>';
+        return;
     }
+
+    const info = getSharingInfo(project);
+    if (info.isImported && info.permission !== 'writer') {
+        projectList.innerHTML =
+            '<p style="font-size:0.85rem; color:var(--text-muted);">You have viewer access only — you cannot share this project.</p>';
+        return;
+    }
+
+    let nameText = project.name;
+    if (info.isImported) {
+        nameText += ` (editor — owner: ${info.ownerEmail || 'unknown'})`;
+    } else if (info.isShared) {
+        nameText += ` (shared with ${info.collaboratorCount})`;
+    }
+
+    projectList.innerHTML = `<div style="padding:8px 0; font-weight:600; font-size:0.9rem;">${nameText}</div>`;
 }
 
 function _initShareModal() {
@@ -106,12 +79,9 @@ function _initShareModal() {
         if (submitBtn) { submitBtn.textContent = 'Sharing...'; submitBtn.disabled = true; }
 
         try {
-            const checkedBoxes = document.querySelectorAll(
-                '#share-project-list input[name="share_project"]:checked'
-            );
-            const projectIds = Array.from(checkedBoxes).map(cb => cb.value);
-
-            if (projectIds.length === 0) throw new Error('Select at least one project.');
+            const state = getLocalState();
+            const projectIds = [state.currentProjectId];
+            if (!projectIds[0]) throw new Error('No active project.');
 
             const emailInput = document.getElementById('share-emails-input');
             const rawEmails  = (emailInput?.value || '').split(/[,;\s]+/).filter(Boolean);
