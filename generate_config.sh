@@ -27,7 +27,7 @@ function deepFreeze(obj) {
 const Config = deepFreeze({
     google: {
         clientId: '${GOOGLE_CLIENT_ID}',
-        scopes: 'https://www.googleapis.com/auth/drive.file',
+        scopes: 'openid email profile https://www.googleapis.com/auth/drive.file',
         pickerApiKey: '${PICKER_API_KEY}',
         appId: '${APP_ID}',
         driveRootFolder: 'Ecological_Monitoring_Data',

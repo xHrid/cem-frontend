@@ -609,13 +609,17 @@ async function _handleRunClick() {
         const refFiles = externalFiles.filter(f =>
             f.is_reference && (f.linked_spots || []).some(id => spotIds.includes(id)));
         if (refFiles.length) {
+            closeModal('analysis-popup');
             const ok = await showConfirmDialog({
                 title: 'Reference files not analysed on server',
                 message: `You have ${refFiles.length} file(s) imported as reference. The server will not analyse them (reference files run locally only). Continue?`,
                 confirmText: 'Run on server',
                 cancelText: 'Cancel',
             });
-            if (!ok) return;
+            if (!ok) {
+                openModal('analysis-popup');
+                return;
+            }
         }
         await _runOnServer({ jobName, spotIds, startDate, endDate, dynamicParams, spots, externalFiles });
         return;
