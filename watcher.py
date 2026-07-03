@@ -82,6 +82,12 @@ _HEARTBEAT_REFRESH_SEC = 10
 # treating an empty file as a genuine failure.
 _QUEUE_SETTLE_GRACE = 5.0
 
+# The lock is created (open "x") and its PID payload is written a syscall later.
+# A racing watcher that reads it in that gap sees an empty file; treat such a
+# just-created empty lock as owned (not stale) until it has been empty this long,
+# which only happens if the creator crashed mid-write.
+_LOCK_SETTLE_GRACE = 5.0
+
 _AUDIO_EXTS = frozenset({'.wav', '.mp3', '.flac', '.ogg', '.opus', '.m4a', '.wma', '.aac'})
 
 def _count_audio_files(directory: str) -> int:
@@ -106,9 +112,12 @@ class WatcherConfig:
     venv_dir: str = "system/.venv"
     lock_file: str = "system/watcher.lock"
     req_hash_file: str = "system/.req_hash"
-    github_repo_url: str = (
-        "https://raw.githubusercontent.com/xHrid/cem-backend/master"
-    )
+    # Immutable pin for the self-update source. MUST be a full 40-char commit SHA
+    # (or a signed, non-moving tag). NEVER a branch like "master": the watcher
+    # auto-fetches and *executes* whatever this points at, so a moving ref means
+    # anyone who can push to the branch gets remote code execution here. Bump
+    # this deliberately, per release, after publishing a matching hash manifest.
+    github_ref: str = "74e45f84d408bb19bb6f7e5f69abf150d2ec143d"
 
     status_path: Path = field(init=False)
     scripts_path: Path = field(init=False)
@@ -116,6 +125,7 @@ class WatcherConfig:
     lock_path: Path = field(init=False)
     req_hash_path: Path = field(init=False)
     installed_registry_path: Path = field(init=False)
+    github_repo_url: str = field(init=False)
 
     def __post_init__(self) -> None:
         self.status_path = self.root_path / self.heartbeat_file
@@ -124,6 +134,9 @@ class WatcherConfig:
         self.lock_path = self.root_path / self.lock_file
         self.req_hash_path = self.root_path / self.req_hash_file
         self.installed_registry_path = self.root_path / self.installed_registry
+        self.github_repo_url = (
+            f"https://raw.githubusercontent.com/xHrid/cem-backend/{self.github_ref}"
+        )
 
     @property
     def venv_python(self) -> str:
@@ -145,6 +158,59 @@ def build_logger(name: str = "cem_watcher") -> logging.Logger:
     return logger
 
 logger = build_logger()
+
+def _spawn_new_group_kwargs() -> dict:
+    """Popen kwargs that isolate the child in its own process group / session.
+
+    A timeout must be able to signal the whole subtree — the ML script plus any
+    worker processes it forks — not just the direct child. Giving the child its
+    own group is what makes that possible.
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill *proc* and every descendant it spawned, then reap it.
+
+    POSIX: the child leads its own session, so os.killpg on its group reaches all
+    forked workers — SIGTERM for a clean exit, then SIGKILL for anything left.
+    Windows: taskkill /T walks and kills the child's whole process tree.
+    Without this, killing only the direct child orphans its ML workers, which
+    keep running (and holding the GPU/CPU) after the job is marked failed.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+        )
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return  # already gone
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        logger.error("  Process group %d survived SIGKILL", pgid)
 
 class LockFile:
     """PID-based lock file.  Acquired on __enter__, released on __exit__."""
@@ -199,7 +265,14 @@ class LockFile:
         """
         pid, recorded_start = self._read_lock()
         if pid is None:
-            return True
+            # Empty/unparseable lock: either a racer created it microseconds ago
+            # and hasn't written its PID yet (they own it — NOT stale), or a crash
+            # left it empty forever (stale). Tell them apart by age.
+            try:
+                age = time.time() - self.path.stat().st_mtime
+            except OSError:
+                return True
+            return age > _LOCK_SETTLE_GRACE
 
         if os.name == "nt":
             import ctypes
@@ -223,20 +296,40 @@ class LockFile:
         return False
 
     def acquire(self) -> bool:
-        if self.path.exists() and not self._stale():
-            existing_pid, _ = self._read_lock()
-            logger.error(
-                "Another watcher instance is already running (PID %s). "
-                "Remove %s to force-start.",
-                existing_pid,
-                self.path,
-            )
-            return False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         my_pid = os.getpid()
-        self.path.write_text(json.dumps({"pid": my_pid, "start": self._proc_start_time(my_pid)}))
-        self._acquired = True
-        return True
+        payload = json.dumps({"pid": my_pid, "start": self._proc_start_time(my_pid)})
+
+        # Two attempts: one to claim, one more in case we clear a stale lock and
+        # a competitor re-creates it in between.
+        for _ in range(2):
+            try:
+                # open(..., "x") == O_CREAT | O_EXCL: the create-if-absent is a
+                # single atomic syscall, so exactly one of N racing watchers can
+                # succeed. No exists()-then-write TOCTOU window.
+                with open(self.path, "x") as fh:
+                    fh.write(payload)
+                self._acquired = True
+                return True
+            except FileExistsError:
+                # Someone holds (or crash-left) the lock. Only take over if it is
+                # provably dead/reused; otherwise a live watcher owns the queue.
+                if not self._stale():
+                    existing_pid, _ = self._read_lock()
+                    logger.error(
+                        "Another watcher instance is already running (PID %s). "
+                        "Remove %s to force-start.",
+                        existing_pid,
+                        self.path,
+                    )
+                    return False
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass  # another watcher already reclaimed it; retry re-checks
+
+        logger.error("Could not acquire watcher lock at %s (contended).", self.path)
+        return False
 
     def release(self) -> None:
         if self._acquired and self.path.exists():
@@ -290,6 +383,41 @@ class WatcherSetup:
                 h.update(chunk)
         return h.hexdigest()
 
+    @staticmethod
+    def _content_sha256(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _fetch_manifest(self) -> dict:
+        """Fetch and parse the hash-pinned scripts.json from the pinned ref.
+
+        This manifest is the trust root for every self-update: it carries the
+        sha256 of requirements.txt and of every module manifest, script, and
+        asset. It is itself immutable because github_ref is a commit pin.
+        """
+        url = f"{self.cfg.github_repo_url}/scripts.json"
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
+    @staticmethod
+    def _verify_content(rel_key: str, data: bytes, hashes: dict) -> bool:
+        """True only if *data* matches the sha256 pinned for *rel_key* in the manifest.
+
+        Fails closed: an absent hash is treated exactly like a mismatch. Nothing
+        is written or executed unless it is explicitly pinned in the manifest.
+        """
+        expected = hashes.get(rel_key)
+        if not expected:
+            logger.error("    REFUSED %s: no sha256 in manifest (unpinned)", rel_key)
+            return False
+        actual = WatcherSetup._content_sha256(data)
+        if actual != expected:
+            logger.error(
+                "    REFUSED %s: sha256 mismatch (manifest %s… got %s…)",
+                rel_key, expected[:12], actual[:12],
+            )
+            return False
+        return True
+
     def setup_virtual_environment(self) -> None:
         cfg = self.cfg
 
@@ -302,30 +430,45 @@ class WatcherSetup:
                 timeout=300,
             )
 
-        req_url = f"{cfg.github_repo_url}/requirements.txt"
         req_path = cfg.root_path / "system" / "requirements.txt"
 
         try:
-            logger.info("Fetching latest requirements.txt from GitHub...")
-            tmp_req = req_path.with_suffix(".tmp")
-            urllib.request.urlretrieve(req_url, tmp_req)
-            new_hash = self._file_sha256(tmp_req)
+            manifest = self._fetch_manifest()
+            hashes = manifest.get("hashes", {})
 
+            req_url = f"{cfg.github_repo_url}/requirements.txt"
+            logger.info("Fetching pinned requirements.txt...")
+            with urllib.request.urlopen(req_url, timeout=30) as resp:
+                req_bytes = resp.read()
+
+            if not self._verify_content("requirements.txt", req_bytes, hashes):
+                logger.error("Refusing to install unverified requirements.txt.")
+                return
+
+            new_hash = self._content_sha256(req_bytes)
             stored_hash: Optional[str] = None
             if cfg.req_hash_path.exists():
                 stored_hash = cfg.req_hash_path.read_text().strip()
 
             if new_hash == stored_hash and req_path.exists():
                 logger.info("Requirements unchanged — skipping pip install.")
-                tmp_req.unlink()
                 return
 
+            req_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_req = req_path.with_suffix(".tmp")
+            tmp_req.write_bytes(req_bytes)
             tmp_req.replace(req_path)
-            logger.info("Installing dependencies in venv...")
+
+            logger.info("Installing dependencies in venv (--require-hashes)...")
             self.update_heartbeat("installing_dependencies")
+            # --require-hashes makes pip refuse any package whose sha256 is not
+            # pinned in requirements.txt, so a tampered index or MITM can't slip
+            # a different wheel past us. Verifying requirements.txt above pins the
+            # pin list itself; this pins what the pins resolve to.
             subprocess.run(
                 [cfg.venv_python, "-m", "pip", "install",
-                 "--prefer-binary", "--no-input", "-r", str(req_path)],
+                 "--require-hashes", "--prefer-binary", "--no-input",
+                 "-r", str(req_path)],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -345,22 +488,19 @@ class WatcherSetup:
         except Exception as exc:
             logger.warning("Failed to setup requirements: %s", exc)
 
-    @staticmethod
-    def _content_sha256(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
-
     def sync_scripts(self) -> None:
         cfg = self.cfg
-        logger.info("Checking for script updates from GitHub...")
+        logger.info("Checking for script updates from pinned ref %s…", cfg.github_ref[:12])
         cfg.scripts_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            registry_url = f"{cfg.github_repo_url}/scripts.json"
-            with urllib.request.urlopen(registry_url, timeout=30) as resp:
-                script_folders = json.loads(resp.read().decode())
+            manifest = self._fetch_manifest()
         except Exception as exc:
             logger.warning("Sync failed (using cached scripts if available): %s", exc)
             return
+
+        hashes = manifest.get("hashes", {})
+        script_folders = manifest.get("modules", [])
 
         installed_scripts = []
         for folder in script_folders:
@@ -368,15 +508,28 @@ class WatcherSetup:
             manifest_url = f"{cfg.github_repo_url}/{folder}/manifest.json"
             try:
                 with urllib.request.urlopen(manifest_url, timeout=30) as resp:
-                    manifest_data = json.loads(resp.read().decode())
+                    manifest_bytes = resp.read()
+
+                if not self._verify_content(f"{folder}/manifest.json", manifest_bytes, hashes):
+                    logger.warning("  Skipping %s: manifest failed verification", folder)
+                    continue
+
+                manifest_data = json.loads(manifest_bytes.decode())
 
                 for script_entry in manifest_data:
-                    self._sync_file(folder, script_entry["script_file"])
-
+                    ok = self._sync_file(folder, script_entry["script_file"], hashes)
                     for asset in script_entry.get("assets", []):
-                        self._sync_file(folder, asset)
+                        ok = self._sync_file(folder, asset, hashes) and ok
 
-                    installed_scripts.append(script_entry)
+                    # Only register a script whose code + assets all verified,
+                    # so process() never launches a half-verified module.
+                    if ok:
+                        installed_scripts.append(script_entry)
+                    else:
+                        logger.warning(
+                            "  Not registering %s/%s: one or more files unverified",
+                            folder, script_entry.get("script_file"),
+                        )
             except Exception as folder_err:
                 logger.warning("  Skipping %s: %s", folder, folder_err)
 
@@ -384,17 +537,22 @@ class WatcherSetup:
             json.dump(installed_scripts, fh, indent=2)
         logger.info("Successfully synced %d analysis scripts.", len(installed_scripts))
 
-    def _sync_file(self, folder: str, filename: str) -> None:
-        """Download *filename* from *folder* if it is absent or its content hash differs.
+    def _sync_file(self, folder: str, filename: str, hashes: dict) -> bool:
+        """Download *filename* from *folder*, verifying it against the pinned manifest.
 
-        Integrity safeguards:
-          - Validates Content-Length against actual bytes received
-          - For .py files: verifies the source compiles (catches truncation)
-          - Writes via atomic temp-file rename (no partial overwrites)
-          - Deduplicates shared assets (e.g. 00_config.py) — first valid
-            download wins; subsequent folders skip if hash matches
+        Returns True if the local copy is present and verified afterwards, False
+        if the file was refused (absent/mismatched hash, corrupt download, bad
+        syntax). Nothing is written unless it matches the manifest sha256.
+
+        Layered guards (manifest hash is authoritative; the rest catch corruption
+        before it can ever reach disk):
+          - sha256 vs the pinned manifest  (rejects unpinned or tampered content)
+          - Content-Length vs bytes received  (rejects truncated transfers)
+          - .py compiles  (rejects syntactically broken source)
+          - atomic temp-file rename  (no partial overwrites)
         """
         cfg = self.cfg
+        rel_key = f"{folder}/{filename}"
         remote_url = f"{cfg.github_repo_url}/{folder}/{filename}"
         local_path = cfg.scripts_path / filename
 
@@ -406,31 +564,33 @@ class WatcherSetup:
                     expected_len = int(expected_len)
                     if len(remote_bytes) != expected_len:
                         logger.warning(
-                            "    %s/%s: incomplete download (%d/%d bytes). Skipping.",
-                            folder, filename, len(remote_bytes), expected_len,
+                            "    %s: incomplete download (%d/%d bytes). Skipping.",
+                            rel_key, len(remote_bytes), expected_len,
                         )
-                        return
+                        return False
         except Exception as exc:
-            logger.warning("    Could not fetch %s/%s: %s", folder, filename, exc)
-            return
+            logger.warning("    Could not fetch %s: %s", rel_key, exc)
+            return False
+
+        if not self._verify_content(rel_key, remote_bytes, hashes):
+            return False
 
         if filename.endswith(".py"):
             try:
                 compile(remote_bytes, filename, "exec")
             except SyntaxError as exc:
                 logger.warning(
-                    "    %s/%s: syntax error after download (line %s). "
-                    "Keeping existing copy.",
-                    folder, filename, exc.lineno,
+                    "    %s: syntax error after download (line %s). Keeping existing copy.",
+                    rel_key, exc.lineno,
                 )
-                return
+                return False
 
         remote_hash = self._content_sha256(remote_bytes)
 
         if local_path.exists():
             local_hash = self._file_sha256(local_path)
             if local_hash == remote_hash:
-                return
+                return True
             logger.info("    Updating: %s (from %s)", filename, folder)
         else:
             logger.info("    Downloading: %s (from %s)", filename, folder)
@@ -439,6 +599,7 @@ class WatcherSetup:
         tmp_path = local_path.with_suffix(local_path.suffix + ".tmp")
         tmp_path.write_bytes(remote_bytes)
         tmp_path.replace(local_path)
+        return True
 
 class JobProcessor:
     def __init__(self, cfg: WatcherConfig, setup: WatcherSetup) -> None:
@@ -642,6 +803,17 @@ class JobProcessor:
                 for d in unique_dirs[:5]:
                     logger.warning("    dir: %s (exists: %s)", d, Path(d).exists())
 
+            # A job that asked for input but resolved to nothing must fail loudly.
+            # Otherwise the script exits 0 over an empty input set and we'd file a
+            # zero-work run under completed/ — silently losing the user's data.
+            inputs_requested = bool(job_data.get("datasets") or job_data.get("input_files"))
+            if inputs_requested and (not unique_dirs or total_files == 0):
+                raise ValueError(
+                    "no input audio resolved: job requested input data but "
+                    f"resolved {len(unique_dirs)} dir(s) and {total_files} audio file(s) "
+                    "— check that the dataset/reference paths exist and contain audio"
+                )
+
             logger.info("  ┌─ Job Summary ─────────────────────────────")
             logger.info("  │ Script:          %s", script_name)
             logger.info("  │ Input dirs:      %d (from copies + reference parents)", len(unique_dirs))
@@ -670,6 +842,7 @@ class JobProcessor:
                     cwd=str(script_path.parent),
                     text=True,
                     bufsize=1,
+                    **_spawn_new_group_kwargs(),
                 )
 
                 # Drain stdout on a background thread. Doing it inline blocks until
@@ -744,8 +917,7 @@ class JobProcessor:
         except subprocess.TimeoutExpired:
             logger.error("  Job %s timed out after %ds", job_id, cfg.job_timeout)
             if 'proc' in locals():
-                proc.kill()
-                proc.wait()
+                _kill_process_tree(proc)
             self._write_failure_reason(
                 results_dir / job_id,
                 f"Job exceeded the time limit ({cfg.job_timeout}s) and was terminated.",
