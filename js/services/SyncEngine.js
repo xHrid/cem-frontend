@@ -2,13 +2,16 @@ import EventBus, { EVENTS } from '../core/EventBus.js';
 import { getAccessToken } from './AuthService.js';
 import { pushMasterToDrive } from '../data/Repository.js';
 import { checkForRemoteUpdates } from './SyncService.js';
-import { getLocalState } from '../data/MasterData.js';
+import { getLocalState, rehydrate, saveMasterData } from '../data/MasterData.js';
 
 const PUSH_DEBOUNCE_MS = 4000;
 
 const INTERVAL_MS = 5 * 60 * 1000;
 
 const POLL_MS = 2 * 60 * 1000;
+
+const LEADER_LOCK = 'cem-sync-leader';
+const CHANNEL     = 'cem-sync';
 
 let _started   = false;
 let _dirty     = false;
@@ -22,8 +25,19 @@ let _poll      = null;
 let _lastSharedSyncId = null;
 let _sharedSyncBusy   = false;
 
+let _isLeader = false;
+let _channel  = null;
+const _tabId  = crypto.randomUUID();
+
+let _lastDirtyAt        = 0;
+let _lastFlushRequestAt = 0;
+
 export function getSyncState() {
-    return { status: _status, dirty: _dirty, lastSyncAt: _lastSyncAt, paused: _paused };
+    return { status: _status, dirty: _dirty, lastSyncAt: _lastSyncAt, paused: _paused, isLeader: _isLeader };
+}
+
+export function isSyncLeader() {
+    return _isLeader;
 }
 
 export function pauseSync() {
@@ -62,20 +76,33 @@ function _emitStatus() {
 
 function _markDirty() {
     _dirty = true;
+    _lastDirtyAt = Date.now();
     if (_debounce) clearTimeout(_debounce);
     _debounce = setTimeout(() => { _debounce = null; flush('auto'); }, PUSH_DEBOUNCE_MS);
 }
 
+// Only the leader tab talks to Drive. Non-leader tabs fold the persisted
+// state into memory (another tab may have written it) and hand the flush to
+// the leader; their dirty flag stays set until the leader confirms a sync.
 export async function flush(reason = 'manual') {
     if (reason === 'manual') _paused = false;
     if (_paused) return;
     if (!getAccessToken()) { _setStatus('offline'); return; }
     if (!_dirty && reason !== 'manual') return;
 
+    if (!_isLeader) {
+        await rehydrate();
+        _lastFlushRequestAt = Date.now();
+        _channel?.postMessage({ t: 'flush-request', from: _tabId });
+        return;
+    }
+
     _dirty = false;
     _setStatus('syncing');
 
     try {
+        const changed = await rehydrate();
+        if (changed) await saveMasterData();
         await pushMasterToDrive();
 
         const active = _activeProject();
@@ -86,6 +113,7 @@ export async function flush(reason = 'manual') {
 
         _markSynced();
         _setStatus('idle');
+        _channel?.postMessage({ t: 'synced', from: _tabId });
     } catch (err) {
         console.error('[SyncEngine] flush failed:', err);
         _dirty = true;
@@ -96,9 +124,11 @@ export async function flush(reason = 'manual') {
 export function onAuthReady() {
     if (_paused) return;
     if (!getAccessToken()) { _setStatus('offline'); return; }
-    checkForRemoteUpdates(false).catch(err =>
-        console.warn('[SyncEngine] initial conflict check failed:', err.message)
-    );
+    if (_isLeader) {
+        checkForRemoteUpdates(false).catch(err =>
+            console.warn('[SyncEngine] initial conflict check failed:', err.message)
+        );
+    }
     _markSynced();
     _setStatus('idle');
 }
@@ -109,7 +139,7 @@ function _activeProject() {
 }
 
 async function _syncActiveSharedProject(force = false) {
-    if (_paused || !getAccessToken() || _sharedSyncBusy) return;
+    if (_paused || !getAccessToken() || _sharedSyncBusy || !_isLeader) return;
 
     const active = _activeProject();
     if (!active) return;
@@ -142,9 +172,72 @@ function _flushOnClose() {
     flush('close');
 }
 
+function _onBecameLeader() {
+    _isLeader = true;
+    _emitStatus();
+    if (_dirty && getAccessToken()) flush('leader-takeover');
+}
+
+function _electLeader() {
+    if (navigator.locks?.request) {
+        // Whoever holds the lock is the leader; the promise below never
+        // resolves, so the lock releases only when the tab dies and the
+        // next waiter is promoted automatically.
+        navigator.locks.request(LEADER_LOCK, { mode: 'exclusive' }, () => {
+            _onBecameLeader();
+            return new Promise(() => { });
+        }).catch(err => console.warn('[SyncEngine] leader lock failed:', err.message));
+        return;
+    }
+
+    if (!_channel) { _isLeader = true; return; }
+
+    // BroadcastChannel fallback: claim, and become leader unless an existing
+    // leader answers. Re-claim periodically in case the leader tab died.
+    let claimTimer = null;
+    const claim = () => {
+        if (_isLeader) return;
+        _channel.postMessage({ t: 'claim', from: _tabId });
+        clearTimeout(claimTimer);
+        claimTimer = setTimeout(() => { if (!_leaderSeen) _onBecameLeader(); _leaderSeen = false; }, 800);
+    };
+    let _leaderSeen = false;
+    _channel.addEventListener('message', (e) => {
+        const msg = e.data || {};
+        if (msg.t === 'claim' && _isLeader) _channel.postMessage({ t: 'leader-here', from: _tabId });
+        if (msg.t === 'leader-here') _leaderSeen = true;
+    });
+    claim();
+    setInterval(claim, 15000);
+}
+
+function _bindChannel() {
+    if (!('BroadcastChannel' in globalThis)) return;
+    _channel = new BroadcastChannel(CHANNEL);
+    _channel.addEventListener('message', async (e) => {
+        const msg = e.data || {};
+        if (msg.t === 'flush-request' && _isLeader) {
+            await rehydrate();
+            _markDirty();
+        }
+        if (msg.t === 'synced' && !_isLeader) {
+            // Keep dirty if we mutated after the last hand-off; the next
+            // debounced flush re-delegates those changes to the leader.
+            if (_lastDirtyAt <= _lastFlushRequestAt) _dirty = false;
+            await rehydrate();
+            _markSynced();
+            _setStatus('idle');
+            EventBus.emit(EVENTS.PROJECT_CHANGED);
+        }
+    });
+}
+
 export function initSyncEngine() {
     if (_started) return;
     _started = true;
+
+    _bindChannel();
+    _electLeader();
 
     EventBus.on(EVENTS.DATA_UPDATED, () => _markDirty());
 
@@ -155,8 +248,16 @@ export function initSyncEngine() {
     _interval = setInterval(() => flush('interval'), INTERVAL_MS);
 
     _poll = setInterval(() => {
-        if (document.visibilityState === 'visible') _syncActiveSharedProject(true);
+        if (document.visibilityState !== 'visible') return;
+        _syncActiveSharedProject(true);
+        if (_isLeader && getAccessToken() && !_paused) {
+            checkForRemoteUpdates(false).catch(err =>
+                console.warn('[SyncEngine] remote poll failed:', err.message)
+            );
+        }
     }, POLL_MS);
+
+    window.addEventListener('online', () => flush('online'));
 
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden') {

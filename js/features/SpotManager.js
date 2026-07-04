@@ -9,12 +9,14 @@ import { openModal, closeModal }     from '../ui/ModalManager.js';
 import { downscaleImage }            from '../data/imageUtils.js';
 import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 import { getUserEmail } from '../services/AuthService.js';
+import { escapeHtml } from '../core/escape.js';
 
 let _spotsLayer = null;
 
 let _lastProjectId = null;
 
 let _mediaRecorder = null;
+let _micStream = null;
 let _audioChunks = [];
 let _recordedAudioBlob = null;
 
@@ -99,6 +101,7 @@ function _setAddMoreMode(spot) {
 async function _startRecording() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        _micStream         = stream;
         _audioChunks       = [];
         _recordedAudioBlob = null;
         _mediaRecorder     = new MediaRecorder(stream);
@@ -109,18 +112,37 @@ async function _startRecording() {
             _recordedAudioBlob = new Blob(_audioChunks, { type: 'audio/webm' });
             const playback = document.getElementById('audioPlayback');
             if (playback) playback.src = URL.createObjectURL(_recordedAudioBlob);
+            _stopMicStream();
         };
 
         _mediaRecorder.start();
     } catch (err) {
         showToast(`Mic Error: ${err.message}`, 'failed');
         _mediaRecorder = null;
+        _stopMicStream();
     }
 }
 
 function _stopRecording() {
     if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
         _mediaRecorder.stop();
+    } else {
+        _stopMicStream();
+    }
+}
+
+function _stopMicStream() {
+    if (_micStream) {
+        _micStream.getTracks().forEach(t => t.stop());
+        _micStream = null;
+    }
+}
+
+function _resetRecordingUI() {
+    const audioToggle = document.getElementById('audio-toggle');
+    if (audioToggle) {
+        audioToggle.classList.remove('recording');
+        audioToggle.style.backgroundColor = '';
     }
 }
 
@@ -149,52 +171,55 @@ async function _handleSpotFormSubmit(e) {
     e.preventDefault();
     const form = e.target;
 
-    let recordDate = new Date();
-    const useCurrentCb = document.getElementById('use-current-time');
-    if (useCurrentCb && !useCurrentCb.checked) {
-        const cDate = document.getElementById('custom-date').value;
-        const cTime = document.getElementById('custom-time').value || '00:00:00';
-        if (cDate) recordDate = new Date(`${cDate}T${cTime}`);
-    }
-
-    let lat, lng;
-    if (_addMoreSpot) {
-        lat = _addMoreSpot.latitude;
-        lng = _addMoreSpot.longitude;
-    } else {
-        const useCurrentLocCb = document.getElementById('use-current-location');
-        if (useCurrentLocCb && !useCurrentLocCb.checked) {
-            lat = parseFloat(document.getElementById('custom-lat').value);
-            lng = parseFloat(document.getElementById('custom-lon').value);
-            if (isNaN(lat) || isNaN(lng)) {
-                showToast('Please enter valid latitude and longitude.', 'failed');
-                return;
-            }
-        } else {
-            const pos = getCurrentPosition();
-            lat = pos.lat;
-            lng = pos.lng;
-            if (lat === 0 && lng === 0) {
-                showToast('Location not available yet. Wait for a GPS fix or enter coordinates manually.', 'failed');
-                return;
-            }
-        }
-    }
-
-    const spotName = _addMoreSpot ? _addMoreSpot.name : form.name.value;
+    const submitBtn = form.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
 
     const statusEl = document.getElementById('status');
 
-    const imageBlobs = [];
-    if (_pendingImages.length > 0) {
-        for (let i = 0; i < _pendingImages.length; i++) {
-            if (statusEl) statusEl.textContent = `Optimising photo ${i + 1}/${_pendingImages.length}...`;
-            imageBlobs.push(await downscaleImage(_pendingImages[i].file));
-        }
-    }
-    if (statusEl) statusEl.textContent = 'Saving to disk...';
-
     try {
+        let recordDate = new Date();
+        const useCurrentCb = document.getElementById('use-current-time');
+        if (useCurrentCb && !useCurrentCb.checked) {
+            const cDate = document.getElementById('custom-date').value;
+            const cTime = document.getElementById('custom-time').value || '00:00:00';
+            if (cDate) recordDate = new Date(`${cDate}T${cTime}`);
+        }
+
+        let lat, lng;
+        if (_addMoreSpot) {
+            lat = _addMoreSpot.latitude;
+            lng = _addMoreSpot.longitude;
+        } else {
+            const useCurrentLocCb = document.getElementById('use-current-location');
+            if (useCurrentLocCb && !useCurrentLocCb.checked) {
+                lat = parseFloat(document.getElementById('custom-lat').value);
+                lng = parseFloat(document.getElementById('custom-lon').value);
+                if (isNaN(lat) || isNaN(lng)) {
+                    showToast('Please enter valid latitude and longitude.', 'failed');
+                    return;
+                }
+            } else {
+                const pos = getCurrentPosition();
+                lat = pos.lat;
+                lng = pos.lng;
+                if (lat === 0 && lng === 0) {
+                    showToast('Location not available yet. Wait for a GPS fix or enter coordinates manually.', 'failed');
+                    return;
+                }
+            }
+        }
+
+        const spotName = _addMoreSpot ? _addMoreSpot.name : form.name.value;
+
+        const imageBlobs = [];
+        if (_pendingImages.length > 0) {
+            for (let i = 0; i < _pendingImages.length; i++) {
+                if (statusEl) statusEl.textContent = `Optimising photo ${i + 1}/${_pendingImages.length}...`;
+                imageBlobs.push(await downscaleImage(_pendingImages[i].file));
+            }
+        }
+        if (statusEl) statusEl.textContent = 'Saving to disk...';
+
         await saveSpot(
             {
                 name        : spotName,
@@ -227,9 +252,11 @@ async function _handleSpotFormSubmit(e) {
 
         _pendingImages = [];
         _renderImagePreviews();
+        _stopMicStream();
         _recordedAudioBlob = null;
         _mediaRecorder     = null;
         _audioChunks       = [];
+        _resetRecordingUI();
         const playback = document.getElementById('audioPlayback');
         if (playback) playback.src = '';
 
@@ -239,6 +266,8 @@ async function _handleSpotFormSubmit(e) {
         console.error('[SpotManager] saveSpot failed:', err);
         showToast(`Error saving spot (is a folder selected?): ${err.message}`, 'failed');
         if (statusEl) statusEl.textContent = '';
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
     }
 }
 
@@ -662,7 +691,7 @@ export function displaySpots() {
         }).addTo(_spotsLayer);
 
         if (entryCount > 1) {
-            marker.bindTooltip(`${spot.name} (${entryCount} entries)`, { direction: 'top' });
+            marker.bindTooltip(`${escapeHtml(spot.name)} (${entryCount} entries)`, { direction: 'top' });
         }
 
         marker.on('click', () => _showSpotDetails(spot));
@@ -697,6 +726,15 @@ export function initSpots() {
 
     const spotForm = document.getElementById('spot-form');
     if (spotForm) spotForm.addEventListener('submit', _handleSpotFormSubmit);
+
+    const popupForm = document.getElementById('popup-form');
+    if (popupForm) {
+        popupForm.addEventListener('close', () => {
+            _stopRecording();
+            _stopMicStream();
+            _resetRecordingUI();
+        });
+    }
 
     document.getElementById('open-form')?.addEventListener('click', () => {
         _pendingImages = [];

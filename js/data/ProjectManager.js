@@ -1,7 +1,7 @@
 import EventBus, { EVENTS }       from '../core/EventBus.js';
 import * as MasterData            from './MasterData.js';
 import { getProjectFolderName }   from './projectUtils.js';
-import { pushMasterToDrive }      from './Repository.js';
+import { touch }                  from './mergeUtils.js';
 
 export { getProjectFolderName };
 
@@ -18,7 +18,7 @@ function _guardReadOnly(project) {
 export async function createProject(name) {
     const state     = MasterData.getLocalState();
     const newId     = crypto.randomUUID();
-    const newProject = {
+    const newProject = touch({
         id             : newId,
         name           : (name || 'Untitled Project').trim(),
         spots          : [],
@@ -26,14 +26,23 @@ export async function createProject(name) {
         sites          : [],
         external_files : [],
         created_at     : new Date().toISOString()
-    };
+    });
 
-    state.projects.push(newProject);
+    const prevProjects  = state.projects;
+    const prevCurrentId = state.currentProjectId;
+    state.projects = [...state.projects, newProject];
     state.currentProjectId = newId;
 
-    await MasterData.saveMasterData();
+    try {
+        await MasterData.saveMasterData();
+    } catch (err) {
+        state.projects = prevProjects;
+        state.currentProjectId = prevCurrentId;
+        throw err;
+    }
+
     EventBus.emit(EVENTS.PROJECT_CHANGED);
-    pushMasterToDrive();
+    EventBus.emit(EVENTS.DATA_UPDATED);
 
     return newProject;
 }
@@ -67,11 +76,20 @@ export async function renameProject(projectId, newName) {
         throw new Error('ProjectManager.renameProject: name cannot be empty.');
     }
 
-    project.name = trimmed;
+    const renamed = touch({ ...project, name: trimmed });
 
-    await MasterData.saveMasterData();
+    const prevProjects = state.projects;
+    state.projects = state.projects.map(p => (p === project ? renamed : p));
+
+    try {
+        await MasterData.saveMasterData();
+    } catch (err) {
+        state.projects = prevProjects;
+        throw err;
+    }
+
     EventBus.emit(EVENTS.PROJECT_CHANGED);
-    pushMasterToDrive();
+    EventBus.emit(EVENTS.DATA_UPDATED);
 }
 
 export async function deleteProject(projectId) {
@@ -81,17 +99,25 @@ export async function deleteProject(projectId) {
         throw new Error('ProjectManager.deleteProject: cannot delete the last remaining project.');
     }
 
+    const prevProjects  = state.projects;
+    const prevCurrentId = state.currentProjectId;
+
     state.projects = state.projects.filter(p => p.id !== projectId);
 
     if (state.currentProjectId === projectId) {
         state.currentProjectId = state.projects[0].id;
-        MasterData.setCurrentProjectId(state.currentProjectId);
     }
 
-    await MasterData.saveMasterData();
+    try {
+        await MasterData.saveMasterData();
+    } catch (err) {
+        state.projects = prevProjects;
+        state.currentProjectId = prevCurrentId;
+        throw err;
+    }
+
     EventBus.emit(EVENTS.PROJECT_CHANGED);
     EventBus.emit(EVENTS.DATA_UPDATED);
-    pushMasterToDrive();
 
     try {
         const { gcAndRefresh } = await import('../services/StorageGC.js');

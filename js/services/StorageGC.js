@@ -4,7 +4,10 @@ import { enumerateFileRefs } from './ProjectFilesSync.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
 
 function _isProtected(p) {
-    return p === 'master_data.json' || p === 'watcher.py' || p.startsWith('system/');
+    return p === 'master_data.json' ||
+           p === 'watcher.py' ||
+           p.startsWith('master_data.corrupt-') ||
+           p.startsWith('system/');
 }
 
 function _collectReferenced() {
@@ -15,10 +18,14 @@ function _collectReferenced() {
     for (const proj of (state.projects || [])) {
         folders.add(getProjectFolderName(proj));
 
+        // enumerateFileRefs skips tombstoned items, so a deleted item's media
+        // becomes collectable - but a file whose item is alive is always kept,
+        // regardless of whether it has been uploaded (drive_id null) yet.
         for (const r of enumerateFileRefs(proj)) {
             if (r.relPath) refs.add(r.relPath);
         }
         for (const f of (proj.external_files || [])) {
+            if (f.deleted) continue;
             if (f.local_path && !f.is_reference) refs.add(f.local_path);
         }
     }

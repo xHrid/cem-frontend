@@ -131,36 +131,90 @@ export async function getStorageEstimate() {
     return out;
 }
 
-export async function getMasterData() {
-    if (!_memoryMode && _rootHandle) {
-        try {
-            const fh   = await _rootHandle.getFileHandle('master_data.json');
-            const file = await fh.getFile();
-            return JSON.parse(await file.text());
-        } catch {
-            return null;
-        }
-    }
+let _lastGoodMasterText = null;
 
-    const blob = await _idbGet('master_data.json');
-    if (!blob) return null;
-    return JSON.parse(await blob.text());
+function _isEmptyMaster(data) {
+    const projects = data?.projects || [];
+    return projects.every(p =>
+        !(p.spots?.length || p.sites?.length || p.routes?.length ||
+          p.external_files?.length || p.jobs?.length)
+    );
 }
 
-export async function saveMasterData(data) {
-    const blob = new Blob(
-        [JSON.stringify(data, null, 2)],
-        { type: 'application/json' }
-    );
-
+async function _writeRootFile(filename, text) {
+    const blob = new Blob([text], { type: 'application/json' });
     if (!_memoryMode && _rootHandle) {
-        const fh       = await _rootHandle.getFileHandle('master_data.json', { create: true });
+        const fh       = await _rootHandle.getFileHandle(filename, { create: true });
         const writable = await fh.createWritable();
         await writable.write(blob);
         await writable.close();
     } else {
-        await _idbSave('master_data.json', blob);
+        await _idbSave(filename, blob);
     }
+}
+
+async function _backupCorruptMaster(text) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const name  = `master_data.corrupt-${stamp}.json`;
+    try {
+        await _writeRootFile(name, text);
+        console.warn(`[StorageAdapter] Backed up unreadable/at-risk master to ${name}`);
+    } catch (e) {
+        console.error('[StorageAdapter] Could not back up master data:', e);
+    }
+    return name;
+}
+
+// Returns null ONLY when the file is genuinely absent. An IO or parse failure
+// throws (after backing up the raw bytes), so callers can never mistake a
+// corrupt master for a missing one and overwrite it with an empty state.
+export async function getMasterData() {
+    let text;
+
+    if (!_memoryMode && _rootHandle) {
+        let file = null;
+        try {
+            const fh = await _rootHandle.getFileHandle('master_data.json');
+            file = await fh.getFile();
+        } catch (e) {
+            if (e?.name === 'NotFoundError' || e?.name === 'TypeMismatchError') return null;
+            throw new Error(`Could not read master_data.json: ${e?.message || e}`);
+        }
+        text = await file.text();
+    } else {
+        const blob = await _idbGet('master_data.json');
+        if (blob === undefined || blob === null) return null;
+        text = await blob.text();
+    }
+
+    try {
+        const data = JSON.parse(text);
+        _lastGoodMasterText = text;
+        return data;
+    } catch {
+        const backup = await _backupCorruptMaster(text);
+        throw new Error(
+            `master_data.json is corrupt and was NOT overwritten. ` +
+            `The raw content was backed up as ${backup}.`
+        );
+    }
+}
+
+export async function saveMasterData(data) {
+    const text = JSON.stringify(data, null, 2);
+
+    // Losing all items between two writes means either a legitimate wipe or a
+    // bug upstream; keep the last non-empty snapshot either way.
+    if (_lastGoodMasterText && _isEmptyMaster(data)) {
+        try {
+            if (!_isEmptyMaster(JSON.parse(_lastGoodMasterText))) {
+                await _backupCorruptMaster(_lastGoodMasterText);
+            }
+        } catch { }
+    }
+
+    await _writeRootFile('master_data.json', text);
+    _lastGoodMasterText = text;
 }
 
 export async function saveFile(blob, filename, pathParts) {

@@ -3,7 +3,7 @@ import * as DriveService from './DriveService.js';
 import * as MasterData from '../data/MasterData.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
-import { pushMasterToDrive, pushProjectDataToDrive } from '../data/Repository.js';
+import { pushProjectDataToDrive } from '../data/Repository.js';
 import { getAccessToken } from './AuthService.js';
 import { mergeById } from '../data/mergeUtils.js';
 
@@ -330,7 +330,7 @@ export async function shareProject(projectId, emails, role) {
     }
 
     await MasterData.saveMasterData();
-    pushMasterToDrive();
+    EventBus.emit(EVENTS.DATA_UPDATED);
 
     const shareLink = generateShareLink(folderId);
 
@@ -360,7 +360,7 @@ export async function unshareProject(projectId, email) {
     }
 
     await MasterData.saveMasterData();
-    pushMasterToDrive();
+    EventBus.emit(EVENTS.DATA_UPDATED);
 }
 
 export async function importSharedProject(projectFileId) {

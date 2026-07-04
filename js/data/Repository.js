@@ -12,7 +12,12 @@ import {
     upsertFile,
     ensureDrivePath
 } from '../services/DriveService.js';
-import { mergeById } from './mergeUtils.js';
+import { mergeById, touch, tombstone, isDeleted } from './mergeUtils.js';
+import {
+    getKnownRemoteMasterTime,
+    setKnownRemoteMasterTime,
+    raiseRemoteConflict
+} from '../services/SyncService.js';
 
 function _requireActiveProject() {
     const project = MasterData.getActiveProject();
@@ -31,6 +36,26 @@ function _safeName(name, fallback = 'Unknown') {
         .replace(/_{2,}/g,      '_')
         .replace(/^_|_$/g,      '');
     return clean || fallback;
+}
+
+// Persist-then-commit: apply the mutation, persist, and roll the mutation back
+// if the write fails, so memory and disk never diverge. `mutate` must return a
+// rollback function.
+async function _commit(mutate) {
+    const rollback = mutate();
+    try {
+        await MasterData.saveMasterData();
+    } catch (err) {
+        try { rollback(); } catch { }
+        throw err;
+    }
+    EventBus.emit(EVENTS.DATA_UPDATED);
+}
+
+function _replaceArray(project, key, next) {
+    const prev = project[key];
+    project[key] = next;
+    return () => { project[key] = prev; };
 }
 
 export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
@@ -70,7 +95,7 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
         ? recordDate.toISOString()
         : new Date().toISOString();
 
-    const newSpot = {
+    const newSpot = touch({
         ...spotData,
         spotId,
         projectId              : project.id,
@@ -79,13 +104,9 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
         image_local_filename   : imagePaths[0] || null,
         images                 : imagePaths.length > 0 ? imagePaths : null,
         audio_local_filename   : audioPath
-    };
+    });
 
-    if (!project.spots) project.spots = [];
-    project.spots.push(newSpot);
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() => _replaceArray(project, 'spots', [...(project.spots || []), newSpot]));
 
     for (const p of imagePaths) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: p, isExternal: false });
@@ -99,30 +120,40 @@ export async function saveSpot(spotData, imageBlobs, audioBlob, recordDate) {
 
 export async function updateSpot(spotId, fields, addBlobs = [], removePaths = [], clearDriveImg = false) {
     const project = _requireActiveProject();
-    const spot    = (project.spots || []).find(s => s.spotId === spotId);
+    const spot    = (project.spots || []).find(s => s.spotId === spotId && !isDeleted(s));
     if (!spot) throw new Error(`Spot "${spotId}" not found.`);
 
+    const updated = { ...spot };
+
     if (fields && typeof fields.description === 'string') {
-        spot.description = fields.description;
+        updated.description = fields.description;
     }
 
     const blobs = addBlobs instanceof Blob ? [addBlobs] : (Array.isArray(addBlobs) ? addBlobs : []);
 
-    let images = spot.images && spot.images.length > 0
-        ? [...spot.images]
-        : (spot.image_local_filename ? [spot.image_local_filename] : []);
+    let images = updated.images && updated.images.length > 0
+        ? [...updated.images]
+        : (updated.image_local_filename ? [updated.image_local_filename] : []);
+    let driveIds = updated.image_drive_ids ? [...updated.image_drive_ids] : [];
+    while (driveIds.length < images.length) driveIds.push(null);
+    if (!updated.image_drive_ids && updated.image_drive_id && driveIds.length > 0) {
+        driveIds[0] = updated.image_drive_id;
+    }
 
     if (removePaths.length > 0) {
         const removeSet = new Set(removePaths);
-        images = images.filter(p => !removeSet.has(p));
+        const kept = images.map((p, i) => [p, driveIds[i]]).filter(([p]) => !removeSet.has(p));
+        images   = kept.map(([p]) => p);
+        driveIds = kept.map(([, id]) => id);
     }
 
     if (clearDriveImg) {
-        spot.image_drive_id = null;
+        updated.image_drive_id = null;
+        if (driveIds.length > 0) driveIds[0] = null;
     }
 
     const projectFolder = getProjectFolderName(project);
-    const safeSpot      = _safeName(spot.name, `Spot_${spotId.substring(0, 8)}`);
+    const safeSpot      = _safeName(updated.name, `Spot_${spotId.substring(0, 8)}`);
     const shortId       = spotId.substring(0, 8);
     const newPaths      = [];
 
@@ -134,25 +165,25 @@ export async function updateSpot(spotId, fields, addBlobs = [], removePaths = []
             [projectFolder, 'spots', safeSpot, 'images']
         );
         images.push(path);
+        driveIds.push(null);
         newPaths.push(path);
     }
 
-    spot.images = images.length > 0 ? images : null;
-    spot.image_local_filename = images[0] || null;
+    updated.images               = images.length > 0 ? images : null;
+    updated.image_drive_ids      = images.length > 0 ? driveIds : null;
+    updated.image_local_filename = images[0] || null;
+    updated.image_drive_id       = driveIds[0] || null;
+    touch(updated);
 
-    if (!spot.image_local_filename && !clearDriveImg) {
-    }
-
-    spot.updated_at = new Date().toISOString();
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'spots', project.spots.map(s => (s === spot ? updated : s)))
+    );
 
     for (const p of newPaths) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: p, isExternal: false });
     }
 
-    return spot;
+    return updated;
 }
 
 export async function saveSite(siteName, kmlFile, clusters) {
@@ -169,7 +200,7 @@ export async function saveSite(siteName, kmlFile, clusters) {
         [projectFolder, 'sites']
     );
 
-    const newSite = {
+    const newSite = touch({
         id             : siteId,
         projectId      : project.id,
         name           : siteName,
@@ -177,13 +208,9 @@ export async function saveSite(siteName, kmlFile, clusters) {
         clusters       : clusters || null,
         created_by     : getUserEmail() || null,
         timestamp      : new Date().toISOString()
-    };
+    });
 
-    if (!project.sites) project.sites = [];
-    project.sites.push(newSite);
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() => _replaceArray(project, 'sites', [...(project.sites || []), newSite]));
 
     if (kmlPath) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: kmlPath, isExternal: false });
@@ -195,19 +222,15 @@ export async function saveSite(siteName, kmlFile, clusters) {
 export async function saveRoute(routeData) {
     const project = _requireActiveProject();
 
-    const newRoute = {
+    const newRoute = touch({
         ...routeData,
         id        : crypto.randomUUID(),
         projectId : project.id,
         created_by: getUserEmail() || null,
         timestamp : new Date().toISOString()
-    };
+    });
 
-    if (!project.routes) project.routes = [];
-    project.routes.push(newRoute);
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() => _replaceArray(project, 'routes', [...(project.routes || []), newRoute]));
 
     return newRoute;
 }
@@ -216,7 +239,7 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
     const project       = _requireActiveProject();
     const projectFolder = getProjectFolderName(project);
 
-    const route = (project.routes || []).find(r => r.id === routeId);
+    const route = (project.routes || []).find(r => r.id === routeId && !isDeleted(r));
     if (!route) throw new Error(`Route "${routeId}" not found.`);
 
     const annId    = crypto.randomUUID();
@@ -234,7 +257,7 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
     }
 
     const now = new Date().toISOString();
-    const annotation = {
+    const annotation = touch({
         id                   : annId,
         latitude             : data.latitude  ?? data.lat,
         longitude            : data.longitude ?? data.lng,
@@ -243,14 +266,16 @@ export async function saveRouteAnnotation(routeId, data, imageBlob, audioBlob) {
         image_local_filename : imgPath,
         audio_local_filename : audioPath,
         timestamp            : now,
-    };
+    });
 
-    if (!route.annotations) route.annotations = [];
-    route.annotations.push(annotation);
-    route.timestamp = now;
+    const updatedRoute = touch({
+        ...route,
+        annotations: [...(route.annotations || []), annotation],
+    });
 
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'routes', project.routes.map(r => (r === route ? updatedRoute : r)))
+    );
 
     if (imgPath)   EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: imgPath,   isExternal: false });
     if (audioPath) EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: audioPath, isExternal: false });
@@ -262,10 +287,15 @@ export async function deleteRouteAnnotation(routeId, annId) {
     const project = _requireActiveProject();
     const route   = (project.routes || []).find(r => r.id === routeId);
     if (!route?.annotations) return;
-    route.annotations = route.annotations.filter(a => a.id !== annId);
-    route.timestamp = new Date().toISOString();
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+
+    const updatedRoute = touch({
+        ...route,
+        annotations: route.annotations.map(a => (a.id === annId && !isDeleted(a) ? tombstone(a) : a)),
+    });
+
+    await _commit(() =>
+        _replaceArray(project, 'routes', project.routes.map(r => (r === route ? updatedRoute : r)))
+    );
 }
 
 export async function saveExternalFile(fileObj, spotIds, importDate) {
@@ -287,7 +317,7 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
         ? importDate.toISOString()
         : new Date().toISOString();
 
-    const newFileEntry = {
+    const newFileEntry = touch({
         id           : crypto.randomUUID(),
         name         : fileObj.name,
         type         : fileObj.type,
@@ -296,13 +326,11 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
         timestamp,
         sync_status  : 'pending',
         local_path   : savedPath
-    };
+    });
 
-    if (!project.external_files) project.external_files = [];
-    project.external_files.push(newFileEntry);
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'external_files', [...(project.external_files || []), newFileEntry])
+    );
 
     if (savedPath) {
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, relPath: savedPath, isExternal: true });
@@ -314,40 +342,50 @@ export async function saveExternalFile(fileObj, spotIds, importDate) {
 export async function deleteSpot(spotId) {
     const project = _requireActiveProject();
     if (!project.spots) return;
-    project.spots = project.spots.filter(s => s.spotId !== spotId);
-    if (project.external_files) {
-        project.external_files = project.external_files.filter(f => {
-            if (!f.linked_spots) return true;
-            f.linked_spots = f.linked_spots.filter(id => id !== spotId);
-            return f.linked_spots.length > 0;
-        });
-    }
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+
+    const nextSpots = project.spots.map(s =>
+        s.spotId === spotId && !isDeleted(s) ? tombstone(s) : s
+    );
+
+    const nextFiles = (project.external_files || []).map(f => {
+        if (isDeleted(f) || !f.linked_spots?.includes(spotId)) return f;
+        const remaining = f.linked_spots.filter(id => id !== spotId);
+        if (remaining.length === 0) return tombstone(f);
+        return touch({ ...f, linked_spots: remaining });
+    });
+
+    await _commit(() => {
+        const undoSpots = _replaceArray(project, 'spots', nextSpots);
+        const undoFiles = _replaceArray(project, 'external_files', nextFiles);
+        return () => { undoSpots(); undoFiles(); };
+    });
 }
 
 export async function deleteSite(siteId) {
     const project = _requireActiveProject();
     if (!project.sites) return;
-    project.sites = project.sites.filter(s => s.id !== siteId);
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'sites',
+            project.sites.map(s => (s.id === siteId && !isDeleted(s) ? tombstone(s) : s)))
+    );
 }
 
 export async function deleteRoute(routeId) {
     const project = _requireActiveProject();
     if (!project.routes) return;
-    project.routes = project.routes.filter(r => r.id !== routeId);
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'routes',
+            project.routes.map(r => (r.id === routeId && !isDeleted(r) ? tombstone(r) : r)))
+    );
 }
 
 export async function deleteExternalFile(fileId) {
     const project = _requireActiveProject();
     if (!project.external_files) return;
-    project.external_files = project.external_files.filter(f => f.id !== fileId);
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'external_files',
+            project.external_files.map(f => (f.id === fileId && !isDeleted(f) ? tombstone(f) : f)))
+    );
 }
 
 export async function deleteJob(jobId, currentStatus) {
@@ -377,21 +415,26 @@ export async function deleteJob(jobId, currentStatus) {
         }
     } catch { }
 
+    if (project.jobs?.some(j => j.job_id === jobId && !isDeleted(j))) {
+        await _commit(() =>
+            _replaceArray(project, 'jobs',
+                project.jobs.map(j => (j.job_id === jobId && !isDeleted(j) ? tombstone(j) : j)))
+        );
+    }
+
     return deleted;
 }
 
 export async function saveExternalFileByReference(fileName, filePath, fileType, spotIds, importDate) {
     const project = _requireActiveProject();
 
-    if (!project.external_files) project.external_files = [];
-
-    if (project.external_files.some(f => f.local_path === filePath)) return null;
+    if ((project.external_files || []).some(f => !isDeleted(f) && f.local_path === filePath)) return null;
 
     const timestamp = (importDate instanceof Date)
         ? importDate.toISOString()
         : new Date().toISOString();
 
-    const newFileEntry = {
+    const newFileEntry = touch({
         id           : crypto.randomUUID(),
         name         : fileName,
         type         : fileType,
@@ -401,12 +444,11 @@ export async function saveExternalFileByReference(fileName, filePath, fileType, 
         sync_status  : 'reference',
         local_path   : filePath,
         is_reference : true
-    };
+    });
 
-    project.external_files.push(newFileEntry);
-
-    await MasterData.saveMasterData();
-    EventBus.emit(EVENTS.DATA_UPDATED);
+    await _commit(() =>
+        _replaceArray(project, 'external_files', [...(project.external_files || []), newFileEntry])
+    );
 
     return newFileEntry;
 }
@@ -418,10 +460,11 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
         ? importDate.toISOString()
         : new Date().toISOString();
 
-    if (!project.external_files) project.external_files = [];
-
     const existingPaths = new Set(
-        project.external_files.map(f => f.local_path).filter(Boolean)
+        (project.external_files || [])
+            .filter(f => !isDeleted(f))
+            .map(f => f.local_path)
+            .filter(Boolean)
     );
 
     const entries = [];
@@ -434,7 +477,7 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
         if (existingPaths.has(path)) { skipped++; continue; }
         existingPaths.add(path);
 
-        const entry = {
+        entries.push(touch({
             id           : crypto.randomUUID(),
             name,
             type,
@@ -444,9 +487,7 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
             sync_status  : 'reference',
             local_path   : path,
             is_reference : true
-        };
-        project.external_files.push(entry);
-        entries.push(entry);
+        }));
 
         if (onProgress && (i % 200 === 0 || i === total - 1)) {
             onProgress(i + 1, total);
@@ -455,8 +496,9 @@ export async function saveExternalFilesByReferenceBatch(fileDescriptors, spotIds
     }
 
     if (entries.length > 0) {
-        await MasterData.saveMasterData();
-        EventBus.emit(EVENTS.DATA_UPDATED);
+        await _commit(() =>
+            _replaceArray(project, 'external_files', [...(project.external_files || []), ...entries])
+        );
     }
 
     return entries;
@@ -477,11 +519,9 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
         ? importDate.toISOString()
         : new Date().toISOString();
 
-    if (!project.external_files) project.external_files = [];
-
     const existingNames = new Set(
-        project.external_files
-            .filter(f => !f.is_reference && f.linked_spots?.includes(primarySpotId))
+        (project.external_files || [])
+            .filter(f => !isDeleted(f) && !f.is_reference && f.linked_spots?.includes(primarySpotId))
             .map(f => f.name)
     );
 
@@ -504,7 +544,7 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
                 const { file, idx } = queue.shift();
                 const savedPath = await StorageAdapter.saveFile(file, file.name, pathArray);
 
-                entries[idx] = {
+                entries[idx] = touch({
                     id           : crypto.randomUUID(),
                     name         : file.name,
                     type         : file.type,
@@ -513,7 +553,7 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
                     timestamp,
                     sync_status  : 'pending',
                     local_path   : savedPath
-                };
+                });
 
                 processed++;
                 if (onProgress) onProgress(processed, total);
@@ -523,17 +563,15 @@ export async function saveExternalFilesBatch(files, spotIds, importDate, onProgr
 
     await Promise.all(workers);
 
-    for (const entry of entries) {
-        if (entry) project.external_files.push(entry);
-    }
-
-    if (total > 0) {
-        await MasterData.saveMasterData();
-        EventBus.emit(EVENTS.DATA_UPDATED);
+    const saved = entries.filter(Boolean);
+    if (saved.length > 0) {
+        await _commit(() =>
+            _replaceArray(project, 'external_files', [...(project.external_files || []), ...saved])
+        );
         EventBus.emit(EVENTS.MEDIA_SAVED, { projectId: project.id, isExternal: true, batch: true });
     }
 
-    return entries.filter(Boolean);
+    return saved;
 }
 
 export async function getLocalFileUrl(relativePath) {
@@ -604,8 +642,8 @@ export async function getAllJobs() {
 
     // The four folders are listed concurrently, so if the watcher moves a job
     // (queue→processing→completed/failed) between two listings, the same job_id
-    // can be read from two folders. Dedup, keeping the most-advanced status —
-    // moves only ever go forward — so a row never doubles or shows a stale state.
+    // can be read from two folders. Dedup, keeping the most-advanced status -
+    // moves only ever go forward - so a row never doubles or shows a stale state.
     const STATUS_RANK = { queue: 0, processing: 1, failed: 2, completed: 3 };
     const byId = new Map();
     for (const job of jobs) {
@@ -694,34 +732,44 @@ export async function checkDependencyExists(scriptName, cacheKey) {
     return !!(cache[scriptName] && cache[scriptName][cacheKey]);
 }
 
+// Pushes the local master to Drive. Throws on failure so callers (SyncEngine)
+// keep the dirty flag and retry. Refuses to overwrite a remote master that
+// moved since we last saw it - that raises the MASTER_SYNC_CONFLICT flow.
 export async function pushMasterToDrive() {
     const token = getAccessToken();
-    if (!token) return;
+    if (!token) throw new Error('Not signed in - cannot push master to Drive.');
 
-    try {
-        const rootFolderId = await findOrCreateRootFolder();
-        const state        = MasterData.getLocalState();
-        const cleanState = {
-            ...state,
-            projects: (state.projects || []).filter(p => !p.shared?.isImported),
-        };
-        const blob = new Blob(
-            [JSON.stringify(cleanState, null, 2)],
-            { type: 'application/json' }
-        );
+    const rootFolderId = await findOrCreateRootFolder();
+    const remote       = await findFileByName('master_data.json', rootFolderId);
 
-        await upsertFile('master_data.json', rootFolderId, blob, 'application/json', 'master_data.json');
-    } catch (e) {
-        console.error('Repository.pushMasterToDrive: auto-push failed (offline?):', e);
+    const known = getKnownRemoteMasterTime();
+    if (remote && known && remote.modifiedTime && remote.modifiedTime !== known) {
+        await raiseRemoteConflict(remote);
+        throw new Error('Remote master changed since last sync - conflict raised instead of overwriting.');
     }
 
-    try {
-        const activeProject = MasterData.getActiveProject();
-        if (activeProject) {
-            await pushProjectDataToDrive(activeProject);
-        }
-    } catch (e) {
-        console.error('Repository.pushMasterToDrive: project_data push failed:', e);
+    const state = MasterData.getLocalState();
+    const cleanState = {
+        ...state,
+        projects: (state.projects || []).filter(p => !p.shared?.isImported),
+    };
+    const blob = new Blob(
+        [JSON.stringify(cleanState, null, 2)],
+        { type: 'application/json' }
+    );
+
+    if (remote) {
+        await updateDriveFile(remote.id, blob);
+    } else {
+        await upsertFile('master_data.json', rootFolderId, blob, 'application/json', 'master_data.json');
+    }
+
+    const fresh = await findFileByName('master_data.json', rootFolderId);
+    if (fresh?.modifiedTime) setKnownRemoteMasterTime(fresh.modifiedTime);
+
+    const activeProject = MasterData.getActiveProject();
+    if (activeProject) {
+        await pushProjectDataToDrive(activeProject);
     }
 }
 
@@ -746,10 +794,10 @@ export async function pushProjectDataToDrive(project) {
             if (existing) {
                 try {
                     const remote = JSON.parse(await readDriveTextFile(existing.id));
-                    projectData.spots          = _mergeItemArray(projectData.spots,          remote.spots);
-                    projectData.routes         = _mergeItemArray(projectData.routes,         remote.routes);
-                    projectData.sites          = _mergeItemArray(projectData.sites,          remote.sites);
-                    projectData.jobs           = _mergeItemArray(projectData.jobs,           remote.jobs);
+                    projectData.spots          = mergeById(projectData.spots,          remote.spots);
+                    projectData.routes         = mergeById(projectData.routes,         remote.routes);
+                    projectData.sites          = mergeById(projectData.sites,          remote.sites);
+                    projectData.jobs           = mergeById(projectData.jobs,           remote.jobs);
                 } catch { }
             }
 
@@ -767,5 +815,3 @@ export async function pushProjectDataToDrive(project) {
         console.error(`[Repository] pushProjectDataToDrive failed for "${project.name}":`, e);
     }
 }
-
-const _mergeItemArray = (a = [], b = []) => mergeById(a, b);

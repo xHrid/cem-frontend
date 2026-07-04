@@ -4,6 +4,8 @@ import * as MasterData from '../data/MasterData.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
+import { touch } from '../data/mergeUtils.js';
+import { enumerateFileRefs } from './ProjectFilesSync.js';
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 2000;
@@ -167,9 +169,9 @@ async function _processItem(item) {
             fileId = await _pushToOwnProjectFolder(project, relPath);
         }
 
-        if (isShared && fileId) {
-            await DriveService.makeFilePublic(fileId);
-            _recordDriveId(project, relPath, fileId);
+        if (fileId) {
+            if (isShared) await DriveService.makeFilePublic(fileId);
+            await _recordDriveId(project, relPath, fileId);
         }
 
         _stats.pushed++;
@@ -267,9 +269,8 @@ async function _pushToOwnProjectFolder(project, relPath) {
     return created.id;
 }
 
-function _recordDriveId(project, relPath, fileId) {
+async function _recordDriveId(project, relPath, fileId) {
     let changed = false;
-    const now = new Date().toISOString();
     for (const spot of (project.spots || [])) {
         const imgPaths = spot.images && spot.images.length > 0
             ? spot.images
@@ -281,41 +282,79 @@ function _recordDriveId(project, relPath, fileId) {
             if (spot.image_drive_ids[imgIdx] !== fileId) {
                 spot.image_drive_ids[imgIdx] = fileId;
                 if (imgIdx === 0) spot.image_drive_id = fileId;
-                spot.updated_at = now;
+                touch(spot);
                 changed = true;
             }
         }
         if (spot.audio_local_filename === relPath && spot.audio_drive_id !== fileId) {
-            spot.audio_drive_id = fileId; spot.updated_at = now; changed = true;
+            spot.audio_drive_id = fileId; touch(spot); changed = true;
         }
     }
     for (const site of (project.sites || [])) {
         if (site.kml_filename === relPath && site.kml_drive_id !== fileId) {
-            site.kml_drive_id = fileId; site.updated_at = now; changed = true;
+            site.kml_drive_id = fileId; touch(site); changed = true;
         }
     }
     for (const route of (project.routes || [])) {
         for (const a of (route.annotations || [])) {
             if (a.image_local_filename === relPath && a.image_drive_id !== fileId) {
-                a.image_drive_id = fileId; route.updated_at = now; changed = true;
+                a.image_drive_id = fileId; touch(a); touch(route); changed = true;
             }
             if (a.audio_local_filename === relPath && a.audio_drive_id !== fileId) {
-                a.audio_drive_id = fileId; route.updated_at = now; changed = true;
+                a.audio_drive_id = fileId; touch(a); touch(route); changed = true;
             }
         }
     }
     for (const job of (project.jobs || [])) {
         if (job.job_file === relPath && job.job_file_drive_id !== fileId) {
-            job.job_file_drive_id = fileId; job.updated_at = now; changed = true;
+            job.job_file_drive_id = fileId; touch(job); changed = true;
         }
         for (const rf of (job.result_files || [])) {
             if (rf.rel_path === relPath && rf.drive_id !== fileId) {
-                rf.drive_id = fileId; job.updated_at = now; changed = true;
+                rf.drive_id = fileId; touch(job); changed = true;
             }
         }
     }
     if (changed) {
-        MasterData.saveMasterData();
+        await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
     }
+}
+
+// Synchronously push every locally-referenced file that has no drive_id yet.
+// Called before a pull replaces local state, so the pull can never orphan the
+// only copy of a file.
+export async function uploadLocalOnlyMedia() {
+    if (!getAccessToken()) return 0;
+
+    const state = MasterData.getLocalState();
+    let uploaded = 0;
+
+    for (const project of (state.projects || [])) {
+        const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
+        if (project.shared?.isImported && !isImportedEditor) continue;
+
+        for (const ref of enumerateFileRefs(project)) {
+            if (ref.driveId) continue;
+            let exists = false;
+            try { exists = await StorageAdapter.checkFileExists(ref.relPath); } catch { }
+            if (!exists) continue;
+
+            try {
+                const fileId = isImportedEditor
+                    ? await _pushToSharedFolder(project, ref.relPath)
+                    : await _pushToOwnProjectFolder(project, ref.relPath);
+                if (fileId) {
+                    if (isImportedEditor || project.sharing?.isShared) {
+                        await DriveService.makeFilePublic(fileId);
+                    }
+                    await _recordDriveId(project, ref.relPath, fileId);
+                    uploaded++;
+                }
+            } catch (e) {
+                console.warn(`[SharedMediaSync] pre-pull upload failed "${ref.relPath}":`, e.message);
+            }
+        }
+    }
+    return uploaded;
 }

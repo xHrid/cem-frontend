@@ -2,7 +2,7 @@ import EventBus, { EVENTS } from './EventBus.js';
 import Config               from './Config.js';
 
 import { initAuth, requestLogin }      from '../services/AuthService.js';
-import { initStorage, checkFileExists, saveFile, getStorageEstimate } from '../data/StorageAdapter.js';
+import { initStorage, getFileBlob, saveFile, getStorageEstimate } from '../data/StorageAdapter.js';
 import { ensureMasterJson }            from '../data/MasterData.js';
 import { initSyncEngine, onAuthReady } from '../services/SyncEngine.js';
 import { initSyncPanel }               from '../ui/SyncPanel.js';
@@ -88,14 +88,16 @@ function _fmtBytes(n) {
 
 async function _ensureWatcherScript() {
     try {
-        const exists = await checkFileExists('watcher.py');
-        if (!exists) {
-            const response = await fetch('./watcher.py');
-            if (!response.ok) throw new Error(`Server returned ${response.status}`);
-            const pythonCode = await response.text();
-            const blob = new Blob([pythonCode], { type: 'text/plain' });
-            await saveFile(blob, 'watcher.py', []);
-        }
+        const response = await fetch('./watcher.py');
+        if (!response.ok) throw new Error(`Server returned ${response.status}`);
+        const pythonCode = await response.text();
+
+        const existing = await getFileBlob('watcher.py');
+        const currentCode = existing ? await existing.text() : null;
+        if (currentCode === pythonCode) return;
+
+        const blob = new Blob([pythonCode], { type: 'text/plain' });
+        await saveFile(blob, 'watcher.py', []);
     } catch (e) {
         console.warn('[App] Could not inject watcher.py:', e);
     }

@@ -1,4 +1,5 @@
 import * as StorageAdapter from './StorageAdapter.js';
+import { mergeMasterData, isDeleted } from './mergeUtils.js';
 
 let masterData = {
     currentProjectId : null,
@@ -9,6 +10,9 @@ let masterData = {
 let remoteMasterCache = null;
 
 export async function ensureMasterJson() {
+    // getMasterData throws on unreadable/corrupt content (it only returns null
+    // when the file is genuinely absent), so a read failure propagates to the
+    // caller instead of being papered over with a fresh empty master.
     const data = await StorageAdapter.getMasterData();
 
     if (data && !data.projects) {
@@ -58,22 +62,46 @@ export async function ensureMasterJson() {
     }
 }
 
-export async function saveMasterData() {
-    await StorageAdapter.saveMasterData(masterData);
+// Single-flight write queue: at most one write in flight, at most one queued.
+// Every write serializes the state at write time, so N mutations coalesce into
+// the in-flight write plus one trailing write of the latest state.
+let _inflightSave = null;
+let _queuedSave   = null;
+
+export function saveMasterData() {
+    if (_queuedSave) return _queuedSave;
+    if (_inflightSave) {
+        _queuedSave = _inflightSave
+            .catch(() => {})
+            .then(() => {
+                _queuedSave = null;
+                return _runSave();
+            });
+        return _queuedSave;
+    }
+    return _runSave();
+}
+
+function _runSave() {
+    _inflightSave = StorageAdapter.saveMasterData(masterData)
+        .finally(() => { _inflightSave = null; });
+    return _inflightSave;
 }
 
 export function generateDataSignature(data) {
     if (!data || !data.projects) return 'empty';
 
+    const sig = it => `${it.rev || 0}_${it.timestamp || ''}_${it.updated_at || ''}${it.deleted ? '_D' : ''}`;
+
     return data.projects
         .map(p => {
-            const spots  = (p.spots          || []).map(s => `${s.spotId}_${s.timestamp}_${s.updated_at || ''}`).sort().join(',');
-            const sites  = (p.sites          || []).map(s => `${s.id}_${s.timestamp}_${s.updated_at || ''}`).sort().join(',');
-            const routes = (p.routes         || []).map(r => `${r.id}_${r.timestamp}_${r.updated_at || ''}`).sort().join(',');
-            const files  = (p.external_files || []).map(f => `${f.id}_${f.timestamp}_${f.updated_at || ''}`).sort().join(',');
-            const jobs   = (p.jobs           || []).map(j => `${j.job_id}_${j.status || ''}`).sort().join(',');
+            const spots  = (p.spots          || []).map(s => `${s.spotId}_${sig(s)}`).sort().join(',');
+            const sites  = (p.sites          || []).map(s => `${s.id}_${sig(s)}`).sort().join(',');
+            const routes = (p.routes         || []).map(r => `${r.id}_${sig(r)}`).sort().join(',');
+            const files  = (p.external_files || []).map(f => `${f.id}_${sig(f)}`).sort().join(',');
+            const jobs   = (p.jobs           || []).map(j => `${j.job_id}_${j.status || ''}_${sig(j)}`).sort().join(',');
 
-            return `Project:${p.id}_${p.name}|Spots:${spots}|Sites:${sites}|Routes:${routes}|Jobs:${jobs}|Files:${files}`;
+            return `Project:${p.id}_${p.name}_${p.rev || 0}|Spots:${spots}|Sites:${sites}|Routes:${routes}|Jobs:${jobs}|Files:${files}`;
         })
         .sort()
         .join('||');
@@ -90,6 +118,26 @@ export function getMasterData() {
 export async function replaceState(newData) {
     masterData = newData;
     await saveMasterData();
+}
+
+// Fold the persisted state (possibly written by another tab) into memory.
+// Never writes; the caller decides whether a save/push follows.
+export async function rehydrate() {
+    let disk = null;
+    try {
+        disk = await StorageAdapter.getMasterData();
+    } catch (e) {
+        console.warn('[MasterData] rehydrate skipped, master unreadable:', e.message);
+        return false;
+    }
+    if (!disk?.projects) return false;
+
+    const before = generateDataSignature(masterData);
+    masterData = mergeMasterData(masterData, disk);
+    if (!masterData.projects.find(p => p.id === masterData.currentProjectId)) {
+        masterData.currentProjectId = masterData.projects[0]?.id || null;
+    }
+    return generateDataSignature(masterData) !== before;
 }
 
 export function getActiveProject() {
@@ -109,20 +157,22 @@ export function setCurrentProjectId(id) {
     masterData.currentProjectId = id;
 }
 
+const _live = arr => (arr || []).filter(it => !isDeleted(it));
+
 export function getSpots() {
-    return getActiveProject()?.spots || [];
+    return _live(getActiveProject()?.spots);
 }
 
 export function getRoutes() {
-    return getActiveProject()?.routes || [];
+    return _live(getActiveProject()?.routes);
 }
 
 export function getSites() {
-    return getActiveProject()?.sites || [];
+    return _live(getActiveProject()?.sites);
 }
 
 export function getExternalFiles() {
-    return getActiveProject()?.external_files || [];
+    return _live(getActiveProject()?.external_files);
 }
 
 export function getRemoteMasterCache() {

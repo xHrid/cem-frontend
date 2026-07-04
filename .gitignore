@@ -1,15 +1,39 @@
-# .gitignore
-
+# ---- Runtime project data ----
 master_data.json
 media/
 spots/
 sites/
-cloudflare-proxy/
 
-# 2. Ignore System Files
-.DS_Store
-Thumbs.db
+# ---- Secrets / generated config ----
 js/core/Config.js
 
-.gitignore
-FILE_MAP.md
+# ---- Cloudflare proxy (build + deps) ----
+cloudflare-proxy/
+.wrangler/
+
+# ---- Logs ----
+logs/
+*.log
+
+# ---- Tests ----
+tests/
+
+# ---- Docs ----
+*.md
+
+# ---- Dependencies / build ----
+node_modules/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- Caches ----
+.pytest_cache/
+.ruff_cache/
+
+# ---- OS / editor / system files ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

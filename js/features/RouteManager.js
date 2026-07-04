@@ -12,6 +12,7 @@ import { showToast }            from '../ui/Toast.js';
 import { openModal, closeModal } from '../ui/ModalManager.js';
 import { downscaleImage }       from '../data/imageUtils.js';
 import { downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
+import { escapeHtml } from '../core/escape.js';
 
 let _routePoints = [];
 let _routePolyline = null;
@@ -29,6 +30,7 @@ let _annotationTarget = null;
 let _lastProjectId = null;
 
 let _mediaRecorder = null;
+let _micStream = null;
 let _audioChunks = [];
 let _recordedAudioBlob = null;
 
@@ -98,6 +100,9 @@ async function _handleRouteFormSubmit(e) {
         return;
     }
 
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
+
     try {
         const newRoute = await saveRoute({ name, points: _dedupePoints(_routePoints) });
         showToast('Route saved locally.', 'success');
@@ -139,6 +144,8 @@ async function _handleRouteFormSubmit(e) {
     } catch (err) {
         console.error('[RouteManager] saveRoute failed:', err);
         showToast(`Error saving route: ${err.message}`, 'failed');
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
     }
 }
 
@@ -191,7 +198,7 @@ export function displayRoutes() {
             opacity: 0.85,
         }).addTo(_routesLayer);
 
-        line.bindTooltip(route.name || 'Route', { sticky: true });
+        line.bindTooltip(escapeHtml(route.name || 'Route'), { sticky: true });
 
         line.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
@@ -207,7 +214,7 @@ export function displayRoutes() {
                 radius: 7,
                 weight: 1,
             }).addTo(_routesLayer);
-            marker.bindTooltip(a.description ? a.description.slice(0, 40) : 'Observation', { direction: 'top' });
+            marker.bindTooltip(a.description ? escapeHtml(a.description.slice(0, 40)) : 'Observation', { direction: 'top' });
             marker.on('click', (e) => {
                 L.DomEvent.stopPropagation(e);
                 _showAnnotationDetails(route, a);
@@ -312,7 +319,7 @@ async function _handleAnnotationSubmit(e) {
                 L.circleMarker([lat, lng], {
                     color: '#000', fillColor: ANNOTATION_COLOR, fillOpacity: 0.9, radius: 7, weight: 1,
                 }).addTo(_liveAnnoLayer)
-                  .bindTooltip(desc ? desc.slice(0, 40) : 'Observation', { direction: 'top' });
+                  .bindTooltip(desc ? escapeHtml(desc.slice(0, 40)) : 'Observation', { direction: 'top' });
             }
             showToast('Pinned — saves with the route when you stop.', 'success');
         } else {
@@ -345,7 +352,7 @@ async function _showAnnotationDetails(route, ann) {
     content.innerHTML = `
         <h2 style="margin-top:0;">Route observation</h2>
         <p style="font-size:0.85rem; color:var(--text-muted);">
-            ${route.name || 'Route'} — (${Number(ann.latitude).toFixed(5)}, ${Number(ann.longitude).toFixed(5)})<br>
+            ${escapeHtml(route.name || 'Route')} - (${Number(ann.latitude).toFixed(5)}, ${Number(ann.longitude).toFixed(5)})<br>
             <small>${new Date(ann.timestamp || Date.now()).toLocaleString()}</small>
         </p>
         <p><strong>Description:</strong> <span id="route-ann-desc-view"></span></p>
@@ -458,6 +465,7 @@ function _bindAnnotationAudioToggle() {
 async function _startAnnotationRecording() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        _micStream = stream;
         _audioChunks = [];
         _recordedAudioBlob = null;
         _mediaRecorder = new MediaRecorder(stream);
@@ -466,18 +474,31 @@ async function _startAnnotationRecording() {
             _recordedAudioBlob = new Blob(_audioChunks, { type: 'audio/webm' });
             const pb = document.getElementById('route-ann-playback');
             if (pb) pb.src = URL.createObjectURL(_recordedAudioBlob);
+            _stopMicStream();
         };
         _mediaRecorder.start();
     } catch (err) {
         showToast(`Mic error: ${err.message}`, 'failed');
         _mediaRecorder = null;
+        _stopMicStream();
+    }
+}
+
+function _stopMicStream() {
+    if (_micStream) {
+        _micStream.getTracks().forEach(t => t.stop());
+        _micStream = null;
     }
 }
 
 function _resetAnnotationAudio() {
+    if (_mediaRecorder && _mediaRecorder.state !== 'inactive') _mediaRecorder.stop();
+    _stopMicStream();
     _recordedAudioBlob = null;
     _mediaRecorder = null;
     _audioChunks = [];
+    const toggle = document.getElementById('route-ann-audio-toggle');
+    if (toggle) toggle.style.backgroundColor = '';
 }
 
 function _openRoutePanel() {
@@ -485,6 +506,7 @@ function _openRoutePanel() {
     document.body.classList.add('panel-open');
 }
 function _closeRoutePanel() {
+    _resetAnnotationAudio();
     document.getElementById('route-side-panel')?.classList.remove('open');
     document.body.classList.remove('panel-open');
 }

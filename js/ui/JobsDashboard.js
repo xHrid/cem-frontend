@@ -9,6 +9,7 @@ import { openModal, closeModal } from './ModalManager.js';
 import { getActiveProject } from '../data/MasterData.js';
 import { revokeObjectUrls } from '../data/StorageAdapter.js';
 import { recordCompletedJobs, downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
+import { escapeHtml as _escapeHtml } from '../core/escape.js';
 
 const els = {
     popup              : null,
@@ -88,7 +89,7 @@ async function _loadJobsSidebar() {
 
         const project = getActiveProject();
         const sharedJobs = (project?.jobs || [])
-            .filter(j => !localIds.has(j.job_id))
+            .filter(j => !j.deleted && !localIds.has(j.job_id))
             .map(j => ({
                 ...j,
                 job_name: j.job_name || j.job_id,
@@ -117,12 +118,12 @@ async function _loadJobsSidebar() {
             div.innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                     <div style="font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-dark); flex:1;">
-                        ${job.job_name || 'Unnamed Job'}
+                        ${_escapeHtml(job.job_name || 'Unnamed Job')}
                     </div>
                     <button class="delete-job-btn" title="Delete job" style="background:none; border:none; color:var(--danger-red); cursor:pointer; font-size:1rem; padding:2px 6px;">🗑</button>
                 </div>
                 <div style="display:flex; justify-content:space-between; font-size:0.78rem; color:var(--text-muted); margin-top:6px;">
-                    <span style="color:${color}; font-weight:700; letter-spacing:0.04em;">${job.current_status.toUpperCase()}</span>
+                    <span style="color:${color}; font-weight:700; letter-spacing:0.04em;">${_escapeHtml(String(job.current_status).toUpperCase())}</span>
                     <span style="font-family:var(--font-mono);">${new Date(job.created_at).toLocaleDateString()}</span>
                 </div>
             `;
@@ -224,7 +225,7 @@ async function _renderJobDetails(job, statusColor) {
 
     } else {
         els.viewerFileList.innerHTML =
-            `<span style='color:var(--text-muted);'>Job is currently ${job.current_status}. Files will appear when finished.</span>`;
+            `<span style='color:var(--text-muted);'>Job is currently ${_escapeHtml(String(job.current_status))}. Files will appear when finished.</span>`;
     }
 }
 
@@ -265,7 +266,7 @@ async function _previewFile(file) {
                 <div style="text-align:center;">
                     <img src="${url}" style="max-width:100%; max-height:500px; border:1px solid #ccc; border-radius:4px;">
                     <div style="margin-top:15px;">
-                        <a href="${url}" download="${file.name}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download Image</a>
+                        <a href="${url}" download="${_escapeHtml(file.name)}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download Image</a>
                     </div>
                 </div>
             `;
@@ -295,14 +296,14 @@ async function _previewFile(file) {
                 if (text.split('\n').length > 50) {
                     html += "<p style='color:var(--text-muted); font-size:0.8rem; margin-top:10px;'>Showing first 50 rows...</p>";
                 }
-                html += `<div style="margin-top:15px;"><a href="${url}" download="${file.name}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download Full CSV</a></div>`;
+                html += `<div style="margin-top:15px;"><a href="${url}" download="${_escapeHtml(file.name)}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download Full CSV</a></div>`;
                 els.viewerPreview.innerHTML = html;
 
             } else {
                 els.viewerPreview.innerHTML = `
                     <pre style="background:#2d2d2d; color:#f8f8f2; padding:15px; overflow:auto; max-height:400px; font-size:0.85rem; border-radius:4px; white-space:pre-wrap;">${_escapeHtml(text)}</pre>
                     <div style="margin-top:15px;">
-                        <a href="${url}" download="${file.name}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download File</a>
+                        <a href="${url}" download="${_escapeHtml(file.name)}" style="padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download File</a>
                     </div>
                 `;
             }
@@ -312,7 +313,7 @@ async function _previewFile(file) {
         els.viewerPreview.innerHTML = `
             <div style="text-align:center; padding:40px;">
                 <p>Preview not available for this file type.</p>
-                <a href="${url}" download="${file.name}" style="display:inline-block; margin-top:10px; padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download File</a>
+                <a href="${url}" download="${_escapeHtml(file.name)}" style="display:inline-block; margin-top:10px; padding:8px 16px; background:#4285F4; color:white; text-decoration:none; border-radius:4px;">Download File</a>
             </div>
         `;
 
@@ -330,13 +331,4 @@ function _statusColor(status) {
         queue      : '#6c757d',
     };
     return map[status] || '#6c757d';
-}
-
-function _escapeHtml(str) {
-    return str
-        .replace(/&/g,  '&amp;')
-        .replace(/</g,  '&lt;')
-        .replace(/>/g,  '&gt;')
-        .replace(/"/g,  '&quot;')
-        .replace(/'/g,  '&#39;');
 }

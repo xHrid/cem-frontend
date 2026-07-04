@@ -2,12 +2,14 @@ import { saveSite, deleteSite } from '../data/Repository.js';
 import { showToast }            from '../ui/Toast.js';
 import { closeModal, openModal } from '../ui/ModalManager.js';
 import { getMap }               from './MapManager.js';
-import { getActiveProject, getSites } from '../data/MasterData.js';
+import { getActiveProject, getSites, saveMasterData } from '../data/MasterData.js';
+import { getProjectFolderName } from '../data/projectUtils.js';
 import * as StorageAdapter      from '../data/StorageAdapter.js';
 import EventBus, { EVENTS }     from '../core/EventBus.js';
 import Config                   from '../core/Config.js';
 import { isConfigured as serverConfigured } from '../services/ServerService.js';
 import { authHeaders } from '../services/AuthService.js';
+import { escapeHtml } from '../core/escape.js';
 
 const _layers = new Map();
 
@@ -48,7 +50,7 @@ function _addOutline(siteId, coords, siteName, fitBounds = false) {
     }
 
     const polygon = L.polygon(coords, OUTLINE_STYLE);
-    polygon.bindTooltip(siteName, { sticky: true, className: 'site-tooltip' });
+    polygon.bindTooltip(escapeHtml(siteName), { sticky: true, className: 'site-tooltip' });
     polygon.addTo(map);
     _layers.set(siteId, polygon);
     _visible.set(siteId, true);
@@ -159,6 +161,7 @@ function _clearAllLayers() {
 
 async function _loadProjectSites() {
     _clearAllLayers();
+    _clearStrat();
 
     const sites = getSites();
     if (!sites || sites.length === 0) {
@@ -182,12 +185,40 @@ async function _loadProjectSites() {
     }
 
     _renderSiteList();
+    await _reloadStratOverlays(sites);
+}
+
+async function _reloadStratOverlays(sites) {
+    const counts = [];
+    for (const site of sites) {
+        for (const ov of (site.strat_overlays || [])) {
+            if (!ov.rel_path || !ov.bounds) continue;
+            const blob = await StorageAdapter.getFileBlob(ov.rel_path);
+            if (!blob) continue;
+            const url = URL.createObjectURL(blob);
+            _stratUrls.push(url);
+            const bounds = L.latLngBounds(
+                [ov.bounds[0][0], ov.bounds[0][1]],
+                [ov.bounds[1][0], ov.bounds[1][1]],
+            );
+            _stratLayers[ov.cluster_count] = L.imageOverlay(url, bounds, { opacity: 0.7, interactive: false });
+            counts.push(ov.cluster_count);
+        }
+    }
+
+    counts.sort((a, b) => a - b);
+    if (counts.length) {
+        const first = counts[0];
+        _setStratLayer(first);
+        _showStratPanel(counts, first);
+    }
 }
 
 let _pendingKmlFile = null;
 
 let _stratLayers = {};
 let _stratControl = null;
+let _stratUrls = [];
 
 function _clearStrat() {
     const map = getMap();
@@ -197,6 +228,8 @@ function _clearStrat() {
     _stratLayers = {};
     if (map && _stratControl) map.removeControl(_stratControl);
     _stratControl = null;
+    for (const url of _stratUrls) URL.revokeObjectURL(url);
+    _stratUrls = [];
 }
 
 function _setStratLayer(k) {
@@ -235,22 +268,25 @@ async function _handleSiteFormSubmit(e) {
     e.preventDefault();
     const form = e.target;
 
-    const name = (form.siteName?.value || '').trim();
-    if (!name) {
-        showToast('Please enter a site name.', 'failed');
-        return;
-    }
-
-    const fileInput = document.getElementById('kml-upload');
-    const file      = fileInput?.files?.[0] || null;
-    if (!file) {
-        showToast('Please select a KML file before submitting.', 'failed');
-        return;
-    }
+    const submitBtn = form.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
 
     const statusEl = document.getElementById('add-site-status');
 
     try {
+        const name = (form.siteName?.value || '').trim();
+        if (!name) {
+            showToast('Please enter a site name.', 'failed');
+            return;
+        }
+
+        const fileInput = document.getElementById('kml-upload');
+        const file      = fileInput?.files?.[0] || null;
+        if (!file) {
+            showToast('Please select a KML file before submitting.', 'failed');
+            return;
+        }
+
         if (statusEl) statusEl.textContent = 'Saving…';
 
         const coords = await _parseKmlCoords(file);
@@ -274,6 +310,7 @@ async function _handleSiteFormSubmit(e) {
         showToast(`Error saving site: ${err.message}`, 'failed');
     } finally {
         if (statusEl) statusEl.textContent = '';
+        if (submitBtn) submitBtn.disabled = false;
     }
 }
 
@@ -317,8 +354,12 @@ async function _runServerStratification(siteId) {
 
         if (statusEl) statusEl.textContent = `Downloading ${results.length} overlay(s)…`;
 
+        const project = getActiveProject();
+        const folder = getProjectFolderName(project);
+
         _clearStrat();
         const counts = [];
+        const overlayRefs = [];
         for (const r of results) {
             const imgUrl = `${base}/api/v1/stratify/overlay/${r.overlay_id}`;
             const imgResp = await fetch(imgUrl, {
@@ -328,15 +369,23 @@ async function _runServerStratification(siteId) {
 
             const blob = await imgResp.blob();
             const fname = `stratify_k${r.cluster_count}_${r.overlay_id}.png`;
-            await StorageAdapter.saveFile(blob, fname, ['stratification']);
+            const relPath = await StorageAdapter.saveFile(blob, fname, [folder, 'stratification']);
 
             const dataUrl = URL.createObjectURL(blob);
+            _stratUrls.push(dataUrl);
             const bounds = L.latLngBounds(
                 [r.bounds[0][0], r.bounds[0][1]],
                 [r.bounds[1][0], r.bounds[1][1]],
             );
             _stratLayers[r.cluster_count] = L.imageOverlay(dataUrl, bounds, { opacity: 0.7, interactive: false });
             counts.push(r.cluster_count);
+            overlayRefs.push({ cluster_count: r.cluster_count, rel_path: relPath, bounds: r.bounds });
+        }
+
+        const site = (project?.sites || []).find(s => s.id === siteId);
+        if (site) {
+            site.strat_overlays = overlayRefs;
+            await saveMasterData();
         }
 
         counts.sort((a, b) => a - b);
