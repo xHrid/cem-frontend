@@ -1,0 +1,19 @@
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cem-frontend:latest
+    container_name: cem-frontend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    volumes:
+      # Bind-mount the static files over the baked-in copy so a restart alone
+      # (no rebuild) picks up new code, matching the backend's pattern.
+      - ./index.html:/usr/share/nginx/html/index.html:ro
+      - ./js:/usr/share/nginx/html/js:ro
+      - ./styles:/usr/share/nginx/html/styles:ro
+      - ./leaflet:/usr/share/nginx/html/leaflet:ro
+      - ./images:/usr/share/nginx/html/images:ro
+      - ./watcher.py:/usr/share/nginx/html/watcher.py:ro
+    restart: unless-stopped
