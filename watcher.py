@@ -144,6 +144,12 @@ def build_logger(name: str = "cem_watcher") -> logging.Logger:
     if logger.handlers:
         return logger
 
+    # Windows consoles default stdout to cp1252, which can't encode the box-
+    # drawing/warning characters used in job-summary log lines and crashes the
+    # handler mid-run. Force UTF-8 so those lines print instead of erroring out.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+
     logger.setLevel(logging.DEBUG)
     handler = logging.StreamHandler(sys.stdout)
     handler.setLevel(logging.DEBUG)
@@ -442,7 +448,7 @@ class WatcherSetup:
 
     def sync_scripts(self) -> None:
         cfg = self.cfg
-        logger.info("Checking for script updates from %s…", cfg.github_ref)
+        logger.info("Checking for script updates from %s...", cfg.github_ref)
         cfg.scripts_path.mkdir(parents=True, exist_ok=True)
 
         try:
