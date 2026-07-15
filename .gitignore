@@ -37,3 +37,6 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+
+# ---- Watcher runtime (venv + synced scripts) ----
+system/

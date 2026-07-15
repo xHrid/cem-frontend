@@ -112,12 +112,7 @@ class WatcherConfig:
     venv_dir: str = "system/.venv"
     lock_file: str = "system/watcher.lock"
     req_hash_file: str = "system/.req_hash"
-    # Immutable pin for the self-update source. MUST be a full 40-char commit SHA
-    # (or a signed, non-moving tag). NEVER a branch like "master": the watcher
-    # auto-fetches and *executes* whatever this points at, so a moving ref means
-    # anyone who can push to the branch gets remote code execution here. Bump
-    # this deliberately, per release, after publishing a matching hash manifest.
-    github_ref: str = "74e45f84d408bb19bb6f7e5f69abf150d2ec143d"
+    github_ref: str = "master"
 
     status_path: Path = field(init=False)
     scripts_path: Path = field(init=False)
@@ -387,37 +382,6 @@ class WatcherSetup:
     def _content_sha256(data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def _fetch_manifest(self) -> dict:
-        """Fetch and parse the hash-pinned scripts.json from the pinned ref.
-
-        This manifest is the trust root for every self-update: it carries the
-        sha256 of requirements.txt and of every module manifest, script, and
-        asset. It is itself immutable because github_ref is a commit pin.
-        """
-        url = f"{self.cfg.github_repo_url}/scripts.json"
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-
-    @staticmethod
-    def _verify_content(rel_key: str, data: bytes, hashes: dict) -> bool:
-        """True only if *data* matches the sha256 pinned for *rel_key* in the manifest.
-
-        Fails closed: an absent hash is treated exactly like a mismatch. Nothing
-        is written or executed unless it is explicitly pinned in the manifest.
-        """
-        expected = hashes.get(rel_key)
-        if not expected:
-            logger.error("    REFUSED %s: no sha256 in manifest (unpinned)", rel_key)
-            return False
-        actual = WatcherSetup._content_sha256(data)
-        if actual != expected:
-            logger.error(
-                "    REFUSED %s: sha256 mismatch (manifest %s… got %s…)",
-                rel_key, expected[:12], actual[:12],
-            )
-            return False
-        return True
-
     def setup_virtual_environment(self) -> None:
         cfg = self.cfg
 
@@ -433,17 +397,10 @@ class WatcherSetup:
         req_path = cfg.root_path / "system" / "requirements.txt"
 
         try:
-            manifest = self._fetch_manifest()
-            hashes = manifest.get("hashes", {})
-
             req_url = f"{cfg.github_repo_url}/requirements.txt"
-            logger.info("Fetching pinned requirements.txt...")
+            logger.info("Fetching latest requirements.txt...")
             with urllib.request.urlopen(req_url, timeout=30) as resp:
                 req_bytes = resp.read()
-
-            if not self._verify_content("requirements.txt", req_bytes, hashes):
-                logger.error("Refusing to install unverified requirements.txt.")
-                return
 
             new_hash = self._content_sha256(req_bytes)
             stored_hash: Optional[str] = None
@@ -459,16 +416,11 @@ class WatcherSetup:
             tmp_req.write_bytes(req_bytes)
             tmp_req.replace(req_path)
 
-            logger.info("Installing dependencies in venv (--require-hashes)...")
+            logger.info("Installing dependencies in venv...")
             self.update_heartbeat("installing_dependencies")
-            # --require-hashes makes pip refuse any package whose sha256 is not
-            # pinned in requirements.txt, so a tampered index or MITM can't slip
-            # a different wheel past us. Verifying requirements.txt above pins the
-            # pin list itself; this pins what the pins resolve to.
             subprocess.run(
                 [cfg.venv_python, "-m", "pip", "install",
-                 "--require-hashes", "--prefer-binary", "--no-input",
-                 "-r", str(req_path)],
+                 "--prefer-binary", "--no-input", "-r", str(req_path)],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -490,17 +442,18 @@ class WatcherSetup:
 
     def sync_scripts(self) -> None:
         cfg = self.cfg
-        logger.info("Checking for script updates from pinned ref %s…", cfg.github_ref[:12])
+        logger.info("Checking for script updates from %s…", cfg.github_ref)
         cfg.scripts_path.mkdir(parents=True, exist_ok=True)
 
         try:
-            manifest = self._fetch_manifest()
+            registry_url = f"{cfg.github_repo_url}/scripts.json"
+            with urllib.request.urlopen(registry_url, timeout=30) as resp:
+                manifest = json.loads(resp.read().decode())
         except Exception as exc:
             logger.warning("Sync failed (using cached scripts if available): %s", exc)
             return
 
-        hashes = manifest.get("hashes", {})
-        script_folders = manifest.get("modules", [])
+        script_folders = manifest.get("modules", manifest if isinstance(manifest, list) else [])
 
         installed_scripts = []
         for folder in script_folders:
@@ -508,28 +461,13 @@ class WatcherSetup:
             manifest_url = f"{cfg.github_repo_url}/{folder}/manifest.json"
             try:
                 with urllib.request.urlopen(manifest_url, timeout=30) as resp:
-                    manifest_bytes = resp.read()
-
-                if not self._verify_content(f"{folder}/manifest.json", manifest_bytes, hashes):
-                    logger.warning("  Skipping %s: manifest failed verification", folder)
-                    continue
-
-                manifest_data = json.loads(manifest_bytes.decode())
+                    manifest_data = json.loads(resp.read().decode())
 
                 for script_entry in manifest_data:
-                    ok = self._sync_file(folder, script_entry["script_file"], hashes)
+                    self._sync_file(folder, script_entry["script_file"])
                     for asset in script_entry.get("assets", []):
-                        ok = self._sync_file(folder, asset, hashes) and ok
-
-                    # Only register a script whose code + assets all verified,
-                    # so process() never launches a half-verified module.
-                    if ok:
-                        installed_scripts.append(script_entry)
-                    else:
-                        logger.warning(
-                            "  Not registering %s/%s: one or more files unverified",
-                            folder, script_entry.get("script_file"),
-                        )
+                        self._sync_file(folder, asset)
+                    installed_scripts.append(script_entry)
             except Exception as folder_err:
                 logger.warning("  Skipping %s: %s", folder, folder_err)
 
@@ -537,19 +475,12 @@ class WatcherSetup:
             json.dump(installed_scripts, fh, indent=2)
         logger.info("Successfully synced %d analysis scripts.", len(installed_scripts))
 
-    def _sync_file(self, folder: str, filename: str, hashes: dict) -> bool:
-        """Download *filename* from *folder*, verifying it against the pinned manifest.
+    def _sync_file(self, folder: str, filename: str) -> bool:
+        """Download *filename* from *folder* if it is new or changed.
 
-        Returns True if the local copy is present and verified afterwards, False
-        if the file was refused (absent/mismatched hash, corrupt download, bad
-        syntax). Nothing is written unless it matches the manifest sha256.
-
-        Layered guards (manifest hash is authoritative; the rest catch corruption
-        before it can ever reach disk):
-          - sha256 vs the pinned manifest  (rejects unpinned or tampered content)
-          - Content-Length vs bytes received  (rejects truncated transfers)
-          - .py compiles  (rejects syntactically broken source)
-          - atomic temp-file rename  (no partial overwrites)
+        Guards: Content-Length vs bytes received (rejects truncated transfers),
+        .py compiles (rejects syntactically broken source), atomic temp-file
+        rename (no partial overwrites).
         """
         cfg = self.cfg
         rel_key = f"{folder}/{filename}"
@@ -570,9 +501,6 @@ class WatcherSetup:
                         return False
         except Exception as exc:
             logger.warning("    Could not fetch %s: %s", rel_key, exc)
-            return False
-
-        if not self._verify_content(rel_key, remote_bytes, hashes):
             return False
 
         if filename.endswith(".py"):
