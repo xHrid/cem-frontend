@@ -5,6 +5,12 @@ spots/
 sites/
 
 # ---- Secrets / generated config ----
+# docker-compose auto-loads .env from this directory, and generate_config.sh
+# reads GOOGLE_CLIENT_ID / PICKER_API_KEY from the environment.
+.env
+*.env
+.env.*
+!.env.example
 js/core/Config.js
 
 # ---- Cloudflare proxy (build + deps) ----

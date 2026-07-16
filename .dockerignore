@@ -1,4 +1,7 @@
 .git
+.env
+*.env
+.env.*
 master_data.json
 media/
 spots/
