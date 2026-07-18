@@ -104,7 +104,6 @@ def _count_audio_files(directory: str) -> int:
 class WatcherConfig:
     root_path: Path
     watch_interval: int = 2
-    job_timeout: int = 1800
     pip_timeout: Optional[int] = None
     heartbeat_file: str = "system/status.json"
     scripts_dir: str = "system/scripts"
@@ -159,59 +158,6 @@ def build_logger(name: str = "cem_watcher") -> logging.Logger:
     return logger
 
 logger = build_logger()
-
-def _spawn_new_group_kwargs() -> dict:
-    """Popen kwargs that isolate the child in its own process group / session.
-
-    A timeout must be able to signal the whole subtree — the ML script plus any
-    worker processes it forks — not just the direct child. Giving the child its
-    own group is what makes that possible.
-    """
-    if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
-
-def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Kill *proc* and every descendant it spawned, then reap it.
-
-    POSIX: the child leads its own session, so os.killpg on its group reaches all
-    forked workers — SIGTERM for a clean exit, then SIGKILL for anything left.
-    Windows: taskkill /T walks and kills the child's whole process tree.
-    Without this, killing only the direct child orphans its ML workers, which
-    keep running (and holding the GPU/CPU) after the job is marked failed.
-    """
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-        )
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        return
-
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return  # already gone
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    try:
-        proc.wait(timeout=10)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        logger.error("  Process group %d survived SIGKILL", pgid)
 
 class LockFile:
     """PID-based lock file.  Acquired on __enter__, released on __exit__."""
@@ -786,13 +732,12 @@ class JobProcessor:
                     cwd=str(script_path.parent),
                     text=True,
                     bufsize=1,
-                    **_spawn_new_group_kwargs(),
                 )
 
                 # Drain stdout on a background thread. Doing it inline blocks until
                 # the child *closes* stdout (i.e. exits), so a hung child that never
-                # exits would never reach proc.wait() and the timeout below would
-                # never fire — freezing the whole single-threaded watcher.
+                # exits would never reach proc.wait() and the heartbeat refresh below
+                # would never run — freezing the whole single-threaded watcher.
                 #
                 # Flushed per line (not just buffered to close) and teed to our own
                 # stdout so stdout.log is tailable and the watcher console shows the
@@ -810,17 +755,12 @@ class JobProcessor:
                 drain_thread = threading.Thread(target=_drain, daemon=True)
                 drain_thread.start()
 
-                # Wait in short slices so we can (a) enforce job_timeout even on a
-                # silently-hung child and (b) refresh the heartbeat so the UI sees
-                # the job as alive for its full (possibly long) duration.
-                deadline = start_time + cfg.job_timeout
+                # Wait in short slices (no deadline) so the heartbeat gets refreshed
+                # and the UI sees the job as alive for its full, unbounded duration.
                 try:
                     while True:
-                        remaining = deadline - time.time()
-                        if remaining <= 0:
-                            raise subprocess.TimeoutExpired(cmd, cfg.job_timeout)
                         try:
-                            proc.wait(timeout=min(remaining, _HEARTBEAT_REFRESH_SEC))
+                            proc.wait(timeout=_HEARTBEAT_REFRESH_SEC)
                             break
                         except subprocess.TimeoutExpired:
                             self.setup.update_heartbeat("processing_job")
@@ -865,16 +805,6 @@ class JobProcessor:
                     shutil.copy2(str(stdout_log_path), str(error_log))
                 raise RuntimeError("Script execution failed. Check error.log")
 
-        except subprocess.TimeoutExpired:
-            logger.error("  Job %s timed out after %ds", job_id, cfg.job_timeout)
-            if 'proc' in locals():
-                _kill_process_tree(proc)
-            self._write_failure_reason(
-                results_dir / job_id,
-                f"Job exceeded the time limit ({cfg.job_timeout}s) and was terminated.",
-            )
-            if processing_path.exists():
-                shutil.move(str(processing_path), str(failed_dir / job_file.name))
         except Exception as exc:
             logger.error("  Job failed: %s", exc)
             self._write_failure_reason(
@@ -1012,12 +942,6 @@ def parse_args() -> argparse.Namespace:
         help="Seconds between queue scans.",
     )
     parser.add_argument(
-        "--job-timeout",
-        type=int,
-        default=1800,
-        help="Maximum seconds a single job script may run before being killed.",
-    )
-    parser.add_argument(
         "--pip-timeout",
         type=int,
         default=None,
@@ -1030,7 +954,6 @@ def main() -> None:
     cfg = WatcherConfig(
         root_path=args.root_path.resolve(),
         watch_interval=args.watch_interval,
-        job_timeout=args.job_timeout,
         pip_timeout=args.pip_timeout,
     )
     Watcher(cfg).run()
