@@ -717,13 +717,23 @@ class JobProcessor:
             if ebird_file.exists():
                 cmd.extend(["--ebird-file", str(ebird_file)])
 
+            # acoustic_indices.py keeps a separate aggregate/processed-cache
+            # pair from every other script (which all share birdnet's), and
+            # its CLI only recognises the *_indices flag names — so passing
+            # the generic flag here would silently set the wrong config
+            # global and the script would fall back to its unwritable
+            # "path/to/..." placeholder default.
+            is_indices = script_name == "acoustic_indices.py"
+            aggregate_flag = "--aggregate-file-indices" if is_indices else "--aggregate-file"
+            processed_flag = "--processed-file-indices" if is_indices else "--processed-file"
+
             aggregate_path = self._resolve_aggregate_path(script_name, db_dir)
             if aggregate_path:
-                cmd.extend(["--aggregate-file", aggregate_path])
+                cmd.extend([aggregate_flag, aggregate_path])
                 logger.info("  Aggregate: %s", aggregate_path)
             script_stem = Path(script_name).stem
             processed_path = str(db_dir / f"processed_{script_stem}.txt")
-            cmd.extend(["--processed-file", processed_path])
+            cmd.extend([processed_flag, processed_path])
 
             logger.info("  Scanning input directories for audio files...")
             total_files = sum(_count_audio_files(d) for d in unique_dirs)
