@@ -783,10 +783,17 @@ class JobProcessor:
                 # the child *closes* stdout (i.e. exits), so a hung child that never
                 # exits would never reach proc.wait() and the timeout below would
                 # never fire — freezing the whole single-threaded watcher.
+                #
+                # Flushed per line (not just buffered to close) and teed to our own
+                # stdout so stdout.log is tailable and the watcher console shows the
+                # child's live progress, instead of both only appearing at job end.
                 def _drain() -> None:
                     try:
                         for line in proc.stdout:
                             log_fh.write(line)
+                            log_fh.flush()
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
                     except (ValueError, OSError):
                         pass  # log file closed during shutdown/kill
 

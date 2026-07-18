@@ -7,9 +7,21 @@ import {
 import { showToast } from './Toast.js';
 import { openModal, closeModal } from './ModalManager.js';
 import { getActiveProject } from '../data/MasterData.js';
-import { revokeObjectUrls } from '../data/StorageAdapter.js';
+import { getProjectFolderName } from '../data/projectUtils.js';
+import { revokeObjectUrls, getFileBlob } from '../data/StorageAdapter.js';
 import { recordCompletedJobs, downloadMediaFile, getPublicUrl } from '../services/ProjectFilesSync.js';
 import { escapeHtml as _escapeHtml } from '../core/escape.js';
+
+const LOG_POLL_MS  = 1500;
+const LOG_TAIL_LINES = 200;
+let _logPollTimer  = null;
+
+function _stopLogPoll() {
+    if (_logPollTimer) {
+        clearInterval(_logPollTimer);
+        _logPollTimer = null;
+    }
+}
 
 const els = {
     popup              : null,
@@ -51,6 +63,7 @@ export function initJobsDashboard() {
         if (e.target && e.target.id === 'close-jobs-btn') {
             closeModal('jobs-popup');
             revokeObjectUrls();
+            _stopLogPoll();
         }
 
         if (e.target && e.target.id === 'refresh-jobs-btn') {
@@ -159,6 +172,8 @@ async function _loadJobsSidebar() {
 async function _renderJobDetails(job, statusColor) {
     if (!els.viewerContent || !els.viewerPlaceholder) return;
 
+    _stopLogPoll();
+
     els.viewerPlaceholder.style.display = 'none';
     els.viewerContent.style.display     = 'block';
 
@@ -223,10 +238,48 @@ async function _renderJobDetails(job, statusColor) {
             els.viewerFileList.appendChild(btn);
         });
 
+    } else if (job.current_status === 'processing') {
+        els.viewerFileList.innerHTML =
+            `<span style='color:var(--text-muted);'>Job is running — live log below.</span>`;
+        _startLogPoll(job.job_id);
     } else {
         els.viewerFileList.innerHTML =
             `<span style='color:var(--text-muted);'>Job is currently ${_escapeHtml(String(job.current_status))}. Files will appear when finished.</span>`;
     }
+}
+
+function _startLogPoll(jobId) {
+    if (!els.viewerPreview) return;
+
+    const project = getActiveProject();
+    const pf      = project ? getProjectFolderName(project) : '';
+    if (!pf) return;
+
+    const logPath = `${pf}/jobs/results/${jobId}/stdout.log`;
+
+    els.viewerPreview.innerHTML = `
+        <pre id="job-live-log" style="background:#1a1a1a; color:#e0e0e0; padding:12px; overflow:auto; max-height:480px; font-size:0.8rem; border-radius:4px; white-space:pre-wrap; margin:0;">Waiting for log output…</pre>
+    `;
+
+    const tick = async () => {
+        const logEl = document.getElementById('job-live-log');
+        if (!logEl) { _stopLogPoll(); return; }
+        try {
+            const blob = await getFileBlob(logPath);
+            if (blob) {
+                const text  = await blob.text();
+                const lines = text.split('\n');
+                const tail  = lines.slice(-LOG_TAIL_LINES).join('\n');
+                logEl.textContent = tail || 'Waiting for log output…';
+                logEl.scrollTop = logEl.scrollHeight;
+            }
+        } catch {
+            // stdout.log not created yet — keep showing the waiting message.
+        }
+    };
+
+    tick();
+    _logPollTimer = setInterval(tick, LOG_POLL_MS);
 }
 
 async function _previewFile(file) {
