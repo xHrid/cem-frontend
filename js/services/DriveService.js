@@ -386,7 +386,9 @@ export async function fetchPublicBlob(fileId, kind = '') {
             const res = await fetch(url);
             if (res.ok) {
                 const blob = await res.blob();
-                if (blob && blob.size > 0) return blob;
+                // A non-public file returns Google's HTML sign-in/permission page
+                // (HTTP 200, text/html). Never mistake that for the real file.
+                if (blob && blob.size > 0 && !/^text\/html/i.test(blob.type)) return blob;
             }
         } catch { }
     }

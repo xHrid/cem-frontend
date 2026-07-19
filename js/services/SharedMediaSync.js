@@ -67,17 +67,9 @@ async function _catchUpUnsyncedMedia() {
 
     if (project.shared?.isImported) return;
 
-    const mediaPaths = [];
-    for (const spot of (project.spots || [])) {
-        const imgPaths = spot.images && spot.images.length > 0
-            ? spot.images
-            : (spot.image_local_filename ? [spot.image_local_filename] : []);
-        for (const p of imgPaths) mediaPaths.push(p);
-        if (spot.audio_local_filename) mediaPaths.push(spot.audio_local_filename);
-    }
-    for (const site of (project.sites || [])) {
-        if (site.kml_filename) mediaPaths.push(site.kml_filename);
-    }
+    const mediaPaths = [...new Set(
+        enumerateFileRefs(project).map(ref => ref.relPath).filter(Boolean)
+    )];
 
     if (mediaPaths.length === 0) return;
 

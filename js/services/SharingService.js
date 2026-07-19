@@ -5,6 +5,7 @@ import * as StorageAdapter from '../data/StorageAdapter.js';
 import { getProjectFolderName } from '../data/projectUtils.js';
 import { pushProjectDataToDrive } from '../data/Repository.js';
 import { getAccessToken } from './AuthService.js';
+import { enumerateFileRefs } from './ProjectFilesSync.js';
 import { mergeById } from '../data/mergeUtils.js';
 
 function _remapMediaPaths(project, ownerFolderName, localFolderName) {
@@ -46,25 +47,13 @@ function _remapMediaPaths(project, ownerFolderName, localFolderName) {
 }
 
 async function _pushAllProjectMedia(project, rootFolderId) {
-    const projectFolder = getProjectFolderName(project);
-
-    const mediaPaths = [];
-    for (const spot of (project.spots || [])) {
-        const imgPaths = spot.images && spot.images.length > 0
-            ? spot.images
-            : (spot.image_local_filename ? [spot.image_local_filename] : []);
-        for (const p of imgPaths) mediaPaths.push(p);
-        if (spot.audio_local_filename) mediaPaths.push(spot.audio_local_filename);
-    }
-    for (const site of (project.sites || [])) {
-        if (site.kml_filename) mediaPaths.push(site.kml_filename);
-    }
-    for (const route of (project.routes || [])) {
-        for (const a of (route.annotations || [])) {
-            if (a.image_local_filename) mediaPaths.push(a.image_local_filename);
-            if (a.audio_local_filename) mediaPaths.push(a.audio_local_filename);
-        }
-    }
+    // Every locally-referenced file (spots, sites, overlays, routes AND job
+    // result files) must be uploaded + made public, or an importer with only
+    // drive.file scope cannot fetch it. Reuse the canonical enumeration instead
+    // of a partial hand-rolled list that silently dropped analysis outputs.
+    const mediaPaths = [...new Set(
+        enumerateFileRefs(project).map(ref => ref.relPath).filter(Boolean)
+    )];
 
     if (mediaPaths.length === 0) return;
 
@@ -131,11 +120,20 @@ function _setMediaDriveId(project, relPath, fileId) {
     }
     for (const site of (project.sites || [])) {
         if (site.kml_filename === relPath) { site.kml_drive_id = fileId; site.updated_at = now; }
+        for (const ov of (site.strat_overlays || [])) {
+            if (ov.rel_path === relPath) { ov.drive_id = fileId; site.updated_at = now; }
+        }
     }
     for (const route of (project.routes || [])) {
         for (const a of (route.annotations || [])) {
             if (a.image_local_filename === relPath) { a.image_drive_id = fileId; route.updated_at = now; }
             if (a.audio_local_filename === relPath) { a.audio_drive_id = fileId; route.updated_at = now; }
+        }
+    }
+    for (const job of (project.jobs || [])) {
+        if (job.job_file === relPath) { job.job_file_drive_id = fileId; job.updated_at = now; }
+        for (const rf of (job.result_files || [])) {
+            if (rf.rel_path === relPath) { rf.drive_id = fileId; job.updated_at = now; }
         }
     }
 }
