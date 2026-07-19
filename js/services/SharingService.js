@@ -172,8 +172,9 @@ async function _resolveMissingDriveIds(project, folderId, ownerFolderName) {
     const byName    = new Map();
     for (const f of allFiles) {
         if (f.mimeType === 'application/vnd.google-apps.folder') continue;
-        if (f.appProperties?.relativePath) {
-            byRelPath.set(f.appProperties.relativePath, f.id);
+        const relPath = DriveService.driveFileRelPath(f);
+        if (relPath) {
+            byRelPath.set(relPath, f.id);
         }
         if (!byName.has(f.name)) {
             byName.set(f.name, f.id);

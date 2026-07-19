@@ -87,7 +87,7 @@ async function _catchUpUnsyncedMedia() {
     } catch { return; }
 
     const drivePaths = new Set(
-        driveFiles.map(f => f.appProperties?.relativePath).filter(Boolean)
+        driveFiles.map(f => DriveService.driveFileRelPath(f)).filter(Boolean)
     );
 
     let queued = 0;

@@ -279,6 +279,39 @@ export async function downloadBlob(fileId) {
     return res.blob();
 }
 
+// Drive caps each appProperty (key + value) at 124 bytes UTF-8, so a long
+// relativePath (e.g. jobs/results/<uuid>/boxplot_...png) can't fit in one.
+// Split it into rp0, rp1, ... chunks that each stay under the cap; reassemble
+// with driveFileRelPath.
+const _RELPATH_CHUNK_BYTES = 110;
+
+function _relPathToProps(relativePath) {
+    const enc = new TextEncoder();
+    const chunks = [];
+    let cur = '';
+    for (const ch of relativePath) {
+        if (enc.encode(cur + ch).length > _RELPATH_CHUNK_BYTES) {
+            chunks.push(cur);
+            cur = ch;
+        } else {
+            cur += ch;
+        }
+    }
+    if (cur) chunks.push(cur);
+
+    const props = {};
+    chunks.forEach((c, i) => { props[`rp${i}`] = c; });
+    return props;
+}
+
+export function driveFileRelPath(file) {
+    const props = file?.appProperties;
+    if (!props || props.rp0 === undefined) return null;
+    let out = '';
+    for (let i = 0; props[`rp${i}`] !== undefined; i++) out += props[`rp${i}`];
+    return out;
+}
+
 export async function uploadFile(blob, filename, mimeType, parentId, relativePath = null) {
     const metadata = {
         name: filename,
@@ -286,7 +319,7 @@ export async function uploadFile(blob, filename, mimeType, parentId, relativePat
         parents: [parentId],
     };
     if (relativePath) {
-        metadata.appProperties = { relativePath };
+        metadata.appProperties = _relPathToProps(relativePath);
     }
 
     const form = new FormData();
