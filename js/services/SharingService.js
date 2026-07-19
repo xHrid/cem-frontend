@@ -121,8 +121,12 @@ async function _pushAllProjectMedia(project, rootFolderId) {
 }
 
 function _setMediaDriveId(project, relPath, fileId) {
+    // Target the live project object by id - _pushAllProjectMedia awaits between
+    // uploads, and a flush/rehydrate in that window rebuilds the object graph.
+    // Writing to the stale reference would be dropped by the next save.
+    const live = MasterData.getLocalState().projects.find(p => p.id === project.id) || project;
     const now = new Date().toISOString();
-    for (const spot of (project.spots || [])) {
+    for (const spot of (live.spots || [])) {
         const imgPaths = spot.images && spot.images.length > 0
             ? spot.images
             : (spot.image_local_filename ? [spot.image_local_filename] : []);
@@ -136,19 +140,19 @@ function _setMediaDriveId(project, relPath, fileId) {
         }
         if (spot.audio_local_filename === relPath) { spot.audio_drive_id = fileId; spot.updated_at = now; }
     }
-    for (const site of (project.sites || [])) {
+    for (const site of (live.sites || [])) {
         if (site.kml_filename === relPath) { site.kml_drive_id = fileId; site.updated_at = now; }
         for (const ov of (site.strat_overlays || [])) {
             if (ov.rel_path === relPath) { ov.drive_id = fileId; site.updated_at = now; }
         }
     }
-    for (const route of (project.routes || [])) {
+    for (const route of (live.routes || [])) {
         for (const a of (route.annotations || [])) {
             if (a.image_local_filename === relPath) { a.image_drive_id = fileId; route.updated_at = now; }
             if (a.audio_local_filename === relPath) { a.audio_drive_id = fileId; route.updated_at = now; }
         }
     }
-    for (const job of (project.jobs || [])) {
+    for (const job of (live.jobs || [])) {
         if (job.job_file === relPath) { job.job_file_drive_id = fileId; job.updated_at = now; }
         for (const rf of (job.result_files || [])) {
             if (rf.rel_path === relPath) { rf.drive_id = fileId; job.updated_at = now; }
@@ -296,7 +300,11 @@ export async function shareProject(projectId, emails, role) {
 
     try {
         await _pushAllProjectMedia(project, rootFolderId);
-        await pushProjectDataToDrive(project);
+        // Re-resolve: _pushAllProjectMedia recorded drive_ids onto the live
+        // object, which a concurrent flush may have rebuilt. Push that one so
+        // project_data.json ships with the ids, not a stale copy without them.
+        const liveProject = MasterData.getLocalState().projects.find(p => p.id === projectId) || project;
+        await pushProjectDataToDrive(liveProject);
     } catch (e) {
         console.warn('[SharingService] pre-share media/data push failed (continuing):', e.message);
     }

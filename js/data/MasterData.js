@@ -132,7 +132,14 @@ export async function rehydrate() {
     }
     if (!disk?.projects) return false;
 
+    // Only fold in when the persisted state actually differs. Rebuilding the
+    // object graph on every call (the common single-tab case, where disk just
+    // mirrors memory) would orphan any reference an in-flight caller is holding
+    // - e.g. a media upload about to record its drive_id - so its mutation
+    // would land on a discarded object and be dropped by the next save.
     const before = generateDataSignature(masterData);
+    if (generateDataSignature(disk) === before) return false;
+
     masterData = mergeMasterData(masterData, disk);
     if (!masterData.projects.find(p => p.id === masterData.currentProjectId)) {
         masterData.currentProjectId = masterData.projects[0]?.id || null;

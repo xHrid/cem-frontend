@@ -220,10 +220,14 @@ function _assignDriveId(project, relPath, fileId) {
 }
 
 async function _recordDriveId(project, relPath, fileId) {
-    if (_assignDriveId(project, relPath, fileId)) {
+    // Re-resolve the live project by id: a flush/rehydrate may have rebuilt the
+    // object graph while the upload was in flight, orphaning `project`. Writing
+    // the id to a stale copy would be silently dropped by the next save.
+    const live = MasterData.getLocalState().projects.find(p => p.id === project.id) || project;
+    if (_assignDriveId(live, relPath, fileId)) {
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
-        _scheduleWriteThrough(project.id);
+        _scheduleWriteThrough(live.id);
     }
 }
 
