@@ -6,7 +6,6 @@ import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
 import { touch } from '../data/mergeUtils.js';
 import { enumerateFileRefs } from './ProjectFilesSync.js';
-import { buildSyncReport, SYNC } from './SyncReconciler.js';
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 2000;
@@ -46,9 +45,12 @@ export function initSharedMediaSync() {
         _scheduleDrain();
     });
 
-    EventBus.on(EVENTS.STORAGE_READY, () => _scheduleHeal(5000));
-    EventBus.on(EVENTS.DATA_UPDATED, () => _scheduleHeal(2000));
-    EventBus.on(EVENTS.PROJECT_CHANGED, () => _scheduleHeal(1500));
+    // On load, upload any local media that never reached Drive (created offline
+    // or before sign-in). One pass is enough; new saves enqueue themselves via
+    // MEDIA_SAVED above.
+    EventBus.on(EVENTS.STORAGE_READY, () => {
+        setTimeout(() => { uploadLocalOnlyMedia().catch(() => {}); }, 5000);
+    });
 }
 
 export function getMediaSyncStatus() {
@@ -343,104 +345,3 @@ export async function uploadLocalOnlyMedia() {
     return uploaded;
 }
 
-export function enqueueMedia(projectId, relPaths) {
-    if (!getAccessToken() || !relPaths || relPaths.length === 0) return 0;
-    let added = 0;
-    for (const relPath of relPaths) {
-        if (_queue.some(q => q.projectId === projectId && q.relPath === relPath)) continue;
-        _queue.push({ projectId, relPath, retries: 0 });
-        added++;
-    }
-    if (added > 0) {
-        _stats.pending = _queue.length;
-        _scheduleDrain();
-    }
-    return added;
-}
-
-function _resolveProject(projectId) {
-    const state = MasterData.getLocalState();
-    return (state.projects || []).find(p => p.id === projectId) || null;
-}
-
-function _canWrite(project) {
-    if (!project) return false;
-    if (project.shared?.isImported) return project.shared?.permission === 'writer';
-    return true;
-}
-
-export async function getProjectSyncReport(projectId) {
-    const project = _resolveProject(projectId);
-    if (!project) return null;
-    return buildSyncReport(project);
-}
-
-// Reconcile recorded ids with Drive reality: repair drifted ids, drop dead ids,
-// and (when upload) enqueue re-uploads for stale/unsynced local files.
-export async function healProject(projectId, { upload = true } = {}) {
-    if (!getAccessToken()) return { healed: 0, cleared: 0, enqueued: 0 };
-    const project = _resolveProject(projectId);
-    if (!project) return { healed: 0, cleared: 0, enqueued: 0 };
-
-    const report = await buildSyncReport(project);
-    if (!report.driveOk) return { healed: 0, cleared: 0, enqueued: 0 };
-
-    // Writing a drive_id back is local metadata (safe for viewers, needed to view
-    // shared media). Only actual uploads require write access.
-    const canUpload = upload && _canWrite(project);
-
-    let changed = false, healed = 0, cleared = 0;
-    const toEnqueue = [];
-
-    for (const row of report.rows) {
-        if (row.status === SYNC.ID_DRIFT && row.liveId) {
-            if (_assignDriveId(project, row.relPath, row.liveId)) { changed = true; healed++; }
-        } else if (row.status === SYNC.STALE) {
-            if (canUpload) {
-                if (_assignDriveId(project, row.relPath, null)) changed = true;
-                toEnqueue.push(row.relPath);
-            }
-        } else if (row.status === SYNC.UNSYNCED) {
-            if (canUpload) toEnqueue.push(row.relPath);
-        } else if (row.status === SYNC.MISSING && row.driveId) {
-            if (_assignDriveId(project, row.relPath, null)) { changed = true; cleared++; }
-        }
-    }
-
-    if (changed) {
-        await MasterData.saveMasterData();
-        EventBus.emit(EVENTS.DATA_UPDATED);
-    }
-    const enqueued = canUpload ? enqueueMedia(projectId, toEnqueue) : 0;
-    return { healed, cleared, enqueued };
-}
-
-export function resyncProject(projectId) {
-    return healProject(projectId, { upload: true });
-}
-
-export function repairDriveIds(projectId) {
-    return healProject(projectId, { upload: false });
-}
-
-let _healTimer = null;
-let _healing = false;
-
-function _scheduleHeal(delay = 2000) {
-    if (_healing) return;
-    clearTimeout(_healTimer);
-    _healTimer = setTimeout(_healActive, delay);
-}
-
-async function _healActive() {
-    if (_healing || !getAccessToken()) return;
-    _healing = true;
-    try {
-        const project = MasterData.getActiveProject?.();
-        if (project) await healProject(project.id, { upload: true });
-    } catch (e) {
-        console.warn('[SharedMediaSync] heal failed:', e.message);
-    } finally {
-        _healing = false;
-    }
-}
