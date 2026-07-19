@@ -270,10 +270,6 @@ async function _listFilesRecursive(folderId) {
     return files;
 }
 
-export async function listAllFilesInFolder(folderId) {
-    return _listFilesRecursive(folderId);
-}
-
 export async function downloadBlob(fileId) {
     const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media&supportsAllDrives=true`);
     return res.blob();

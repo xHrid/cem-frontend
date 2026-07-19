@@ -140,94 +140,98 @@ function _setMediaDriveId(project, relPath, fileId) {
     }
 }
 
-async function _resolveMissingDriveIds(project, folderId, ownerFolderName) {
-    if (!folderId) return false;
+// The owner's project_data.json is the sole authority for media that lives in
+// the owner's folder. A collaborator can read project_data.json by its picked
+// file id but cannot enumerate the folder under the drive.file scope, so we
+// never scan the directory: we adopt the drive_ids the remote already carries.
+// Gap-fill only - never overwrite a present local id or drop a local-only path,
+// so an editor's own not-yet-pushed media is preserved.
+function _adoptRemoteMediaIds(project, remote) {
+    if (!remote) return;
 
-    let needsRepair = false;
+    const remoteSpots = new Map(
+        (remote.spots || []).map(s => [s.spotId || s.id, s])
+    );
     for (const spot of (project.spots || [])) {
-        const imgPaths = spot.images && spot.images.length > 0
-            ? spot.images : [];
-        if (imgPaths.length === 0) continue;
+        const r = remoteSpots.get(spot.spotId || spot.id);
+        if (!r) continue;
 
-        const driveIds = spot.image_drive_ids || [];
-        for (let i = 0; i < imgPaths.length; i++) {
-            if (!driveIds[i] && !(i === 0 && spot.image_drive_id)) {
-                needsRepair = true;
-                break;
-            }
+        const paths = spot.images && spot.images.length > 0
+            ? spot.images
+            : (spot.image_local_filename ? [spot.image_local_filename] : []);
+        if (paths.length > 0) {
+            const rPaths = r.images && r.images.length > 0
+                ? r.images
+                : (r.image_local_filename ? [r.image_local_filename] : []);
+            const rIds = r.image_drive_ids || [];
+            const rByPath = new Map();
+            rPaths.forEach((p, i) => {
+                const id = rIds[i] || (i === 0 ? r.image_drive_id : null);
+                if (id) rByPath.set(p, id);
+            });
+
+            if (!spot.image_drive_ids) spot.image_drive_ids = [];
+            while (spot.image_drive_ids.length < paths.length) spot.image_drive_ids.push(null);
+            paths.forEach((p, i) => {
+                if (!spot.image_drive_ids[i] && rByPath.has(p)) {
+                    spot.image_drive_ids[i] = rByPath.get(p);
+                }
+            });
+            spot.image_drive_id = spot.image_drive_ids[0] || spot.image_drive_id || null;
         }
-        if (needsRepair) break;
+        if (!spot.audio_drive_id && r.audio_drive_id) spot.audio_drive_id = r.audio_drive_id;
     }
-    if (!needsRepair) return false;
 
-    let allFiles;
+    const remoteSites = new Map((remote.sites || []).map(s => [s.id, s]));
+    for (const site of (project.sites || [])) {
+        const r = remoteSites.get(site.id);
+        if (r && !site.kml_drive_id && r.kml_drive_id) site.kml_drive_id = r.kml_drive_id;
+    }
+
+    const remoteRoutes = new Map((remote.routes || []).map(r => [r.id, r]));
+    for (const route of (project.routes || [])) {
+        const r = remoteRoutes.get(route.id);
+        if (!r) continue;
+        const rAnns = new Map((r.annotations || []).map(a => [a.id, a]));
+        for (const a of (route.annotations || [])) {
+            const ra = rAnns.get(a.id);
+            if (!ra) continue;
+            if (!a.image_drive_id && ra.image_drive_id) a.image_drive_id = ra.image_drive_id;
+            if (!a.audio_drive_id && ra.audio_drive_id) a.audio_drive_id = ra.audio_drive_id;
+        }
+    }
+
+    const remoteJobs = new Map((remote.jobs || []).map(j => [j.job_id || j.id, j]));
+    for (const job of (project.jobs || [])) {
+        const r = remoteJobs.get(job.job_id || job.id);
+        if (!r) continue;
+        if (!job.job_file_drive_id && r.job_file_drive_id) job.job_file_drive_id = r.job_file_drive_id;
+        const rRes = new Map((r.result_files || []).map(f => [f.rel_path || f.id, f]));
+        for (const rf of (job.result_files || [])) {
+            const rr = rRes.get(rf.rel_path || rf.id);
+            if (rr && !rf.drive_id && rr.drive_id) rf.drive_id = rr.drive_id;
+        }
+    }
+}
+
+// Make every already-uploaded media reference public by its drive_id, reading
+// refs straight from the project (never the folder). Owner-only path, run at
+// share time so collaborators can stream every file from its public link.
+async function _publishReferencedMedia(project) {
+    let refs;
     try {
-        allFiles = await DriveService.listAllFilesInFolder(folderId);
+        const { enumerateFileRefs } = await import('./ProjectFilesSync.js');
+        refs = enumerateFileRefs(project);
     } catch (e) {
-        console.warn('[SharingService] Cannot list folder for drive-ID repair:', e.message);
-        return false;
+        console.warn('[SharingService] could not enumerate refs to publish:', e.message);
+        return;
     }
-
-    const byRelPath = new Map();
-    const byName    = new Map();
-    for (const f of allFiles) {
-        if (f.mimeType === 'application/vnd.google-apps.folder') continue;
-        const relPath = DriveService.driveFileRelPath(f);
-        if (relPath) {
-            byRelPath.set(relPath, f.id);
-        }
-        if (!byName.has(f.name)) {
-            byName.set(f.name, f.id);
-        }
+    const seen = new Set();
+    for (const ref of refs) {
+        if (!ref.driveId || seen.has(ref.driveId)) continue;
+        seen.add(ref.driveId);
+        try { await DriveService.makeFilePublic(ref.driveId); } catch { }
     }
-
-    const localFolder = getProjectFolderName(project);
-    const now = new Date().toISOString();
-    let repaired = false;
-
-    for (const spot of (project.spots || [])) {
-        const imgPaths = spot.images && spot.images.length > 0
-            ? spot.images : [];
-        if (imgPaths.length === 0) continue;
-
-        if (!spot.image_drive_ids) spot.image_drive_ids = [];
-        while (spot.image_drive_ids.length < imgPaths.length) spot.image_drive_ids.push(null);
-
-        for (let i = 0; i < imgPaths.length; i++) {
-            if (spot.image_drive_ids[i]) continue;
-            if (i === 0 && spot.image_drive_id) {
-                spot.image_drive_ids[0] = spot.image_drive_id;
-                continue;
-            }
-
-            const localPath = imgPaths[i];
-
-            let ownerPath = localPath;
-            if (ownerFolderName && ownerFolderName !== localFolder
-                && localPath.startsWith(localFolder + '/')) {
-                ownerPath = ownerFolderName + localPath.substring(localFolder.length);
-            }
-
-            let fileId = byRelPath.get(ownerPath);
-            if (!fileId) fileId = byRelPath.get(localPath);
-            if (!fileId) {
-                const filename = localPath.split('/').pop();
-                if (filename) fileId = byName.get(filename);
-            }
-
-            if (fileId) {
-                try { await DriveService.makeFilePublic(fileId); } catch { }
-                spot.image_drive_ids[i] = fileId;
-                if (i === 0) spot.image_drive_id = fileId;
-                spot.updated_at = now;
-                repaired = true;
-            }
-        }
-    }
-
-    if (repaired) {
-    }
-    return repaired;
 }
 
 export async function shareProject(projectId, emails, role) {
@@ -291,6 +295,7 @@ export async function shareProject(projectId, emails, role) {
 
     try {
         await _pushAllProjectMedia(project, rootFolderId);
+        await _publishReferencedMedia(project);
         await pushProjectDataToDrive(project);
     } catch (e) {
         console.warn('[SharingService] pre-share media/data push failed (continuing):', e.message);
@@ -380,21 +385,18 @@ export async function importSharedProject(projectFileId) {
         );
     }
 
-    let sourceFolderId, projectDataFileId, myRole;
+    // Under the drive.file scope we can only read files the user explicitly
+    // picked - the shared folder itself cannot be listed. So import is strictly
+    // file-based: the user must pick the project_data.json file, not the folder.
     if (fileMeta.mimeType === 'application/vnd.google-apps.folder') {
-        sourceFolderId    = fileMeta.id;
-        myRole            = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
-        const pdFile      = await DriveService.findFileByName('project_data.json', sourceFolderId);
-        if (!pdFile) {
-            throw new Error('Cannot list this folder under drive.file. Re-open it in the picker ' +
-                'and select the project_data.json FILE inside instead.');
-        }
-        projectDataFileId = pdFile.id;
-    } else {
-        sourceFolderId    = fileMeta.parents?.[0] || null;
-        myRole            = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
-        projectDataFileId = projectFileId;
+        throw new Error(
+            'Open the shared folder in the picker and select the project_data.json ' +
+            'FILE inside it (not the folder). The folder itself cannot be read.'
+        );
     }
+    const sourceFolderId    = fileMeta.parents?.[0] || null;
+    const myRole            = fileMeta.capabilities?.canEdit ? 'writer' : 'reader';
+    const projectDataFileId = projectFileId;
 
     let sharedProject = null;
     try {
@@ -435,16 +437,6 @@ export async function importSharedProject(projectFileId) {
     _remapMediaPaths(importedProject, ownerFolder, localFolder);
 
     delete importedProject.inline_files;
-
-    try {
-        await _resolveMissingDriveIds(
-            importedProject,
-            sourceFolderId,
-            ownerFolder
-        );
-    } catch (e) {
-        console.warn('[SharingService] import-time drive-ID repair failed:', e.message);
-    }
 
     state.projects.push(importedProject);
     await MasterData.saveMasterData();
@@ -497,6 +489,8 @@ export async function syncImportedProject(projectId) {
         project.jobs           = _mergeArray(project.jobs,           remoteForMerge.jobs);
         project.external_files = _mergeArray(project.external_files, remoteForMerge.external_files);
 
+        _adoptRemoteMediaIds(project, remoteForMerge);
+
         project.name       = updatedProject.name       || project.name;
         project.created_at = updatedProject.created_at || project.created_at;
 
@@ -507,16 +501,6 @@ export async function syncImportedProject(projectId) {
             lastSyncedAt: new Date().toISOString(),
             projectDataFileId: fileId,
         };
-
-        try {
-            await _resolveMissingDriveIds(
-                project,
-                project.shared.sourceFolderId,
-                ownerFolder
-            );
-        } catch (e) {
-            console.warn('[SharingService] imported project drive-ID repair failed:', e.message);
-        }
 
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.SHARED_PROJECT_SYNCED, { projectId });
@@ -627,14 +611,7 @@ export async function pullEditorContributions(projectId) {
     project.jobs           = _mergeArray(project.jobs,           remote.jobs);
     project.external_files = _mergeArray(project.external_files, remote.external_files);
 
-    try {
-        const repaired = await _resolveMissingDriveIds(project, folderId, null);
-        if (repaired) {
-            await pushProjectDataToDrive(project);
-        }
-    } catch (e) {
-        console.warn('[SharingService] owner drive-ID repair failed:', e.message);
-    }
+    _adoptRemoteMediaIds(project, remote);
 
     await MasterData.saveMasterData();
     EventBus.emit(EVENTS.DATA_UPDATED);
