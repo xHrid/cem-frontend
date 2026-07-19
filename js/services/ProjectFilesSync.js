@@ -8,8 +8,6 @@ import { getAccessToken } from './AuthService.js';
 import { getAllJobs, getJobResultFiles } from '../data/Repository.js';
 import { touch, isDeleted } from '../data/mergeUtils.js';
 
-const _unfetchable = new Set();
-
 export function enumerateFileRefs(project) {
     const refs = [];
     for (const s of (project.spots || [])) {
@@ -127,8 +125,6 @@ export async function downloadMediaFile(driveId, relPath, kind = '') {
         }
     } catch { }
 
-    if (_unfetchable.has(driveId)) return null;
-
     try {
         let blob = await DriveService.fetchPublicBlob(driveId, kind);
 
@@ -140,10 +136,9 @@ export async function downloadMediaFile(driveId, relPath, kind = '') {
             } catch { }
         }
 
-        if (!blob || blob.size === 0) {
-            _unfetchable.add(driveId);
-            return null;
-        }
+        // A miss here is usually transient (Drive still propagating a just-made-
+        // public file), so we do NOT blacklist the id - the next open retries.
+        if (!blob || blob.size === 0) return null;
 
         const parts = relPath.split('/');
         const name  = parts.pop();
@@ -154,7 +149,6 @@ export async function downloadMediaFile(driveId, relPath, kind = '') {
             return { url, source: 'local' };
         }
     } catch (e) {
-        _unfetchable.add(driveId);
         console.warn(`[ProjectFilesSync] On-demand download failed "${relPath}":`, e.message);
     }
 

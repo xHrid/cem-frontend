@@ -263,7 +263,38 @@ async function _recordDriveId(project, relPath, fileId) {
     if (_assignDriveId(project, relPath, fileId)) {
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
+        _scheduleWriteThrough(project.id);
     }
+}
+
+const _writeThroughTimers = new Map();
+const WRITE_THROUGH_DEBOUNCE_MS = 1500;
+
+// project_data.json is the shared source of truth collaborators read, so push
+// the freshly-recorded drive_id there instead of waiting for the debounced
+// master flush - otherwise a collaborator can pull a copy that is missing the
+// id and has no way to recover it (they can't enumerate the owner's folder).
+// Debounced per project so a bulk catch-up coalesces into a single push.
+function _scheduleWriteThrough(projectId) {
+    const prev = _writeThroughTimers.get(projectId);
+    if (prev) clearTimeout(prev);
+    _writeThroughTimers.set(projectId, setTimeout(async () => {
+        _writeThroughTimers.delete(projectId);
+        try {
+            const state = MasterData.getLocalState();
+            const project = state.projects.find(p => p.id === projectId);
+            if (!project) return;
+            if (project.shared?.isImported && project.shared?.permission === 'writer') {
+                const { pushToSharedProject } = await import('./SharingService.js');
+                await pushToSharedProject(project.id);
+            } else if (project.sharing?.isShared) {
+                const { pushProjectDataToDrive } = await import('../data/Repository.js');
+                await pushProjectDataToDrive(project);
+            }
+        } catch (e) {
+            console.warn('[SharedMediaSync] project_data.json write-through failed:', e.message);
+        }
+    }, WRITE_THROUGH_DEBOUNCE_MS));
 }
 
 // Synchronously push every locally-referenced file that has no drive_id yet.
