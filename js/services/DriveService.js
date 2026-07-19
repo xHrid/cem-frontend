@@ -230,46 +230,6 @@ async function _resolveFolder(folderName, parentId) {
     return folder.id;
 }
 
-export async function listAllDriveFiles() {
-    const rootId = await findOrCreateRootFolder();
-    return _listFilesRecursive(rootId);
-}
-
-async function _listFilesRecursive(folderId) {
-    const fields = 'nextPageToken,files(id,name,mimeType,parents,appProperties)';
-    const safeFolderId = escapeQueryString(folderId);
-    const q = `'${safeFolderId}' in parents and trashed = false`;
-
-    let files     = [];
-    let pageToken = null;
-
-    do {
-        const params = new URLSearchParams({
-            q,
-            fields,
-            pageSize: String(PAGE_SIZE),
-            supportsAllDrives: 'true',
-            includeItemsFromAllDrives: 'true',
-        });
-        if (pageToken) params.set('pageToken', pageToken);
-
-        const res  = await fetchDrive(`${DRIVE_FILES_URL}?${params.toString()}`);
-        const data = await res.json();
-
-        if (data.files) files.push(...data.files);
-        pageToken = data.nextPageToken || null;
-
-    } while (pageToken);
-
-    const subfolders = files.filter(f => f.mimeType === 'application/vnd.google-apps.folder');
-    for (const sub of subfolders) {
-        const subFiles = await _listFilesRecursive(sub.id);
-        files.push(...subFiles);
-    }
-
-    return files;
-}
-
 export async function downloadBlob(fileId) {
     const res = await fetchDrive(`${DRIVE_FILES_URL}/${fileId}?alt=media&supportsAllDrives=true`);
     return res.blob();

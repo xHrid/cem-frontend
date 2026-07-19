@@ -266,20 +266,16 @@ export async function uploadLocalOnlyMedia() {
     const state = MasterData.getLocalState();
     let uploaded = 0;
 
-    // Verify recorded ids against what is ACTUALLY on Drive - a stale id (e.g.
-    // the Drive folder was deleted) must not make us skip a re-upload.
-    let liveIds = new Set();
-    try {
-        const driveFiles = await DriveService.listAllDriveFiles();
-        liveIds = new Set(driveFiles.map(f => f.id));
-    } catch { }
-
     for (const project of (state.projects || [])) {
         const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
         if (project.shared?.isImported && !isImportedEditor) continue;
 
         for (const ref of enumerateFileRefs(project)) {
-            if (ref.driveId && liveIds.has(ref.driveId)) continue;
+            // Already on Drive (this account's or the owner's) - trust the id
+            // and never re-upload. Re-uploading owner-hosted media that the
+            // editor merely downloaded would fork the reference to a duplicate
+            // in the editor's own Drive and churn project_data.json.
+            if (ref.driveId) continue;
             let exists = false;
             try { exists = await StorageAdapter.checkFileExists(ref.relPath); } catch { }
             if (!exists) continue;
