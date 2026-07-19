@@ -6,6 +6,7 @@ import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
 import { touch } from '../data/mergeUtils.js';
 import { enumerateFileRefs } from './ProjectFilesSync.js';
+import { buildSyncReport, SYNC } from './SyncReconciler.js';
 
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 2000;
@@ -45,61 +46,9 @@ export function initSharedMediaSync() {
         _scheduleDrain();
     });
 
-    EventBus.on(EVENTS.STORAGE_READY, () => {
-        setTimeout(() => _catchUpUnsyncedMedia(), 5000);
-    });
-
-    let _catchUpDone = false;
-    EventBus.on(EVENTS.DATA_UPDATED, () => {
-        if (_catchUpDone || !getAccessToken()) return;
-        _catchUpDone = true;
-        setTimeout(() => _catchUpUnsyncedMedia(), 2000);
-    });
-
-}
-
-async function _catchUpUnsyncedMedia() {
-    if (!getAccessToken()) return;
-
-    const state = MasterData.getLocalState();
-    const project = state.projects.find(p => p.id === state.currentProjectId);
-    if (!project) return;
-
-    if (project.shared?.isImported) return;
-
-    const mediaPaths = [...new Set(
-        enumerateFileRefs(project).map(ref => ref.relPath).filter(Boolean)
-    )];
-
-    if (mediaPaths.length === 0) return;
-
-    let driveFiles;
-    try {
-        driveFiles = await DriveService.listAllDriveFiles();
-    } catch { return; }
-
-    const drivePaths = new Set(
-        driveFiles.map(f => DriveService.driveFileRelPath(f)).filter(Boolean)
-    );
-
-    let queued = 0;
-    for (const relPath of mediaPaths) {
-        if (drivePaths.has(relPath)) continue;
-
-        const exists = await StorageAdapter.checkFileExists(relPath);
-        if (!exists) continue;
-
-        const alreadyQueued = _queue.some(q => q.relPath === relPath);
-        if (!alreadyQueued) {
-            _queue.push({ projectId: project.id, relPath, retries: 0 });
-            queued++;
-        }
-    }
-
-    if (queued > 0) {
-        _stats.pending = _queue.length;
-        _scheduleDrain();
-    }
+    EventBus.on(EVENTS.STORAGE_READY, () => _scheduleHeal(5000));
+    EventBus.on(EVENTS.DATA_UPDATED, () => _scheduleHeal(2000));
+    EventBus.on(EVENTS.PROJECT_CHANGED, () => _scheduleHeal(1500));
 }
 
 export function getMediaSyncStatus() {
@@ -261,7 +210,7 @@ async function _pushToOwnProjectFolder(project, relPath) {
     return created.id;
 }
 
-async function _recordDriveId(project, relPath, fileId) {
+function _assignDriveId(project, relPath, fileId) {
     let changed = false;
     for (const spot of (project.spots || [])) {
         const imgPaths = spot.images && spot.images.length > 0
@@ -307,7 +256,11 @@ async function _recordDriveId(project, relPath, fileId) {
             }
         }
     }
-    if (changed) {
+    return changed;
+}
+
+async function _recordDriveId(project, relPath, fileId) {
+    if (_assignDriveId(project, relPath, fileId)) {
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
     }
@@ -322,12 +275,20 @@ export async function uploadLocalOnlyMedia() {
     const state = MasterData.getLocalState();
     let uploaded = 0;
 
+    // Verify recorded ids against what is ACTUALLY on Drive - a stale id (e.g.
+    // the Drive folder was deleted) must not make us skip a re-upload.
+    let liveIds = new Set();
+    try {
+        const driveFiles = await DriveService.listAllDriveFiles();
+        liveIds = new Set(driveFiles.map(f => f.id));
+    } catch { }
+
     for (const project of (state.projects || [])) {
         const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
         if (project.shared?.isImported && !isImportedEditor) continue;
 
         for (const ref of enumerateFileRefs(project)) {
-            if (ref.driveId) continue;
+            if (ref.driveId && liveIds.has(ref.driveId)) continue;
             let exists = false;
             try { exists = await StorageAdapter.checkFileExists(ref.relPath); } catch { }
             if (!exists) continue;
@@ -349,4 +310,100 @@ export async function uploadLocalOnlyMedia() {
         }
     }
     return uploaded;
+}
+
+export function enqueueMedia(projectId, relPaths) {
+    if (!getAccessToken() || !relPaths || relPaths.length === 0) return 0;
+    let added = 0;
+    for (const relPath of relPaths) {
+        if (_queue.some(q => q.projectId === projectId && q.relPath === relPath)) continue;
+        _queue.push({ projectId, relPath, retries: 0 });
+        added++;
+    }
+    if (added > 0) {
+        _stats.pending = _queue.length;
+        _scheduleDrain();
+    }
+    return added;
+}
+
+function _resolveProject(projectId) {
+    const state = MasterData.getLocalState();
+    return (state.projects || []).find(p => p.id === projectId) || null;
+}
+
+function _canWrite(project) {
+    if (!project) return false;
+    if (project.shared?.isImported) return project.shared?.permission === 'writer';
+    return true;
+}
+
+export async function getProjectSyncReport(projectId) {
+    const project = _resolveProject(projectId);
+    if (!project) return null;
+    return buildSyncReport(project);
+}
+
+// Reconcile recorded ids with Drive reality: repair drifted ids, drop dead ids,
+// and (when upload) enqueue re-uploads for stale/unsynced local files.
+export async function healProject(projectId, { upload = true } = {}) {
+    if (!getAccessToken()) return { healed: 0, cleared: 0, enqueued: 0 };
+    const project = _resolveProject(projectId);
+    if (!_canWrite(project)) return { healed: 0, cleared: 0, enqueued: 0 };
+
+    const report = await buildSyncReport(project);
+    if (!report.driveOk) return { healed: 0, cleared: 0, enqueued: 0 };
+
+    let changed = false, healed = 0, cleared = 0;
+    const toEnqueue = [];
+
+    for (const row of report.rows) {
+        if (row.status === SYNC.ID_DRIFT && row.liveId) {
+            if (_assignDriveId(project, row.relPath, row.liveId)) { changed = true; healed++; }
+        } else if (row.status === SYNC.STALE) {
+            if (_assignDriveId(project, row.relPath, null)) changed = true;
+            if (upload) toEnqueue.push(row.relPath);
+        } else if (row.status === SYNC.UNSYNCED) {
+            if (upload) toEnqueue.push(row.relPath);
+        } else if (row.status === SYNC.MISSING && row.driveId) {
+            if (_assignDriveId(project, row.relPath, null)) { changed = true; cleared++; }
+        }
+    }
+
+    if (changed) {
+        await MasterData.saveMasterData();
+        EventBus.emit(EVENTS.DATA_UPDATED);
+    }
+    const enqueued = upload ? enqueueMedia(projectId, toEnqueue) : 0;
+    return { healed, cleared, enqueued };
+}
+
+export function resyncProject(projectId) {
+    return healProject(projectId, { upload: true });
+}
+
+export function repairDriveIds(projectId) {
+    return healProject(projectId, { upload: false });
+}
+
+let _healTimer = null;
+let _healing = false;
+
+function _scheduleHeal(delay = 2000) {
+    if (_healing) return;
+    clearTimeout(_healTimer);
+    _healTimer = setTimeout(_healActive, delay);
+}
+
+async function _healActive() {
+    if (_healing || !getAccessToken()) return;
+    _healing = true;
+    try {
+        const project = MasterData.getActiveProject?.();
+        if (project) await healProject(project.id, { upload: true });
+    } catch (e) {
+        console.warn('[SharedMediaSync] heal failed:', e.message);
+    } finally {
+        _healing = false;
+    }
 }
