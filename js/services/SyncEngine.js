@@ -99,6 +99,7 @@ export async function flush(reason = 'manual') {
 
     _dirty = false;
     _setStatus('syncing');
+    EventBus.emit(EVENTS.SYNC_PROGRESS, { detail: 'Uploading changes…' });
 
     try {
         const changed = await rehydrate();
@@ -107,6 +108,7 @@ export async function flush(reason = 'manual') {
 
         const active = _activeProject();
         if (active?.shared?.isImported && active.shared.permission === 'writer') {
+            EventBus.emit(EVENTS.SYNC_PROGRESS, { detail: 'Syncing shared project…' });
             const { pushToSharedProject } = await import('./SharingService.js');
             await pushToSharedProject(active.id);
         }
@@ -119,6 +121,18 @@ export async function flush(reason = 'manual') {
         _dirty = true;
         _setStatus('error');
     }
+}
+
+// Full manual cycle for the "Sync now" button: push local, pull+merge remote,
+// and sync the active shared project. Resolves only when the round-trip is
+// actually done (media may still upload in the background afterwards).
+export async function syncNow() {
+    await flush('manual');
+    if (_isLeader && getAccessToken() && !_paused) {
+        try { await checkForRemoteUpdates(false); }
+        catch (err) { console.warn('[SyncEngine] syncNow remote check failed:', err.message); }
+    }
+    await _syncActiveSharedProject(true);
 }
 
 export function onAuthReady() {
@@ -153,6 +167,7 @@ async function _syncActiveSharedProject(force = false) {
 
     _sharedSyncBusy = true;
     try {
+        EventBus.emit(EVENTS.SYNC_PROGRESS, { detail: 'Syncing shared project…' });
         const SharingService = await import('./SharingService.js');
         if (isImported) {
             await SharingService.syncImportedProject(active.id);

@@ -16,7 +16,7 @@ import { mergeById, touch, tombstone, isDeleted } from './mergeUtils.js';
 import {
     getKnownRemoteMasterTime,
     setKnownRemoteMasterTime,
-    raiseRemoteConflict
+    foldRemoteMasterIntoLocal
 } from '../services/SyncService.js';
 
 function _requireActiveProject() {
@@ -733,8 +733,9 @@ export async function checkDependencyExists(scriptName, cacheKey) {
 }
 
 // Pushes the local master to Drive. Throws on failure so callers (SyncEngine)
-// keep the dirty flag and retry. Refuses to overwrite a remote master that
-// moved since we last saw it - that raises the MASTER_SYNC_CONFLICT flow.
+// keep the dirty flag and retry. If the remote moved since we last saw it, it
+// union-merges the remote into local first so the write can never clobber
+// another device's changes.
 export async function pushMasterToDrive() {
     const token = getAccessToken();
     if (!token) throw new Error('Not signed in - cannot push master to Drive.');
@@ -744,8 +745,7 @@ export async function pushMasterToDrive() {
 
     const known = getKnownRemoteMasterTime();
     if (remote && known && remote.modifiedTime && remote.modifiedTime !== known) {
-        await raiseRemoteConflict(remote);
-        throw new Error('Remote master changed since last sync - conflict raised instead of overwriting.');
+        await foldRemoteMasterIntoLocal(remote);
     }
 
     const state = MasterData.getLocalState();

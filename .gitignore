@@ -46,3 +46,5 @@ Thumbs.db
 
 # ---- Watcher runtime (venv + synced scripts) ----
 system/
+
+.claude/

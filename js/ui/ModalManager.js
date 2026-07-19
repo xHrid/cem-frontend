@@ -4,7 +4,6 @@ const _knownModalIds = new Set([
     'save-route-dialog',
     'sync-modal',
     'import-media-popup',
-    'conflict-modal',
     'analysis-popup',
     'jobs-popup',
     'external-data-viewer',

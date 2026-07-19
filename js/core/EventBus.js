@@ -4,7 +4,6 @@ export const EVENTS = Object.freeze({
     PROJECT_CHANGED: 'project-changed',
     SYNC_PROGRESS: 'sync-progress',
     SYNC_BATCH_COMPLETE: 'sync-batch-complete',
-    MASTER_SYNC_CONFLICT: 'master-sync-conflict',
     WATCHER_STATUS_CHANGED: 'watcher-status-changed',
     SPOTS_DISPLAY_TOGGLE: 'spots-display-toggle',
     TOAST_SHOW: 'toast-show',

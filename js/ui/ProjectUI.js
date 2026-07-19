@@ -4,7 +4,6 @@ import {
     switchProject,
     renameProject,
 }                                    from '../data/ProjectManager.js';
-import { resolveMasterConflict }     from '../services/SyncService.js';
 import { getSpots, getLocalState }   from '../data/MasterData.js';
 import { saveExternalFile, saveExternalFileByReference, saveExternalFilesByReferenceBatch, saveExternalFilesBatch } from '../data/Repository.js';
 import { showToast }                 from './Toast.js';
@@ -13,7 +12,6 @@ import { showAckDialog }             from './Dialog.js';
 
 export function initProjectUI() {
     _initProjectDropdown();
-    _initConflictModal();
     _initImportMediaForm();
 
     EventBus.on(EVENTS.STORAGE_READY,  _renderProjectList);
@@ -122,51 +120,6 @@ function _initProjectDropdown() {
             _renderProjectList();
         } catch (err) {
             showToast(err.message, 'failed');
-        }
-    });
-}
-
-function _openConflictModal(localCount, remoteCount) {
-    const conflictMsg = document.getElementById('conflict-msg');
-
-    if (conflictMsg) {
-        conflictMsg.innerHTML = `
-            Master Data mismatch detected.<br>
-            <strong>Local Spots:</strong> ${localCount}<br>
-            <strong>Drive Spots:</strong> ${remoteCount}
-        `;
-    }
-
-    openModal('conflict-modal');
-}
-
-function _initConflictModal() {
-    const close = () => closeModal('conflict-modal');
-
-    _wireConflictBtn('btn-conflict-pull',   async () => {
-        await resolveMasterConflict('pull');
-        close();
-    });
-
-    _wireConflictBtn('btn-conflict-push',   async () => {
-        await resolveMasterConflict('push');
-        close();
-    });
-
-    _wireConflictBtn('btn-conflict-merge',  async () => {
-        await resolveMasterConflict('merge');
-        close();
-    });
-
-    _wireConflictBtn('btn-conflict-cancel', close);
-}
-
-function _wireConflictBtn(id, handler) {
-    document.getElementById(id)?.addEventListener('click', async () => {
-        try {
-            await handler();
-        } catch (err) {
-            showToast(`Conflict resolution failed: ${err.message}`, 'failed');
         }
     });
 }
