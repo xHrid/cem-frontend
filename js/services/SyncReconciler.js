@@ -1,6 +1,7 @@
 import * as DriveService from './DriveService.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
 import { enumerateFileRefs } from './ProjectFilesSync.js';
+import { getProjectFolderName } from '../data/projectUtils.js';
 
 export const SYNC = {
     SYNCED:   'synced',    // on Drive, recorded id matches
@@ -11,17 +12,39 @@ export const SYNC = {
     UNKNOWN:  'unknown',   // Drive unreachable, cannot verify
 };
 
-async function _driveIndex() {
+// For an imported project the shared media lives in the OWNER's folder, not the
+// current user's own Drive root - list the source folder in that case.
+async function _driveIndex(project) {
     const relToId = new Map();
+    const byName = new Map();
     const liveIds = new Set();
-    const driveFiles = await DriveService.listAllDriveFiles();
+
+    const sh = project.shared;
+    const driveFiles = (sh?.isImported && sh?.sourceFolderId)
+        ? await DriveService.listAllFilesInFolder(sh.sourceFolderId)
+        : await DriveService.listAllDriveFiles();
+
     for (const f of driveFiles) {
         if (f.mimeType === 'application/vnd.google-apps.folder') continue;
         liveIds.add(f.id);
         const rp = DriveService.driveFileRelPath(f);
         if (rp) relToId.set(rp, f.id);
+        if (f.name && !byName.has(f.name)) byName.set(f.name, f.id);
     }
-    return { relToId, liveIds };
+    return { relToId, byName, liveIds };
+}
+
+// The recorded relPath uses the local folder name; on the owner's Drive the same
+// file sits under the owner's folder name. Remap so path lookups line up.
+function _drivePathFor(project, relPath) {
+    const sh = project.shared;
+    if (sh?.isImported && sh?.ownerFolderName) {
+        const local = getProjectFolderName(project);
+        if (local && local !== sh.ownerFolderName && relPath.startsWith(local + '/')) {
+            return sh.ownerFolderName + relPath.substring(local.length);
+        }
+    }
+    return relPath;
 }
 
 function _emptyCounts() {
@@ -47,7 +70,7 @@ export async function buildSyncReport(project) {
     let index = null;
     let driveOk = true;
     try {
-        index = await _driveIndex();
+        index = await _driveIndex(project);
     } catch (e) {
         driveOk = false;
     }
@@ -59,7 +82,11 @@ export async function buildSyncReport(project) {
         let local = false;
         try { local = await StorageAdapter.checkFileExists(ref.relPath); } catch { }
 
-        const liveId = driveOk ? (index.relToId.get(ref.relPath) || null) : null;
+        const liveId = driveOk
+            ? (index.relToId.get(_drivePathFor(project, ref.relPath))
+                || index.byName.get(ref.relPath.split('/').pop())
+                || null)
+            : null;
         const idOnDrive = driveOk && !!ref.driveId && index.liveIds.has(ref.driveId);
         const pathOnDrive = liveId != null;
         const onDrive = idOnDrive || pathOnDrive;

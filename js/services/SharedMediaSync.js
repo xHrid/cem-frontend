@@ -349,10 +349,14 @@ export async function getProjectSyncReport(projectId) {
 export async function healProject(projectId, { upload = true } = {}) {
     if (!getAccessToken()) return { healed: 0, cleared: 0, enqueued: 0 };
     const project = _resolveProject(projectId);
-    if (!_canWrite(project)) return { healed: 0, cleared: 0, enqueued: 0 };
+    if (!project) return { healed: 0, cleared: 0, enqueued: 0 };
 
     const report = await buildSyncReport(project);
     if (!report.driveOk) return { healed: 0, cleared: 0, enqueued: 0 };
+
+    // Writing a drive_id back is local metadata (safe for viewers, needed to view
+    // shared media). Only actual uploads require write access.
+    const canUpload = upload && _canWrite(project);
 
     let changed = false, healed = 0, cleared = 0;
     const toEnqueue = [];
@@ -361,10 +365,12 @@ export async function healProject(projectId, { upload = true } = {}) {
         if (row.status === SYNC.ID_DRIFT && row.liveId) {
             if (_assignDriveId(project, row.relPath, row.liveId)) { changed = true; healed++; }
         } else if (row.status === SYNC.STALE) {
-            if (_assignDriveId(project, row.relPath, null)) changed = true;
-            if (upload) toEnqueue.push(row.relPath);
+            if (canUpload) {
+                if (_assignDriveId(project, row.relPath, null)) changed = true;
+                toEnqueue.push(row.relPath);
+            }
         } else if (row.status === SYNC.UNSYNCED) {
-            if (upload) toEnqueue.push(row.relPath);
+            if (canUpload) toEnqueue.push(row.relPath);
         } else if (row.status === SYNC.MISSING && row.driveId) {
             if (_assignDriveId(project, row.relPath, null)) { changed = true; cleared++; }
         }
@@ -374,7 +380,7 @@ export async function healProject(projectId, { upload = true } = {}) {
         await MasterData.saveMasterData();
         EventBus.emit(EVENTS.DATA_UPDATED);
     }
-    const enqueued = upload ? enqueueMedia(projectId, toEnqueue) : 0;
+    const enqueued = canUpload ? enqueueMedia(projectId, toEnqueue) : 0;
     return { healed, cleared, enqueued };
 }
 
