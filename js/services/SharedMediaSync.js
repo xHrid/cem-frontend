@@ -2,7 +2,6 @@ import EventBus, { EVENTS } from '../core/EventBus.js';
 import * as DriveService from './DriveService.js';
 import * as MasterData from '../data/MasterData.js';
 import * as StorageAdapter from '../data/StorageAdapter.js';
-import { getProjectFolderName } from '../data/projectUtils.js';
 import { getAccessToken } from './AuthService.js';
 import { touch } from '../data/mergeUtils.js';
 import { enumerateFileRefs } from './ProjectFilesSync.js';
@@ -105,12 +104,12 @@ async function _processItem(item) {
         const isImportedEditor = project.shared?.isImported && project.shared?.permission === 'writer';
         const isShared = isImportedEditor || project.sharing?.isShared;
 
-        let fileId = null;
-        if (isImportedEditor) {
-            fileId = await _pushToSharedFolder(project, relPath);
-        } else {
-            fileId = await _pushToOwnProjectFolder(project, relPath);
-        }
+        // Always upload to this account's own Drive - under the drive.file
+        // scope an editor was never granted access to the owner's folder (only
+        // to the project_data.json file they picked), so writing there always
+        // fails. The file's physical location doesn't matter: once it's made
+        // public, project_data.json's drive_id is enough for anyone to render it.
+        const fileId = await _pushToOwnProjectFolder(project, relPath);
 
         if (fileId) {
             if (isShared) await DriveService.makeFilePublic(fileId);
@@ -138,47 +137,6 @@ async function _processItem(item) {
             });
         }
     }
-}
-
-async function _pushToSharedFolder(project, relPath) {
-    const { sourceFolderId, ownerFolderName } = project.shared;
-    if (!sourceFolderId) throw new Error('No sourceFolderId on imported project');
-
-    const fileBlob = await StorageAdapter.getFileBlob(relPath);
-    if (!fileBlob) throw new Error(`Local file not found: ${relPath}`);
-
-    const localFolder = getProjectFolderName(project);
-    const ownerFolder = ownerFolderName || localFolder;
-
-    let targetPath = relPath;
-    if (relPath.startsWith(localFolder + '/')) {
-        targetPath = ownerFolder + relPath.substring(localFolder.length);
-    }
-
-    const parts = targetPath.split('/');
-    parts.shift();
-    const filename = parts.pop();
-
-    if (!filename) throw new Error(`Invalid relPath after split: ${relPath}`);
-
-    let parentId = sourceFolderId;
-    if (parts.length > 0) {
-        parentId = await DriveService.ensureDrivePath(parts, sourceFolderId);
-    }
-
-    const existing = await DriveService.findFileByName(filename, parentId);
-    if (existing) {
-        await DriveService.updateDriveFile(existing.id, fileBlob);
-        return existing.id;
-    }
-    const created = await DriveService.uploadFile(
-        fileBlob,
-        filename,
-        fileBlob.type || 'application/octet-stream',
-        parentId,
-        targetPath
-    );
-    return created.id;
 }
 
 async function _pushToOwnProjectFolder(project, relPath) {
@@ -327,9 +285,7 @@ export async function uploadLocalOnlyMedia() {
             if (!exists) continue;
 
             try {
-                const fileId = isImportedEditor
-                    ? await _pushToSharedFolder(project, ref.relPath)
-                    : await _pushToOwnProjectFolder(project, ref.relPath);
+                const fileId = await _pushToOwnProjectFolder(project, ref.relPath);
                 if (fileId) {
                     if (isImportedEditor || project.sharing?.isShared) {
                         await DriveService.makeFilePublic(fileId);

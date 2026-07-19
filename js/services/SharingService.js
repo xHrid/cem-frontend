@@ -46,60 +46,78 @@ function _remapMediaPaths(project, ownerFolderName, localFolderName) {
     }
 }
 
+const _MEDIA_PUSH_CONCURRENCY = 4;
+
+// Every locally-referenced file (spots, sites, overlays, routes AND job result
+// files) must be public, or a collaborator with only drive.file scope can't
+// fetch it. Files that already carry a drive_id were uploaded before (by this
+// share flow or by SharedMediaSync) - re-uploading their bytes on every share
+// call (e.g. inviting a second collaborator) is pure waste, so those just get
+// a cheap, idempotent makeFilePublic call. Only genuinely new refs get the
+// full read+upload path. Runs with bounded concurrency so a media-heavy
+// project doesn't serialize one Drive round-trip chain at a time.
 async function _pushAllProjectMedia(project, rootFolderId) {
-    // Every locally-referenced file (spots, sites, overlays, routes AND job
-    // result files) must be uploaded + made public, or an importer with only
-    // drive.file scope cannot fetch it. Reuse the canonical enumeration instead
-    // of a partial hand-rolled list that silently dropped analysis outputs.
-    const mediaPaths = [...new Set(
-        enumerateFileRefs(project).map(ref => ref.relPath).filter(Boolean)
-    )];
+    const refs = enumerateFileRefs(project).filter(r => r.relPath);
+    const seen = new Set();
+    const unique = refs.filter(r => {
+        if (seen.has(r.relPath)) return false;
+        seen.add(r.relPath);
+        return true;
+    });
 
-    if (mediaPaths.length === 0) return;
+    if (unique.length === 0) return;
 
-    let pushed = 0;
-    for (const relPath of mediaPaths) {
-        try {
-            const fileBlob = await StorageAdapter.getFileBlob(relPath);
-            if (!fileBlob) continue;
+    let cursor = 0;
+    async function worker() {
+        while (cursor < unique.length) {
+            const ref = unique[cursor++];
+            try {
+                if (ref.driveId) {
+                    await DriveService.makeFilePublic(ref.driveId);
+                    continue;
+                }
 
-            const parts = relPath.split('/');
-            const filename = parts.pop();
-            if (!filename) continue;
+                const fileBlob = await StorageAdapter.getFileBlob(ref.relPath);
+                if (!fileBlob) continue;
 
-            let parentId = rootFolderId;
-            if (parts.length > 0) {
-                parentId = await DriveService.ensureDrivePath(parts, rootFolderId);
+                const parts = ref.relPath.split('/');
+                const filename = parts.pop();
+                if (!filename) continue;
+
+                let parentId = rootFolderId;
+                if (parts.length > 0) {
+                    parentId = await DriveService.ensureDrivePath(parts, rootFolderId);
+                }
+
+                const existing = await DriveService.findFileByName(filename, parentId);
+                let fileId;
+                if (existing) {
+                    await DriveService.updateDriveFile(existing.id, fileBlob);
+                    fileId = existing.id;
+                } else {
+                    const created = await DriveService.uploadFile(
+                        fileBlob,
+                        filename,
+                        fileBlob.type || 'application/octet-stream',
+                        parentId,
+                        ref.relPath
+                    );
+                    fileId = created.id;
+                }
+
+                if (fileId) {
+                    await DriveService.makeFilePublic(fileId);
+                    _setMediaDriveId(project, ref.relPath, fileId);
+                }
+            } catch (err) {
+                console.warn(`[SharingService] Could not push media "${ref.relPath}":`, err.message);
             }
-
-            const existing = await DriveService.findFileByName(filename, parentId);
-            let fileId;
-            if (existing) {
-                await DriveService.updateDriveFile(existing.id, fileBlob);
-                fileId = existing.id;
-            } else {
-                const created = await DriveService.uploadFile(
-                    fileBlob,
-                    filename,
-                    fileBlob.type || 'application/octet-stream',
-                    parentId,
-                    relPath
-                );
-                fileId = created.id;
-            }
-
-            if (fileId) {
-                await DriveService.makeFilePublic(fileId);
-                _setMediaDriveId(project, relPath, fileId);
-            }
-            pushed++;
-        } catch (err) {
-            console.warn(`[SharingService] Could not push media "${relPath}":`, err.message);
         }
     }
 
-    if (pushed > 0) {
-    }
+    await Promise.all(
+        Array.from({ length: Math.min(_MEDIA_PUSH_CONCURRENCY, unique.length) }, worker)
+    );
 }
 
 function _setMediaDriveId(project, relPath, fileId) {
@@ -212,24 +230,18 @@ function _adoptRemoteMediaIds(project, remote) {
     }
 }
 
-// Make every already-uploaded media reference public by its drive_id, reading
-// refs straight from the project (never the folder). Owner-only path, run at
-// share time so collaborators can stream every file from its public link.
-async function _publishReferencedMedia(project) {
-    let refs;
-    try {
-        const { enumerateFileRefs } = await import('./ProjectFilesSync.js');
-        refs = enumerateFileRefs(project);
-    } catch (e) {
-        console.warn('[SharingService] could not enumerate refs to publish:', e.message);
-        return;
-    }
-    const seen = new Set();
-    for (const ref of refs) {
-        if (!ref.driveId || seen.has(ref.driveId)) continue;
-        seen.add(ref.driveId);
-        try { await DriveService.makeFilePublic(ref.driveId); } catch { }
-    }
+// One Drive permission-insert round trip per invitee - independent calls, so
+// run them concurrently instead of awaiting one at a time in a for-loop.
+async function _inviteAll(fileOrFolderId, emails, role, verb) {
+    const settled = await Promise.allSettled(
+        emails.map(email => DriveService.shareWithUser(fileOrFolderId, email.trim(), role))
+    );
+    return settled.map((r, i) => {
+        const email = emails[i].trim();
+        if (r.status === 'fulfilled') return { email, success: true, permissionId: r.value.id };
+        console.error(`[SharingService] Failed to ${verb} with ${email}:`, r.reason);
+        return { email, success: false, error: r.reason?.message };
+    });
 }
 
 export async function shareProject(projectId, emails, role) {
@@ -252,16 +264,7 @@ export async function shareProject(projectId, emails, role) {
         try { await pushToSharedProject(project.id); }
         catch (e) { console.warn('[SharingService] pre-share push failed:', e.message); }
 
-        const results = [];
-        for (const email of emails) {
-            try {
-                const perm = await DriveService.shareWithUser(shareId, email.trim(), role);
-                results.push({ email: email.trim(), success: true, permissionId: perm.id });
-            } catch (err) {
-                console.error(`[SharingService] Failed to re-share with ${email}:`, err);
-                results.push({ email: email.trim(), success: false, error: err.message });
-            }
-        }
+        const results = await _inviteAll(shareId, emails, role, 're-share');
 
         project.shared.resharedWith = project.shared.resharedWith || [];
         const known = new Set(project.shared.resharedWith.map(s => s.email));
@@ -293,22 +296,12 @@ export async function shareProject(projectId, emails, role) {
 
     try {
         await _pushAllProjectMedia(project, rootFolderId);
-        await _publishReferencedMedia(project);
         await pushProjectDataToDrive(project);
     } catch (e) {
         console.warn('[SharingService] pre-share media/data push failed (continuing):', e.message);
     }
 
-    const results = [];
-    for (const email of emails) {
-        try {
-            const perm = await DriveService.shareWithUser(folderId, email.trim(), role);
-            results.push({ email: email.trim(), success: true, permissionId: perm.id });
-        } catch (err) {
-            console.error(`[SharingService] Failed to share with ${email}:`, err);
-            results.push({ email: email.trim(), success: false, error: err.message });
-        }
-    }
+    const results = await _inviteAll(folderId, emails, role, 'share');
 
     if (!project.sharing) {
         project.sharing = {
