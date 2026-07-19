@@ -14,36 +14,40 @@ export function enumerateFileRefs(project) {
     const refs = [];
     for (const s of (project.spots || [])) {
         if (isDeleted(s)) continue;
+        const ctx = s.name || 'Spot';
         const imgPaths = s.images && s.images.length > 0
             ? s.images
             : (s.image_local_filename ? [s.image_local_filename] : []);
         const imgDriveIds = s.image_drive_ids || [];
         for (let i = 0; i < imgPaths.length; i++) {
-            refs.push({ relPath: imgPaths[i], driveId: imgDriveIds[i] || (i === 0 ? s.image_drive_id : null) || null, kind: 'image' });
+            refs.push({ relPath: imgPaths[i], driveId: imgDriveIds[i] || (i === 0 ? s.image_drive_id : null) || null, kind: 'image', context: ctx });
         }
-        if (s.audio_local_filename) refs.push({ relPath: s.audio_local_filename, driveId: s.audio_drive_id || null, kind: 'audio' });
+        if (s.audio_local_filename) refs.push({ relPath: s.audio_local_filename, driveId: s.audio_drive_id || null, kind: 'audio', context: ctx });
     }
     for (const st of (project.sites || [])) {
         if (isDeleted(st)) continue;
-        if (st.kml_filename) refs.push({ relPath: st.kml_filename, driveId: st.kml_drive_id || null, kind: 'kml' });
+        const ctx = st.name || 'Site';
+        if (st.kml_filename) refs.push({ relPath: st.kml_filename, driveId: st.kml_drive_id || null, kind: 'kml', context: ctx });
         for (const ov of (st.strat_overlays || [])) {
-            if (ov.rel_path) refs.push({ relPath: ov.rel_path, driveId: ov.drive_id || null, kind: 'stratification' });
+            if (ov.rel_path) refs.push({ relPath: ov.rel_path, driveId: ov.drive_id || null, kind: 'stratification', context: ctx });
         }
     }
     for (const rt of (project.routes || [])) {
         if (isDeleted(rt)) continue;
+        const ctx = rt.name || 'Route';
         for (const a of (rt.annotations || [])) {
             if (isDeleted(a)) continue;
-            if (a.image_local_filename) refs.push({ relPath: a.image_local_filename, driveId: a.image_drive_id || null, kind: 'image' });
-            if (a.audio_local_filename) refs.push({ relPath: a.audio_local_filename, driveId: a.audio_drive_id || null, kind: 'audio' });
+            if (a.image_local_filename) refs.push({ relPath: a.image_local_filename, driveId: a.image_drive_id || null, kind: 'image', context: ctx });
+            if (a.audio_local_filename) refs.push({ relPath: a.audio_local_filename, driveId: a.audio_drive_id || null, kind: 'audio', context: ctx });
         }
     }
     for (const j of (project.jobs || [])) {
         if (isDeleted(j)) continue;
-        if (j.job_file) refs.push({ relPath: j.job_file, driveId: j.job_file_drive_id || null, kind: 'job' });
+        const ctx = j.job_name || j.job_id || 'Job';
+        if (j.job_file) refs.push({ relPath: j.job_file, driveId: j.job_file_drive_id || null, kind: 'job', context: ctx });
         for (const rf of (j.result_files || [])) {
             if (isDeleted(rf)) continue;
-            if (rf.rel_path) refs.push({ relPath: rf.rel_path, driveId: rf.drive_id || null, kind: 'result' });
+            if (rf.rel_path) refs.push({ relPath: rf.rel_path, driveId: rf.drive_id || null, kind: 'result', context: ctx });
         }
     }
     return refs;
